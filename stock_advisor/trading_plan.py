@@ -4,6 +4,7 @@ import json
 from dataclasses import dataclass
 from decimal import Decimal, ROUND_HALF_UP
 from pathlib import Path
+from typing import Any
 
 from .models import PortfolioHolding, PortfolioSnapshot, StockQuote
 
@@ -31,7 +32,7 @@ class TriggerHit:
     cash_after_trade: Decimal
 
 
-DEFAULT_TRIGGERS = {
+DEFAULT_TRIGGER_MAP = {
     "003035": TradeTrigger(
         code="003035",
         name="南网能源",
@@ -68,6 +69,62 @@ DEFAULT_TRIGGERS = {
 }
 
 
+def build_default_trigger_payload() -> dict[str, list[dict[str, Any]]]:
+    return {
+        "triggers": [
+            {
+                "code": trigger.code,
+                "name": trigger.name,
+                "action": trigger.action,
+                "quantity": trigger.quantity,
+                "priceMin": str(trigger.price_min),
+                "priceMax": str(trigger.price_max),
+                "fallbackPrice": str(trigger.fallback_price),
+                "note": trigger.note,
+                "disableBuy": trigger.disable_buy,
+            }
+            for trigger in DEFAULT_TRIGGER_MAP.values()
+        ]
+    }
+
+
+def load_triggers(path: str | Path | None) -> dict[str, TradeTrigger]:
+    if path is None:
+        return DEFAULT_TRIGGER_MAP.copy()
+    trigger_path = Path(path)
+    if not trigger_path.exists():
+        return DEFAULT_TRIGGER_MAP.copy()
+    raw = json.loads(trigger_path.read_text(encoding="utf-8"))
+    items = raw.get("triggers", [])
+    triggers: dict[str, TradeTrigger] = {}
+    for item in items:
+        trigger = TradeTrigger(
+            code=str(item["code"]),
+            name=str(item.get("name", "")),
+            action=str(item["action"]),
+            quantity=int(item["quantity"]),
+            price_min=Decimal(str(item["priceMin"])),
+            price_max=Decimal(str(item["priceMax"])),
+            fallback_price=Decimal(str(item["fallbackPrice"])),
+            note=str(item.get("note", "")),
+            disable_buy=bool(item.get("disableBuy", False)),
+        )
+        triggers[trigger.code] = trigger
+    return triggers
+
+
+def ensure_trigger_file(path: str | Path) -> Path:
+    trigger_path = Path(path)
+    if trigger_path.exists():
+        return trigger_path
+    trigger_path.parent.mkdir(parents=True, exist_ok=True)
+    trigger_path.write_text(
+        json.dumps(build_default_trigger_payload(), ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+    return trigger_path
+
+
 def load_snapshot(path: str | Path) -> PortfolioSnapshot:
     raw = json.loads(Path(path).read_text(encoding="utf-8"))
     return PortfolioSnapshot(
@@ -87,8 +144,13 @@ def load_snapshot(path: str | Path) -> PortfolioSnapshot:
     )
 
 
-def detect_trigger_hit(quote: StockQuote, snapshot: PortfolioSnapshot) -> TriggerHit | None:
-    trigger = DEFAULT_TRIGGERS.get(quote.code)
+def detect_trigger_hit(
+    quote: StockQuote,
+    snapshot: PortfolioSnapshot,
+    triggers: dict[str, TradeTrigger] | None = None,
+) -> TriggerHit | None:
+    trigger_map = triggers or DEFAULT_TRIGGER_MAP
+    trigger = trigger_map.get(quote.code)
     if trigger is None:
         return None
     holding = _find_holding(snapshot, quote.code)

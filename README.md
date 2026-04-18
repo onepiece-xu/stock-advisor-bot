@@ -47,6 +47,7 @@ python3 -m pip install --user -r requirements.txt
 - 长期持仓文档（飞书）：`https://wcntg42cmak8.feishu.cn/docx/DXRDdRGRJohquex19VucUqh0nVd`
 - 本地结构化快照：`portfolio-snapshot.json`
 - 飞书机器人监听配置：`feishu_bot`
+- 交易计划样例：`trading-plan.example.json`
 
 ## 单次行情轮询
 
@@ -84,11 +85,26 @@ python3 -m stock_advisor.cli monitor-daemon --config config.yaml
 
 - daemon 推送到飞书时，会自动使用手机友好摘要，而不是长篇原始报告
 - 单次分析会优先复用 SQLite 中的最近样本，避免只看当前一跳行情
+- `quote + signal + decision` 现在走单事务写入，避免孤立行情记录
+
+初始化默认交易计划文件：
+
+```bash
+python3 -m stock_advisor.cli init-trading-plan --config config.yaml
+```
+
+生成后直接编辑项目根目录下的 `trading-plan.json` 即可，不需要改代码重启部署逻辑。
 
 如果使用 `direct_dm` 模式，消息会先写到本地 outbox，可用下面脚本继续转发：
 
 ```bash
 python3 scripts/flush_direct_dm_outbox.py
+```
+
+如果 `webhook` 推送重试后仍失败，会写入失败补偿队列，可用下面脚本重放：
+
+```bash
+python3 scripts/flush_failed_notifications.py
 ```
 
 查看状态：
@@ -228,6 +244,7 @@ python3 -m stock_advisor.cli replay-signals \
 - 飞书机器人当前只支持文本消息命令，不支持卡片交互和加密事件
 - 决策层目前是规则评分引擎，不是接入 LLM 的研究代理
 - 腾讯行情接口属于公开行情源，稳定性不如正式行情服务
+- 交易计划文件当前是 JSON，尚未接入飞书侧动态改价
 - 还没做 systemd / 开机自启
 
 ## 下一步建议

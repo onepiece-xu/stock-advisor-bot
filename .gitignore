@@ -4,9 +4,11 @@ __pycache__/
 
 config.yaml
 portfolio-snapshot.json
+trading-plan.json
 logs/
 run/
 data/portfolio/
 data/market.db
 data/direct_dm_outbox.jsonl
 data/direct_dm_spool.txt
+data/failed_notifications.jsonl

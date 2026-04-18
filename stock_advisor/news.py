@@ -10,10 +10,12 @@ import xml.etree.ElementTree as ET
 
 import requests
 
+from .logging_utils import get_logger
 from .models import StockQuote
 
 
 GOOGLE_NEWS_RSS = "https://news.google.com/rss/search"
+logger = get_logger(__name__)
 
 
 @dataclass(slots=True)
@@ -60,7 +62,11 @@ def _fetch_google_news(query: str, *, limit: int) -> list[NewsItem]:
         response = requests.get(GOOGLE_NEWS_RSS, params=params, headers={"User-Agent": "Mozilla/5.0"}, timeout=6)
         response.raise_for_status()
         return _parse_google_news_rss(response.text, limit=limit)
-    except Exception:
+    except requests.RequestException as exc:
+        logger.warning("Google News RSS fetch failed query=%s error=%s", query, exc)
+        return []
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("Google News RSS parse failed query=%s error=%s", query, exc)
         return []
 
 

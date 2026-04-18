@@ -37,6 +37,8 @@ portfolio:
   data_dir: data/portfolio
 storage:
   sqlite_path: data/market.db
+trading_plan:
+  path: trading-plan.json
 feishu_bot:
   enabled: false
   app_id: ""

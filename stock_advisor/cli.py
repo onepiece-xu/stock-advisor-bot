@@ -12,8 +12,8 @@ from .portfolio import build_daily_report, load_previous_snapshot, load_snapshot
 from .providers import TencentQuoteProvider
 from .analysis import analyze_quotes
 from .runtime import MonitorRuntime
-from .storage import connect_db, fetch_latest_briefing, insert_quote, insert_signal, load_recent_quotes, replay_signal_stats
-from .trading_plan import apply_trade_fill, build_post_fill_execution_sheet, load_snapshot as load_trade_snapshot
+from .storage import connect_db, fetch_latest_briefing, load_recent_quotes, persist_observation, replay_signal_stats
+from .trading_plan import apply_trade_fill, build_post_fill_execution_sheet, ensure_trigger_file, load_snapshot as load_trade_snapshot
 
 
 def main() -> None:
@@ -54,6 +54,9 @@ def main() -> None:
     fill_parser.add_argument("--quantity", required=True, type=int, help="成交数量")
     fill_parser.add_argument("--price", required=True, help="成交价")
 
+    init_trade_plan_parser = subparsers.add_parser("init-trading-plan", help="生成默认交易计划文件")
+    init_trade_plan_parser.add_argument("--config", required=True, help="配置文件路径")
+
     args = parser.parse_args()
 
     if args.command == "monitor-once":
@@ -70,6 +73,8 @@ def main() -> None:
         run_feishu_bot(args.config)
     elif args.command == "record-fill":
         run_record_fill(args.snapshot, args.side, args.code, args.quantity, args.price)
+    elif args.command == "init-trading-plan":
+        run_init_trading_plan(args.config)
 
 
 def run_monitor_once(config_path: str, force_notify: bool, mobile: bool) -> None:
@@ -87,8 +92,7 @@ def run_monitor_once(config_path: str, force_notify: bool, mobile: bool) -> None
         if not mobile:
             print(result.title)
         print(rendered)
-        quote_id = insert_quote(conn, quote)
-        insert_signal(conn, quote_id, quote, result)
+        persist_observation(conn, quote, result)
         if force_notify or result.should_notify or config.monitor.notification.notify_on_neutral:
             if config.monitor.notification.feishu.enabled:
                 payload = format_mobile_signal(result.title, result.message, include_title=False) if mobile else result.message
@@ -155,6 +159,12 @@ def run_record_fill(snapshot_path: str, side: str, code: str, quantity: int, pri
     print(f"最新现金：{snapshot.cash}")
     print("")
     print(build_post_fill_execution_sheet(snapshot))
+
+
+def run_init_trading_plan(config_path: str) -> None:
+    config = load_config(config_path)
+    path = ensure_trigger_file(config.trading_plan.path)
+    print(f"已生成默认交易计划文件：{path}")
 
 
 if __name__ == "__main__":

@@ -128,7 +128,6 @@ def insert_quote(conn: sqlite3.Connection, quote: StockQuote) -> int:
         "SELECT id FROM quotes WHERE symbol = ? AND quote_time = ?",
         (quote.symbol, quote.quote_time.isoformat(sep=" ")),
     ).fetchone()
-    conn.commit()
     if row is None:
         raise RuntimeError("Failed to persist quote")
     return int(row["id"])
@@ -155,8 +154,14 @@ def insert_signal(conn: sqlite3.Connection, quote_id: int, quote: StockQuote, re
     signal_id = int(cursor.lastrowid)
     _insert_signal_metrics(conn, signal_id, result.metrics)
     _insert_decision_signal(conn, signal_id, quote, result.decision)
-    conn.commit()
     return signal_id
+
+
+def persist_observation(conn: sqlite3.Connection, quote: StockQuote, result: ObservationResult) -> tuple[int, int]:
+    with conn:
+        quote_id = insert_quote(conn, quote)
+        signal_id = insert_signal(conn, quote_id, quote, result)
+    return quote_id, signal_id
 
 
 def _insert_signal_metrics(conn: sqlite3.Connection, signal_id: int, metrics: ObservationMetrics) -> None:

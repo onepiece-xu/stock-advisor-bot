@@ -85,10 +85,16 @@ class StorageConfig:
 
 
 @dataclass(slots=True)
+class TradingPlanConfig:
+    path: Path
+
+
+@dataclass(slots=True)
 class AppConfig:
     monitor: MonitorConfig
     portfolio: PortfolioConfig
     storage: StorageConfig
+    trading_plan: TradingPlanConfig
     feishu_bot: FeishuBotConfig
 
 
@@ -103,6 +109,7 @@ def load_config(path: str | Path) -> AppConfig:
     notification_raw = monitor_raw.get("notification", {})
     dedup_raw = notification_raw.get("dedup", {})
     feishu_raw = notification_raw.get("feishu", {})
+    trading_plan_raw = raw.get("trading_plan", {})
     bot_raw = raw.get("feishu_bot", {})
 
     stocks = [
@@ -150,6 +157,9 @@ def load_config(path: str | Path) -> AppConfig:
         ),
         storage=StorageConfig(
             sqlite_path=(config_path.parent / raw.get("storage", {}).get("sqlite_path", "data/market.db")).resolve()
+        ),
+        trading_plan=TradingPlanConfig(
+            path=(config_path.parent / trading_plan_raw.get("path", "trading-plan.json")).resolve()
         ),
         feishu_bot=FeishuBotConfig(
             enabled=bool(bot_raw.get("enabled", False)),

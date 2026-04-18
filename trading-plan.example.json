@@ -1,0 +1,37 @@
+{
+  "triggers": [
+    {
+      "code": "003035",
+      "name": "南网能源",
+      "action": "sell",
+      "quantity": 500,
+      "priceMin": "7.95",
+      "priceMax": "8.10",
+      "fallbackPrice": "7.80",
+      "note": "反弹进入减仓带先卖 500 股，若跌回弱承接位下方再执行第二笔减仓",
+      "disableBuy": true
+    },
+    {
+      "code": "603993",
+      "name": "洛阳钼业",
+      "action": "sell",
+      "quantity": 200,
+      "priceMin": "20.50",
+      "priceMax": "20.80",
+      "fallbackPrice": "20.00",
+      "note": "反弹到减仓带先卖 200 股，若重新跌回 20 下方，继续禁止补仓",
+      "disableBuy": true
+    },
+    {
+      "code": "601698",
+      "name": "中国卫通",
+      "action": "hold",
+      "quantity": 100,
+      "priceMin": "34.40",
+      "priceMax": "34.60",
+      "fallbackPrice": "33.20",
+      "note": "默认持有观察，只有冲到 34.5 附近明显无力时才考虑减 100 股",
+      "disableBuy": true
+    }
+  ]
+}

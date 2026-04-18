@@ -11,10 +11,14 @@ from .briefing import format_mobile_signal
 from .config import AppConfig
 from .market_hours import is_a_share_trading_time
 from .models import StockQuote
+from .logging_utils import get_logger
 from .notify import deliver_feishu_message
 from .providers import TencentQuoteProvider
-from .storage import connect_db, insert_quote, insert_signal, load_recent_quotes
-from .trading_plan import detect_trigger_hit, load_snapshot as load_trade_snapshot, render_trade_instruction
+from .storage import connect_db, load_recent_quotes, persist_observation
+from .trading_plan import detect_trigger_hit, load_snapshot as load_trade_snapshot, load_triggers, render_trade_instruction
+
+
+logger = get_logger(__name__)
 
 
 class MonitorRuntime:
@@ -24,6 +28,7 @@ class MonitorRuntime:
         self.history: dict[str, list[StockQuote]] = defaultdict(list)
         self.last_notifications: dict[str, tuple[str, datetime]] = {}
         self.db = connect_db(config.storage.sqlite_path)
+        self.trade_triggers = load_triggers(config.trading_plan.path)
 
     def run_once(self) -> None:
         if self.config.monitor.schedule.restrict_to_trading_session and not is_a_share_trading_time():
@@ -33,14 +38,13 @@ class MonitorRuntime:
         for stock in self.config.monitor.stocks:
             self._hydrate_history(stock.symbol)
             quote = self.provider.fetch_quote(stock)
-            quote_id = insert_quote(self.db, quote)
             bucket = self.history[stock.symbol]
             bucket.append(quote)
             if len(bucket) > self.config.monitor.history_size:
                 del bucket[:-self.config.monitor.history_size]
 
             result = analyze_quotes(bucket, self.config.monitor)
-            insert_signal(self.db, quote_id, quote, result)
+            persist_observation(self.db, quote, result)
             print("=" * 80)
             print(result.title)
             print(result.message)
@@ -81,8 +85,11 @@ class MonitorRuntime:
         return True
 
     def _notify(self, symbol: str, title: str, message: str) -> None:
-        deliver_feishu_message(self.config.monitor.notification.feishu, title, message)
-        self.last_notifications[symbol] = ("\n".join(message.splitlines()[-len(message.splitlines()):]), datetime.now())
+        try:
+            deliver_feishu_message(self.config.monitor.notification.feishu, title, message)
+            self.last_notifications[symbol] = (message, datetime.now())
+        except Exception as exc:  # noqa: BLE001
+            logger.exception("Notification delivery failed symbol=%s title=%s error=%s", symbol, title, exc)
 
     def _hydrate_history(self, symbol: str) -> None:
         if self.history[symbol]:
@@ -94,7 +101,7 @@ class MonitorRuntime:
         if not snapshot_path.exists():
             return None
         snapshot = load_trade_snapshot(snapshot_path)
-        hit = detect_trigger_hit(quote, snapshot)
+        hit = detect_trigger_hit(quote, snapshot, self.trade_triggers)
         if hit is None:
             return None
         return render_trade_instruction(hit, snapshot)

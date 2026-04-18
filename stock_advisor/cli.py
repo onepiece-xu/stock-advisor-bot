@@ -3,12 +3,13 @@ from __future__ import annotations
 import argparse
 
 from .config import load_config
+from .briefing import format_mobile_digest, format_mobile_replay, format_mobile_signal
 from .notify import send_feishu_webhook
 from .portfolio import build_daily_report, load_previous_snapshot, load_snapshot, save_snapshot
 from .providers import TencentQuoteProvider
 from .analysis import analyze_quotes
 from .runtime import MonitorRuntime
-from .storage import connect_db, insert_quote, insert_signal, replay_signal_stats
+from .storage import connect_db, fetch_latest_briefing, insert_quote, insert_signal, load_recent_quotes, replay_signal_stats
 
 
 def main() -> None:
@@ -18,6 +19,7 @@ def main() -> None:
     monitor_parser = subparsers.add_parser("monitor-once", help="单次获取行情并输出观察报告")
     monitor_parser.add_argument("--config", required=True, help="配置文件路径")
     monitor_parser.add_argument("--notify", action="store_true", help="强制发送 webhook")
+    monitor_parser.add_argument("--mobile", action="store_true", help="输出手机友好摘要")
 
     daemon_parser = subparsers.add_parser("monitor-daemon", help="常驻轮询行情并按间隔执行")
     daemon_parser.add_argument("--config", required=True, help="配置文件路径")
@@ -31,36 +33,48 @@ def main() -> None:
     replay_parser.add_argument("--config", required=True, help="配置文件路径")
     replay_parser.add_argument("--symbol", help="按 symbol 过滤，如 sh601698")
     replay_parser.add_argument("--level", help="按信号级别过滤，如 ALERT/INFO/NEUTRAL")
+    replay_parser.add_argument("--action", help="按动作过滤，如 avoid/reduce/hold")
+    replay_parser.add_argument("--notify", action="store_true", help="把回放摘要发送到飞书")
+
+    digest_parser = subparsers.add_parser("mobile-brief", help="输出适合手机飞书机器人的简报")
+    digest_parser.add_argument("--config", required=True, help="配置文件路径")
+    digest_parser.add_argument("--notify", action="store_true", help="把简报发送到飞书")
 
     args = parser.parse_args()
 
     if args.command == "monitor-once":
-        run_monitor_once(args.config, args.notify)
+        run_monitor_once(args.config, args.notify, args.mobile)
     elif args.command == "monitor-daemon":
         run_monitor_daemon(args.config)
     elif args.command == "portfolio-report":
         run_portfolio_report(args.config, args.snapshot, args.notify)
     elif args.command == "replay-signals":
-        run_replay_signals(args.config, args.symbol, args.level)
+        run_replay_signals(args.config, args.symbol, args.level, args.action, args.notify)
+    elif args.command == "mobile-brief":
+        run_mobile_brief(args.config, args.notify)
 
 
-def run_monitor_once(config_path: str, force_notify: bool) -> None:
+def run_monitor_once(config_path: str, force_notify: bool, mobile: bool) -> None:
     config = load_config(config_path)
     provider = TencentQuoteProvider(config.monitor)
+    conn = connect_db(config.storage.sqlite_path)
 
     for stock in config.monitor.stocks:
+        history = load_recent_quotes(conn, stock.symbol, config.monitor.history_size - 1)
         quote = provider.fetch_quote(stock)
-        history = [quote]
+        history.append(quote)
         result = analyze_quotes(history, config.monitor)
         print("=" * 80)
-        print(result.title)
-        print(result.message)
-        conn = connect_db(config.storage.sqlite_path)
+        rendered = format_mobile_signal(result.title, result.message) if mobile else result.message
+        if not mobile:
+            print(result.title)
+        print(rendered)
         quote_id = insert_quote(conn, quote)
         insert_signal(conn, quote_id, quote, result)
         if (force_notify or result.should_notify or config.monitor.notification.notify_on_neutral) and config.monitor.notification.feishu.enabled:
             if config.monitor.notification.feishu.webhook_url:
-                send_feishu_webhook(config.monitor.notification.feishu.webhook_url, result.title, result.message)
+                payload = format_mobile_signal(result.title, result.message, include_title=False) if mobile else result.message
+                send_feishu_webhook(config.monitor.notification.feishu.webhook_url, result.title, payload)
 
 
 def run_monitor_daemon(config_path: str) -> None:
@@ -86,30 +100,29 @@ def run_portfolio_report(config_path: str, snapshot_path: str, notify: bool) -> 
         )
 
 
-def run_replay_signals(config_path: str, symbol: str | None, level: str | None) -> None:
+def run_replay_signals(
+    config_path: str,
+    symbol: str | None,
+    level: str | None,
+    action: str | None,
+    notify: bool,
+) -> None:
     config = load_config(config_path)
     conn = connect_db(config.storage.sqlite_path)
-    stats = replay_signal_stats(conn, symbol=symbol, signal_level=level)
-    print("【信号回放统计】")
-    print(f"生成时间：{stats['generated_at']}")
-    print(f"信号样本数：{stats['signal_count']}")
-    for horizon, summary in stats["horizons"].items():
-        print("")
-        print(f"[{horizon} 个周期后]")
-        print(f"- 样本数：{summary['samples']}")
-        print(f"- 平均收益：{_fmt_stat(summary['avg'])}")
-        print(f"- 中位数收益：{_fmt_stat(summary['median'])}")
-        print(f"- 胜率：{_fmt_pct(summary['win_rate'])}")
-        print(f"- 最差：{_fmt_stat(summary['min'])}")
-        print(f"- 最好：{_fmt_stat(summary['max'])}")
+    stats = replay_signal_stats(conn, symbol=symbol, signal_level=level, action=action)
+    rendered = format_mobile_replay(stats, symbol=symbol, level=level, action=action)
+    print(rendered)
+    if notify and config.monitor.notification.feishu.enabled and config.monitor.notification.feishu.webhook_url:
+        send_feishu_webhook(config.monitor.notification.feishu.webhook_url, "历史回放统计", rendered)
 
 
-def _fmt_stat(value: float | None) -> str:
-    return "N/A" if value is None else f"{value:.4f}%"
-
-
-def _fmt_pct(value: float | None) -> str:
-    return "N/A" if value is None else f"{value:.2f}%"
+def run_mobile_brief(config_path: str, notify: bool) -> None:
+    config = load_config(config_path)
+    conn = connect_db(config.storage.sqlite_path)
+    rendered = format_mobile_digest(fetch_latest_briefing(conn))
+    print(rendered)
+    if notify and config.monitor.notification.feishu.enabled and config.monitor.notification.feishu.webhook_url:
+        send_feishu_webhook(config.monitor.notification.feishu.webhook_url, "AI股票决策简报", rendered)
 
 
 if __name__ == "__main__":

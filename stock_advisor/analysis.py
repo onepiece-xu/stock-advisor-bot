@@ -4,7 +4,7 @@ from decimal import Decimal, ROUND_HALF_UP
 
 from .advice import build_action_candidates, render_action_candidates
 from .config import MonitorConfig
-from .models import ObservationMetrics, ObservationResult, StockQuote
+from .models import DecisionSignal, ObservationMetrics, ObservationResult, StockQuote
 
 
 def analyze_quotes(history: list[StockQuote], monitor_config: MonitorConfig) -> ObservationResult:
@@ -45,10 +45,6 @@ def analyze_quotes(history: list[StockQuote], monitor_config: MonitorConfig) -> 
         observations.append("观察：当前未触发明显信号，建议继续跟踪价格、短期均价和成交额变化。仅供参考，不构成投资建议。")
 
     observations.extend(render_action_candidates(build_action_candidates(current)))
-    title = f"{current.code} {current.name} 行情观察"
-    message = _build_message(current, avg3, avg6, step_change_pct, recent_range_pct, observations)
-    should_notify = has_daily_change_alert or has_step_alert or has_range_alert
-    signal_level = "ALERT" if should_notify else ("INFO" if has_non_neutral else "NEUTRAL")
     metrics = ObservationMetrics(
         avg3=avg3,
         avg6=avg6,
@@ -58,6 +54,11 @@ def analyze_quotes(history: list[StockQuote], monitor_config: MonitorConfig) -> 
         recent_range_pct=recent_range_pct,
         intraday_amplitude_pct=current.intraday_amplitude_percent,
     )
+    decision = _build_decision_signal(current, metrics, len(history))
+    title = f"{current.code} {current.name} 行情观察"
+    message = _build_message(current, metrics, decision, observations)
+    should_notify = has_daily_change_alert or has_step_alert or has_range_alert
+    signal_level = "ALERT" if should_notify else ("INFO" if has_non_neutral else "NEUTRAL")
     return ObservationResult(
         title=title,
         message=message,
@@ -65,27 +66,42 @@ def analyze_quotes(history: list[StockQuote], monitor_config: MonitorConfig) -> 
         should_notify=should_notify,
         signal_level=signal_level,
         metrics=metrics,
+        decision=decision,
     )
 
 
-def _build_message(current: StockQuote, avg3: Decimal, avg6: Decimal, step_change_pct: Decimal, recent_range_pct: Decimal, observations: list[str]) -> str:
-    metrics = [
+def _build_message(
+    current: StockQuote,
+    metrics: ObservationMetrics,
+    decision: DecisionSignal,
+    observations: list[str],
+) -> str:
+    lines = [
         f"标的：{current.code} {current.name}",
         f"数据源：{current.provider}",
         f"时间：{current.quote_time.strftime('%Y-%m-%d %H:%M:%S')}",
         f"现价：{_format_price(current.current_price)}",
         f"昨收：{_format_price(current.previous_close)}",
         f"涨跌幅：{_format_percent(current.change_percent)}",
-        f"近3次均价：{_format_price(avg3)}",
-        f"近6次均价：{_format_price(avg6)}",
-        f"单次采样变化：{_format_percent(step_change_pct)}",
-        f"近6次区间波动：{_format_percent(recent_range_pct)}",
+        f"近3次均价：{_format_price(metrics.avg3)}",
+        f"近6次均价：{_format_price(metrics.avg6)}",
+        f"单次采样变化：{_format_percent(metrics.step_change_pct)}",
+        f"近6次区间波动：{_format_percent(metrics.recent_range_pct)}",
         f"振幅：{_format_percent(current.intraday_amplitude_percent)}",
         f"成交量(股)：{current.volume_shares.quantize(Decimal('1'), rounding=ROUND_HALF_UP)}",
         f"成交额(元)：{current.turnover_yuan.quantize(Decimal('0.01'), rounding=ROUND_HALF_UP)}",
         "",
+        "【AI辅助决策】",
+        f"动作：{decision.action}",
+        f"评分：{decision.score.quantize(Decimal('0.01'), rounding=ROUND_HALF_UP)}/100",
+        f"置信度：{decision.confidence}",
+        f"状态：{decision.regime}",
+        f"理由：{'；'.join(decision.rationale)}",
+        f"风险：{'；'.join(decision.risk_flags) if decision.risk_flags else '暂无显著风险标记'}",
+        "",
+        "【观察】",
     ]
-    return "\n".join(metrics + observations)
+    return "\n".join(lines + observations)
 
 
 def _average_of_last(history: list[StockQuote], count: int) -> Decimal:
@@ -111,6 +127,101 @@ def _percent_diff(current: Decimal, base: Decimal) -> Decimal:
     if base <= 0:
         return Decimal("0")
     return (((current - base) / base) * Decimal("100")).quantize(Decimal("0.01"))
+
+
+def _build_decision_signal(current: StockQuote, metrics: ObservationMetrics, sample_size: int) -> DecisionSignal:
+    score = Decimal("50")
+    rationale: list[str] = []
+    risk_flags: list[str] = []
+
+    if current.change_percent >= Decimal("1.50"):
+        score += Decimal("12")
+        rationale.append("当日涨幅偏强，短线动能在增强")
+    elif current.change_percent <= Decimal("-1.50"):
+        score -= Decimal("14")
+        rationale.append("当日回撤偏大，短线抛压仍在释放")
+
+    if metrics.bias_to_avg3 >= Decimal("0.80"):
+        score += Decimal("10")
+        rationale.append("现价站上近3次均价，短线节奏转强")
+    elif metrics.bias_to_avg3 <= Decimal("-0.80"):
+        score -= Decimal("10")
+        rationale.append("现价跌破近3次均价，短线修复不足")
+
+    if metrics.bias_to_avg6 >= Decimal("1.20"):
+        score += Decimal("12")
+        rationale.append("现价高于近6次均价，短周期趋势占优")
+    elif metrics.bias_to_avg6 <= Decimal("-1.20"):
+        score -= Decimal("12")
+        rationale.append("现价低于近6次均价，趋势仍偏弱")
+
+    if metrics.step_change_pct >= Decimal("1.00"):
+        score += Decimal("8")
+        rationale.append("最近一次采样继续抬升，延续性较好")
+    elif metrics.step_change_pct <= Decimal("-1.00"):
+        score -= Decimal("8")
+        rationale.append("最近一次采样继续回落，修复被打断")
+
+    if metrics.recent_range_pct >= Decimal("4.50"):
+        score -= Decimal("8")
+        risk_flags.append("近6次采样波动过大，节奏不稳定")
+
+    if metrics.intraday_amplitude_pct >= Decimal("5.00"):
+        score -= Decimal("6")
+        risk_flags.append("日内振幅偏大，追价性价比低")
+
+    if current.current_price >= current.open_price > 0:
+        score += Decimal("4")
+        rationale.append("现价守在开盘价上方，盘中承接尚可")
+    elif current.open_price > 0 and current.current_price < current.open_price:
+        score -= Decimal("4")
+        rationale.append("现价落在开盘价下方，资金承接偏弱")
+
+    if not rationale:
+        rationale.append("当前多空信号较均衡，继续观察后续样本更稳妥")
+
+    score = max(Decimal("0"), min(score, Decimal("100")))
+    return DecisionSignal(
+        action=_decision_action(score),
+        score=score.quantize(Decimal("0.01")),
+        confidence=_confidence_level(score, sample_size),
+        regime=_market_regime(current, metrics),
+        rationale=rationale,
+        risk_flags=risk_flags,
+    )
+
+
+def _confidence_level(score: Decimal, sample_size: int) -> str:
+    edge = abs(score - Decimal("50"))
+    if sample_size < 3:
+        return "low"
+    if sample_size >= 6 and edge >= Decimal("18"):
+        return "high"
+    if sample_size >= 4 and edge >= Decimal("10"):
+        return "medium"
+    return "low"
+
+
+def _market_regime(current: StockQuote, metrics: ObservationMetrics) -> str:
+    if current.change_percent >= 0 and metrics.bias_to_avg3 >= 0 and metrics.bias_to_avg6 >= 0:
+        return "momentum"
+    if current.change_percent < 0 and metrics.bias_to_avg3 < 0 and metrics.bias_to_avg6 < 0:
+        return "drawdown"
+    if metrics.recent_range_pct >= Decimal("4.50"):
+        return "volatile"
+    return "range"
+
+
+def _decision_action(score: Decimal) -> str:
+    if score >= Decimal("68"):
+        return "accumulate-small"
+    if score >= Decimal("55"):
+        return "hold-watch"
+    if score >= Decimal("40"):
+        return "hold"
+    if score >= Decimal("28"):
+        return "reduce"
+    return "avoid"
 
 
 def _format_price(value: Decimal) -> str:

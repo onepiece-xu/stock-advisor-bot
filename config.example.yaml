@@ -31,6 +31,7 @@ monitor:
       cooldown_minutes: 30
     feishu:
       enabled: false
+      delivery_mode: webhook
       webhook_url: ""
 portfolio:
   data_dir: data/portfolio

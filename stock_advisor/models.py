@@ -53,6 +53,16 @@ class ObservationMetrics:
 
 
 @dataclass(slots=True)
+class DecisionSignal:
+    action: str
+    score: Decimal
+    confidence: str
+    regime: str
+    rationale: List[str]
+    risk_flags: List[str]
+
+
+@dataclass(slots=True)
 class ObservationResult:
     title: str
     message: str
@@ -60,6 +70,7 @@ class ObservationResult:
     should_notify: bool
     signal_level: str
     metrics: ObservationMetrics
+    decision: DecisionSignal
 
 
 @dataclass(slots=True)

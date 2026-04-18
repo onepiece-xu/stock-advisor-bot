@@ -8,13 +8,13 @@ from .models import ActionCandidate, StockQuote
 STRONG_UP_DAY_PCT = Decimal("2.00")
 WEAK_DOWN_DAY_PCT = Decimal("-2.00")
 HIGH_AMPLITUDE_PCT = Decimal("4.00")
-KEY_PRICE_THRESHOLD = Decimal("32.00")
 
 
 def build_action_candidates(current: StockQuote) -> list[ActionCandidate]:
     candidates: list[ActionCandidate] = []
     change_percent = current.change_percent.quantize(Decimal("0.01"))
     intraday_amplitude = current.intraday_amplitude_percent.quantize(Decimal("0.01"))
+    close_location = _close_location(current)
 
     if change_percent >= STRONG_UP_DAY_PCT:
         candidates.append(
@@ -45,22 +45,31 @@ def build_action_candidates(current: StockQuote) -> list[ActionCandidate]:
             )
         )
 
-    if current.current_price >= KEY_PRICE_THRESHOLD:
+    if close_location >= Decimal("0.75"):
         candidates.append(
             ActionCandidate(
                 action="hold",
-                reason="价格仍在关键位上方，可继续观察能否站稳并延续修复。",
-                trigger="现价 >= 关键价位",
+                reason="价格接近日内高位收敛，短线承接相对更稳，适合先观察延续性。",
+                trigger="现价位于日内波动区间上沿",
                 risk_level="low",
             )
         )
-    else:
+    elif close_location <= Decimal("0.25"):
         candidates.append(
             ActionCandidate(
                 action="avoid",
-                reason="价格仍未站稳关键位，当前更适合等待确认而不是主动补仓。",
-                trigger="现价 < 关键价位",
+                reason="价格靠近日内低位，短线承接仍偏弱，更适合等待止跌确认。",
+                trigger="现价位于日内波动区间下沿",
                 risk_level="medium",
+            )
+        )
+    elif current.current_price >= current.previous_close:
+        candidates.append(
+            ActionCandidate(
+                action="hold",
+                reason="价格仍守在昨收附近之上，暂时没有明显破位信号。",
+                trigger="现价 >= 昨收",
+                risk_level="low",
             )
         )
 
@@ -93,3 +102,10 @@ def _dedupe_candidates(candidates: list[ActionCandidate]) -> list[ActionCandidat
         seen.add(key)
         deduped.append(candidate)
     return deduped
+
+
+def _close_location(current: StockQuote) -> Decimal:
+    intraday_range = current.high_price - current.low_price
+    if intraday_range <= 0:
+        return Decimal("0.50")
+    return ((current.current_price - current.low_price) / intraday_range).quantize(Decimal("0.01"))

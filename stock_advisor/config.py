@@ -21,6 +21,7 @@ class Thresholds:
 class FeishuConfig:
     enabled: bool
     webhook_url: str
+    delivery_mode: str
 
 
 @dataclass(slots=True)
@@ -127,6 +128,7 @@ def load_config(path: str | Path) -> AppConfig:
                 feishu=FeishuConfig(
                     enabled=bool(feishu_raw.get("enabled", False)),
                     webhook_url=str(feishu_raw.get("webhook_url", "")),
+                    delivery_mode=str(feishu_raw.get("delivery_mode", "webhook")),
                 ),
             ),
         ),

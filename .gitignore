@@ -1,6 +1,7 @@
 .venv/
 __pycache__/
 *.py[cod]
+.codex
 
 config.yaml
 portfolio-snapshot.json
@@ -9,6 +10,7 @@ logs/
 run/
 data/portfolio/
 data/market.db
+data/reviews/
 data/direct_dm_outbox.jsonl
 data/direct_dm_spool.txt
 data/failed_notifications.jsonl

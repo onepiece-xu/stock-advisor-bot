@@ -11,6 +11,7 @@ from .notify import deliver_feishu_message, flush_failed_notifications
 from .portfolio import build_daily_report, load_previous_snapshot, load_snapshot, save_snapshot
 from .providers import TencentQuoteProvider
 from .analysis import analyze_quotes
+from .review import build_close_review
 from .runtime import MonitorRuntime
 from .storage import connect_db, fetch_latest_briefing, load_recent_quotes, persist_observation, replay_signal_stats
 from .trading_plan import apply_trade_fill, build_post_fill_execution_sheet, ensure_trigger_file, load_snapshot as load_trade_snapshot
@@ -63,6 +64,10 @@ def main() -> None:
     flush_parser = subparsers.add_parser("flush-failed-notifications", help="重放失败的 webhook 通知")
     flush_parser.add_argument("--config", required=False, help="保留参数位，兼容统一运维脚本")
 
+    review_parser = subparsers.add_parser("close-review", help="生成收盘复盘报告")
+    review_parser.add_argument("--config", required=True, help="配置文件路径")
+    review_parser.add_argument("--notify", action="store_true", help="把收盘复盘发送到飞书")
+
     args = parser.parse_args()
 
     if args.command == "monitor-once":
@@ -85,6 +90,8 @@ def main() -> None:
         run_validate_config(args.config)
     elif args.command == "flush-failed-notifications":
         run_flush_failed_notifications()
+    elif args.command == "close-review":
+        run_close_review(args.config, args.notify)
 
 
 def run_monitor_once(config_path: str, force_notify: bool, mobile: bool) -> None:
@@ -195,6 +202,15 @@ def run_flush_failed_notifications() -> None:
         print(f"仍有失败通知待重放: {pending_count}")
     else:
         print("没有待重放的失败通知")
+
+
+def run_close_review(config_path: str, notify: bool) -> None:
+    config = require_valid_config(config_path)
+    artifact = build_close_review(config)
+    print(artifact.body)
+    print(f"\n[saved] {artifact.saved_path}")
+    if notify and config.monitor.notification.feishu.enabled:
+        deliver_feishu_message(config.monitor.notification.feishu, artifact.title, artifact.body)
 
 
 if __name__ == "__main__":

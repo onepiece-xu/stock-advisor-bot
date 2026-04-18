@@ -16,6 +16,7 @@ from .config import AppConfig
 from .logging_utils import get_logger
 from .models import StockRef
 from .providers import TencentQuoteProvider
+from .review import build_close_review
 from .storage import connect_db, fetch_latest_briefing, load_recent_quotes, replay_signal_stats
 
 
@@ -178,6 +179,9 @@ def run_feishu_command(config: AppConfig, command_text: str) -> str:
     if command.name == "brief":
         conn = connect_db(config.storage.sqlite_path)
         return format_mobile_digest(fetch_latest_briefing(conn))
+    if command.name == "review":
+        artifact = build_close_review(config)
+        return artifact.body
     if command.name == "quote":
         if not command.args:
             return "用法: quote 601698"
@@ -305,6 +309,7 @@ def _help_text(*, prefix: str | None = None) -> str:
             "支持命令:",
             "help",
             "brief",
+            "review",
             "quote 601698",
             "scan 601698",
             "replay",

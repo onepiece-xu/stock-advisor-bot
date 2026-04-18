@@ -91,11 +91,21 @@ class TradingPlanConfig:
 
 
 @dataclass(slots=True)
+class ReviewConfig:
+    enabled: bool
+    auto_notify: bool
+    send_after_hour: int
+    send_after_minute: int
+    data_dir: Path
+
+
+@dataclass(slots=True)
 class AppConfig:
     monitor: MonitorConfig
     portfolio: PortfolioConfig
     storage: StorageConfig
     trading_plan: TradingPlanConfig
+    review: ReviewConfig
     feishu_bot: FeishuBotConfig
 
 
@@ -115,6 +125,7 @@ def load_config(path: str | Path) -> AppConfig:
     dedup_raw = notification_raw.get("dedup", {})
     feishu_raw = notification_raw.get("feishu", {})
     trading_plan_raw = raw.get("trading_plan", {})
+    review_raw = raw.get("review", {})
     bot_raw = raw.get("feishu_bot", {})
 
     stocks = [
@@ -166,6 +177,13 @@ def load_config(path: str | Path) -> AppConfig:
         trading_plan=TradingPlanConfig(
             path=(config_path.parent / trading_plan_raw.get("path", "trading-plan.json")).resolve()
         ),
+        review=ReviewConfig(
+            enabled=bool(review_raw.get("enabled", True)),
+            auto_notify=bool(review_raw.get("auto_notify", True)),
+            send_after_hour=int(review_raw.get("send_after_hour", 15)),
+            send_after_minute=int(review_raw.get("send_after_minute", 10)),
+            data_dir=(config_path.parent / review_raw.get("data_dir", "data/reviews")).resolve(),
+        ),
         feishu_bot=FeishuBotConfig(
             enabled=bool(bot_raw.get("enabled", False)),
             app_id=str(bot_raw.get("app_id", "")),
@@ -203,6 +221,12 @@ def validate_config(path: str | Path) -> list[str]:
     if config.monitor.notification.feishu.enabled:
         if config.monitor.notification.feishu.delivery_mode == "webhook" and not config.monitor.notification.feishu.webhook_url:
             errors.append("开启 webhook 通知时必须填写 monitor.notification.feishu.webhook_url")
+
+    if config.review.send_after_hour < 0 or config.review.send_after_hour > 23:
+        errors.append("review.send_after_hour 必须在 0-23 之间")
+
+    if config.review.send_after_minute < 0 or config.review.send_after_minute > 59:
+        errors.append("review.send_after_minute 必须在 0-59 之间")
 
     if config.feishu_bot.enabled:
         if not config.feishu_bot.app_id:

@@ -39,6 +39,12 @@ storage:
   sqlite_path: data/market.db
 trading_plan:
   path: trading-plan.json
+review:
+  enabled: true
+  auto_notify: true
+  send_after_hour: 15
+  send_after_minute: 10
+  data_dir: data/reviews
 feishu_bot:
   enabled: false
   app_id: ""

@@ -9,11 +9,12 @@ from pathlib import Path
 from .analysis import analyze_quotes
 from .briefing import format_mobile_signal
 from .config import AppConfig
-from .market_hours import is_a_share_trading_time
+from .market_hours import MARKET_TZ, is_a_share_trading_time
 from .models import StockQuote
 from .logging_utils import get_logger
 from .notify import deliver_feishu_message
 from .providers import TencentQuoteProvider
+from .review import already_sent_close_review, build_close_review, mark_close_review_sent, should_send_close_review_now
 from .storage import connect_db, load_recent_quotes, persist_observation
 from .trading_plan import detect_trigger_hit, load_snapshot as load_trade_snapshot, load_triggers, render_trade_instruction
 
@@ -33,6 +34,7 @@ class MonitorRuntime:
     def run_once(self) -> None:
         self._prune_notifications()
         if self.config.monitor.schedule.restrict_to_trading_session and not is_a_share_trading_time():
+            self._maybe_send_close_review()
             print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] skip: outside A-share trading session")
             return
 
@@ -113,3 +115,21 @@ class MonitorRuntime:
         if hit is None:
             return None
         return render_trade_instruction(hit, snapshot)
+
+    def _maybe_send_close_review(self) -> None:
+        if not should_send_close_review_now(self.config):
+            return
+        trade_date = datetime.now(MARKET_TZ).date()
+        if already_sent_close_review(self.config, trade_date):
+            return
+        artifact = build_close_review(self.config, trade_date=trade_date)
+        logger.info("Generated close review report path=%s", artifact.saved_path)
+        if self.config.monitor.notification.feishu.enabled:
+            try:
+                deliver_feishu_message(self.config.monitor.notification.feishu, artifact.title, artifact.body)
+                mark_close_review_sent(self.config, trade_date)
+            except Exception as exc:  # noqa: BLE001
+                logger.exception("Close review delivery failed error=%s", exc)
+                return
+        else:
+            mark_close_review_sent(self.config, trade_date)

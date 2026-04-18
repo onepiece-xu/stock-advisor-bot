@@ -86,6 +86,9 @@ def init_db(conn: sqlite3.Connection) -> None:
           regime TEXT NOT NULL,
           rationale_json TEXT NOT NULL,
           risk_flags_json TEXT NOT NULL,
+          trade_advice TEXT NOT NULL DEFAULT '',
+          trade_size_hint TEXT NOT NULL DEFAULT '',
+          entry_note TEXT NOT NULL DEFAULT '',
           created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
           FOREIGN KEY (signal_id) REFERENCES signals(id)
         );
@@ -94,6 +97,9 @@ def init_db(conn: sqlite3.Connection) -> None:
         CREATE INDEX IF NOT EXISTS idx_decisions_action_time ON decision_signals(action, created_at);
         """
     )
+    _ensure_column(conn, "decision_signals", "trade_advice", "TEXT NOT NULL DEFAULT ''")
+    _ensure_column(conn, "decision_signals", "trade_size_hint", "TEXT NOT NULL DEFAULT ''")
+    _ensure_column(conn, "decision_signals", "entry_note", "TEXT NOT NULL DEFAULT ''")
     conn.commit()
 
 
@@ -188,8 +194,9 @@ def _insert_decision_signal(conn: sqlite3.Connection, signal_id: int, quote: Sto
     conn.execute(
         """
         INSERT INTO decision_signals (
-          signal_id, symbol, code, action, score, confidence, regime, rationale_json, risk_flags_json
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+          signal_id, symbol, code, action, score, confidence, regime, rationale_json, risk_flags_json,
+          trade_advice, trade_size_hint, entry_note
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
             signal_id,
@@ -201,6 +208,9 @@ def _insert_decision_signal(conn: sqlite3.Connection, signal_id: int, quote: Sto
             decision.regime,
             json.dumps(decision.rationale, ensure_ascii=False),
             json.dumps(decision.risk_flags, ensure_ascii=False),
+            decision.trade_advice,
+            decision.trade_size_hint,
+            decision.entry_note,
         ),
     )
 
@@ -335,6 +345,86 @@ def fetch_latest_briefing(conn: sqlite3.Connection) -> list[dict]:
     ]
 
 
+def fetch_daily_review_snapshot(conn: sqlite3.Connection, trade_date: str) -> list[dict]:
+    rows = conn.execute(
+        """
+        WITH daily_quotes AS (
+          SELECT *,
+                 ROW_NUMBER() OVER (PARTITION BY symbol ORDER BY quote_time DESC, id DESC) AS rn_desc,
+                 ROW_NUMBER() OVER (PARTITION BY symbol ORDER BY quote_time ASC, id ASC) AS rn_asc
+          FROM quotes
+          WHERE substr(quote_time, 1, 10) = ?
+        ),
+        latest_quotes AS (
+          SELECT *
+          FROM daily_quotes
+          WHERE rn_desc = 1
+        ),
+        opening_quotes AS (
+          SELECT symbol, current_price AS first_price, quote_time AS first_quote_time
+          FROM daily_quotes
+          WHERE rn_asc = 1
+        ),
+        latest_signals AS (
+          SELECT s.*, ROW_NUMBER() OVER (PARTITION BY s.symbol ORDER BY s.signal_time DESC, s.id DESC) AS rn_desc
+          FROM signals s
+          WHERE substr(s.signal_time, 1, 10) = ?
+        )
+        SELECT q.symbol, q.code, q.name, q.quote_time, q.current_price, q.open_price, q.previous_close,
+               q.high_price, q.low_price, q.change_percent, q.turnover_yuan,
+               o.first_price, o.first_quote_time,
+               s.signal_level, d.action, d.score, d.confidence, d.regime, d.rationale_json, d.risk_flags_json,
+               d.trade_advice, d.trade_size_hint, d.entry_note
+        FROM latest_quotes q
+        LEFT JOIN opening_quotes o ON o.symbol = q.symbol
+        LEFT JOIN latest_signals s ON s.symbol = q.symbol AND s.rn_desc = 1
+        LEFT JOIN decision_signals d ON d.signal_id = s.id
+        ORDER BY COALESCE(d.score, 0) DESC, q.symbol ASC
+        """,
+        (trade_date, trade_date),
+    ).fetchall()
+    return [
+        {
+            "symbol": row["symbol"],
+            "code": row["code"],
+            "name": row["name"],
+            "quote_time": row["quote_time"],
+            "current_price": round(float(row["current_price"]), 3),
+            "open_price": round(float(row["open_price"]), 3),
+            "previous_close": round(float(row["previous_close"]), 3),
+            "high_price": round(float(row["high_price"]), 3),
+            "low_price": round(float(row["low_price"]), 3),
+            "change_percent": round(float(row["change_percent"]), 2),
+            "turnover_yuan": round(float(row["turnover_yuan"]), 2),
+            "first_price": round(float(row["first_price"]), 3) if row["first_price"] is not None else None,
+            "first_quote_time": row["first_quote_time"],
+            "signal_level": row["signal_level"] or "UNKNOWN",
+            "action": row["action"] or "unknown",
+            "score": round(float(row["score"]), 2) if row["score"] is not None else None,
+            "confidence": row["confidence"] or "unknown",
+            "regime": row["regime"] or "unknown",
+            "rationale": json.loads(row["rationale_json"]) if row["rationale_json"] else [],
+            "risk_flags": json.loads(row["risk_flags_json"]) if row["risk_flags_json"] else [],
+            "trade_advice": row["trade_advice"] or "",
+            "trade_size_hint": row["trade_size_hint"] or "",
+            "entry_note": row["entry_note"] or "",
+        }
+        for row in rows
+    ]
+
+
+def fetch_latest_trade_date(conn: sqlite3.Connection) -> str | None:
+    row = conn.execute(
+        """
+        SELECT substr(MAX(quote_time), 1, 10) AS trade_date
+        FROM quotes
+        """
+    ).fetchone()
+    if row is None:
+        return None
+    return row["trade_date"]
+
+
 def _row_to_quote(row: sqlite3.Row) -> StockQuote:
     return StockQuote(
         provider=row["provider"],
@@ -357,6 +447,14 @@ def _row_to_quote(row: sqlite3.Row) -> StockQuote:
 
 def _decimal(value: object) -> Decimal:
     return Decimal(str(value))
+
+
+def _ensure_column(conn: sqlite3.Connection, table_name: str, column_name: str, ddl: str) -> None:
+    rows = conn.execute(f"PRAGMA table_info({table_name})").fetchall()
+    columns = {row["name"] for row in rows}
+    if column_name in columns:
+        return
+    conn.execute(f"ALTER TABLE {table_name} ADD COLUMN {column_name} {ddl}")
 
 
 def _summarize_returns(values: list[float]) -> dict:

@@ -11,6 +11,7 @@
 - 基于历史信号做回放统计
 - 输出适合手机飞书机器人的短摘要
 - 支持飞书机器人消息回调服务
+- 支持每个交易日收盘后的复盘报告
 - 输出控制台报告
 - 可选发送飞书 webhook 通知
 - 支持收盘持仓建议 CLI
@@ -48,6 +49,7 @@ python3 -m pip install --user -r requirements.txt
 - 本地结构化快照：`portfolio-snapshot.json`
 - 飞书机器人监听配置：`feishu_bot`
 - 交易计划样例：`trading-plan.example.json`
+- 收盘复盘配置：`review`
 - 用户级 systemd 服务文件：`systemd/user/`
 
 ## 单次行情轮询
@@ -101,6 +103,27 @@ python3 -m stock_advisor.cli init-trading-plan --config config.yaml
 ```bash
 python3 -m stock_advisor.cli validate-config --config config.yaml
 ```
+
+## 收盘复盘
+
+手动生成：
+
+```bash
+python3 -m stock_advisor.cli close-review --config config.yaml
+```
+
+生成并推送到飞书：
+
+```bash
+python3 -m stock_advisor.cli close-review --config config.yaml --notify
+```
+
+说明：
+
+- 报告默认保存到 `data/reviews`
+- daemon 在非交易时段运行时，如果时间晚于 `review.send_after_hour:review.send_after_minute`，会每天自动生成并最多推送一次
+- 没有持仓快照时，仍会生成基于行情与决策的市场复盘
+- 如果存在 `portfolio-snapshot.json`，会额外生成持仓复盘段落
 
 如果使用 `direct_dm` 模式，消息会先写到本地 outbox，可用下面脚本继续转发：
 
@@ -205,6 +228,7 @@ feishu_bot:
 ```text
 help
 brief
+review
 quote 601698
 scan 601698
 replay
@@ -217,6 +241,7 @@ replay action=reduce level=ALERT symbol=601698
 命令含义：
 
 - `brief`：返回当前缓存中的聚合决策简报
+- `review`：返回最近一个交易日的收盘复盘
 - `quote`：返回某个股票最近一次落库决策
 - `scan`：实时拉一次最新行情并临时分析，不写库
 - `replay`：返回历史回放统计，可按动作 / 等级 / 股票过滤

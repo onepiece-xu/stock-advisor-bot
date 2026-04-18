@@ -5,6 +5,7 @@ from decimal import Decimal, ROUND_HALF_UP
 from .advice import build_action_candidates, render_action_candidates
 from .config import MonitorConfig
 from .models import DecisionSignal, ObservationMetrics, ObservationResult, StockQuote
+from .news import fetch_stock_news, render_news_lines
 
 
 def analyze_quotes(history: list[StockQuote], monitor_config: MonitorConfig) -> ObservationResult:
@@ -45,6 +46,7 @@ def analyze_quotes(history: list[StockQuote], monitor_config: MonitorConfig) -> 
         observations.append("观察：当前未触发明显信号，建议继续跟踪价格、短期均价和成交额变化。仅供参考，不构成投资建议。")
 
     observations.extend(render_action_candidates(build_action_candidates(current)))
+    observations.extend(render_news_lines(fetch_stock_news(current)))
     metrics = ObservationMetrics(
         avg3=avg3,
         avg6=avg6,

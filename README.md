@@ -114,6 +114,12 @@ python3 scripts/flush_direct_dm_outbox.py
 python3 scripts/flush_failed_notifications.py
 ```
 
+也可以直接走 CLI：
+
+```bash
+python3 -m stock_advisor.cli flush-failed-notifications
+```
+
 查看状态：
 
 ```bash

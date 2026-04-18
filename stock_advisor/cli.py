@@ -7,7 +7,7 @@ from decimal import Decimal
 from .config import load_config, require_valid_config, validate_config
 from .briefing import format_mobile_digest, format_mobile_replay, format_mobile_signal
 from .feishu_bot_server import serve_feishu_bot
-from .notify import deliver_feishu_message
+from .notify import deliver_feishu_message, flush_failed_notifications
 from .portfolio import build_daily_report, load_previous_snapshot, load_snapshot, save_snapshot
 from .providers import TencentQuoteProvider
 from .analysis import analyze_quotes
@@ -60,6 +60,9 @@ def main() -> None:
     validate_parser = subparsers.add_parser("validate-config", help="校验配置文件和交易计划")
     validate_parser.add_argument("--config", required=True, help="配置文件路径")
 
+    flush_parser = subparsers.add_parser("flush-failed-notifications", help="重放失败的 webhook 通知")
+    flush_parser.add_argument("--config", required=False, help="保留参数位，兼容统一运维脚本")
+
     args = parser.parse_args()
 
     if args.command == "monitor-once":
@@ -80,6 +83,8 @@ def main() -> None:
         run_init_trading_plan(args.config)
     elif args.command == "validate-config":
         run_validate_config(args.config)
+    elif args.command == "flush-failed-notifications":
+        run_flush_failed_notifications()
 
 
 def run_monitor_once(config_path: str, force_notify: bool, mobile: bool) -> None:
@@ -180,6 +185,16 @@ def run_validate_config(config_path: str) -> None:
             print(f"- {error}")
         raise SystemExit(1)
     print("配置校验通过")
+
+
+def run_flush_failed_notifications() -> None:
+    sent_count, pending_count = flush_failed_notifications()
+    if sent_count:
+        print(f"已重放失败通知: {sent_count}")
+    elif pending_count:
+        print(f"仍有失败通知待重放: {pending_count}")
+    else:
+        print("没有待重放的失败通知")
 
 
 if __name__ == "__main__":

@@ -31,6 +31,7 @@ class MonitorRuntime:
         self.trade_triggers = load_triggers(config.trading_plan.path)
 
     def run_once(self) -> None:
+        self._prune_notifications()
         if self.config.monitor.schedule.restrict_to_trading_session and not is_a_share_trading_time():
             print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] skip: outside A-share trading session")
             return
@@ -95,6 +96,13 @@ class MonitorRuntime:
         if self.history[symbol]:
             return
         self.history[symbol].extend(load_recent_quotes(self.db, symbol, self.config.monitor.history_size - 1))
+
+    def _prune_notifications(self) -> None:
+        cooldown = max(self.config.monitor.notification.dedup.cooldown_minutes, 1)
+        cutoff = datetime.now() - timedelta(minutes=cooldown * 2)
+        self.last_notifications = {
+            key: value for key, value in self.last_notifications.items() if value[1] > cutoff
+        }
 
     def _build_trigger_message(self, quote: StockQuote) -> str | None:
         snapshot_path = Path(self.config.storage.sqlite_path).resolve().parent.parent / "portfolio-snapshot.json"

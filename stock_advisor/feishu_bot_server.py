@@ -13,6 +13,7 @@ import requests
 from .analysis import analyze_quotes
 from .briefing import format_mobile_digest, format_mobile_replay, format_mobile_signal
 from .config import AppConfig
+from .logging_utils import get_logger
 from .models import StockRef
 from .providers import TencentQuoteProvider
 from .storage import connect_db, fetch_latest_briefing, load_recent_quotes, replay_signal_stats
@@ -24,6 +25,7 @@ MENTION_PATTERNS = [
     re.compile(r"<at[^>]*>.*?</at>", re.IGNORECASE),
     re.compile(r"@_user_\d+"),
 ]
+logger = get_logger(__name__)
 
 
 @dataclass(slots=True)
@@ -101,6 +103,7 @@ def serve_feishu_bot(config: AppConfig) -> None:
                     self._handle_url_verification(payload)
                     return
                 if payload.get("encrypt"):
+                    logger.warning("Rejected encrypted Feishu callback because encryption support is not implemented")
                     self._send_json(
                         {
                             "code": 1,

@@ -64,3 +64,45 @@ def _queue_failed_notification(delivery_mode: str, title: str, message: str, err
     }
     with FAILED_OUTBOX_PATH.open("a", encoding="utf-8") as handle:
         handle.write(json.dumps(payload, ensure_ascii=False) + "\n")
+
+
+def flush_failed_notifications() -> tuple[int, int]:
+    if not FAILED_OUTBOX_PATH.exists():
+        return (0, 0)
+
+    rows = FAILED_OUTBOX_PATH.read_text(encoding="utf-8").splitlines()
+    pending: list[dict] = []
+    sent_count = 0
+
+    for row in rows:
+        if not row.strip():
+            continue
+        item = json.loads(row)
+        if item.get("sent"):
+            pending.append(item)
+            continue
+
+        if item.get("delivery_mode") != "webhook" or not item.get("target"):
+            pending.append(item)
+            continue
+
+        payload = {
+            "msg_type": "text",
+            "content": {
+                "text": f"{item['title']}\n\n{item['message']}",
+            },
+        }
+        try:
+            response = requests.post(item["target"], json=payload, timeout=8)
+            response.raise_for_status()
+            item["sent"] = True
+            sent_count += 1
+        except requests.RequestException as exc:
+            item["last_error"] = str(exc)
+            logger.warning("Failed notification replay failed title=%s error=%s", item.get("title"), exc)
+        pending.append(item)
+
+    suffix = "\n" if pending else ""
+    FAILED_OUTBOX_PATH.write_text("\n".join(json.dumps(item, ensure_ascii=False) for item in pending) + suffix, encoding="utf-8")
+    pending_count = sum(1 for item in pending if not item.get("sent"))
+    return (sent_count, pending_count)

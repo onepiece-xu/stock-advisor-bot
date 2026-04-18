@@ -10,6 +10,7 @@
 - 把行情 / 信号 / 决策持久化到 SQLite
 - 基于历史信号做回放统计
 - 输出适合手机飞书机器人的短摘要
+- 支持飞书机器人消息回调服务
 - 输出控制台报告
 - 可选发送飞书 webhook 通知
 - 支持收盘持仓建议 CLI
@@ -30,6 +31,7 @@
 - 每条决策都会给出动作、分数、状态、理由、风险标签，便于后续继续接 LLM 总结层
 - 当前使用场景按“手机飞书机器人查看”为主来优化输出，不假设你会长期守着电脑终端
 - 飞书通知支持两种投递方式：`webhook` 和 `direct_dm`
+- 飞书机器人服务使用 Feishu/Lark 应用凭证，可直接在手机里发命令查询
 
 ## 安装依赖
 
@@ -44,6 +46,7 @@ python3 -m pip install --user -r requirements.txt
 - 当前实际配置：`config.yaml`
 - 长期持仓文档（飞书）：`https://wcntg42cmak8.feishu.cn/docx/DXRDdRGRJohquex19VucUqh0nVd`
 - 本地结构化快照：`portfolio-snapshot.json`
+- 飞书机器人监听配置：`feishu_bot`
 
 ## 单次行情轮询
 
@@ -139,6 +142,56 @@ python3 -m stock_advisor.cli mobile-brief --config config.yaml --notify
 
 适合后续在定时任务或飞书机器人命令里直接调用。
 
+## 飞书机器人命令服务
+
+启动服务：
+
+```bash
+python3 -m stock_advisor.cli serve-feishu-bot --config config.yaml
+```
+
+示例配置：
+
+```yaml
+feishu_bot:
+  enabled: true
+  app_id: "cli_xxx"
+  app_secret: "xxx"
+  verification_token: "xxx"
+  listen_host: 0.0.0.0
+  listen_port: 8788
+  allowed_chat_ids: []
+```
+
+说明：
+
+- 需要在飞书开放平台里创建应用，打开机器人能力和事件订阅
+- 事件订阅里至少订阅 `im.message.receive_v1`
+- 回调 URL 指向你家里机器能被飞书访问到的地址
+- 当前实现只支持未加密回调。如果飞书后台开启了 Encrypt Key，需要先关闭加密
+- `allowed_chat_ids` 为空表示不限制；如果填了，只允许这些会话触发命令
+
+手机里可直接发送这些命令：
+
+```text
+help
+brief
+quote 601698
+scan 601698
+replay
+replay reduce
+replay ALERT
+replay 601698
+replay action=reduce level=ALERT symbol=601698
+```
+
+命令含义：
+
+- `brief`：返回当前缓存中的聚合决策简报
+- `quote`：返回某个股票最近一次落库决策
+- `scan`：实时拉一次最新行情并临时分析，不写库
+- `replay`：返回历史回放统计，可按动作 / 等级 / 股票过滤
+
 ## 历史回放统计
 
 ```bash
@@ -172,14 +225,14 @@ python3 -m stock_advisor.cli replay-signals \
 
 ## 当前限制
 
-- 当前还没有接入真正的飞书消息回调服务，更多是“飞书友好输出 + webhook 推送”
+- 飞书机器人当前只支持文本消息命令，不支持卡片交互和加密事件
 - 决策层目前是规则评分引擎，不是接入 LLM 的研究代理
 - 腾讯行情接口属于公开行情源，稳定性不如正式行情服务
 - 还没做 systemd / 开机自启
 
 ## 下一步建议
 
-- 加飞书机器人命令回调入口，让手机直接发“/brief”“/replay reduce”这类指令
+- 给飞书机器人加菜单卡片和快捷按钮
 - 接入大模型做新闻 / 公告 / 财报摘要
 - 增加 systemd 托管和开机自启
 - 加入导出日报 / 周报

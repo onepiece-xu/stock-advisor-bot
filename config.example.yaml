@@ -37,3 +37,11 @@ portfolio:
   data_dir: data/portfolio
 storage:
   sqlite_path: data/market.db
+feishu_bot:
+  enabled: false
+  app_id: ""
+  app_secret: ""
+  verification_token: ""
+  listen_host: 0.0.0.0
+  listen_port: 8788
+  allowed_chat_ids: []

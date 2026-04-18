@@ -7,10 +7,9 @@ from datetime import datetime, timedelta
 from .analysis import analyze_quotes
 from .briefing import format_mobile_signal
 from .config import AppConfig
-from .direct_notify import write_direct_dm
 from .market_hours import is_a_share_trading_time
 from .models import StockQuote
-from .notify import send_feishu_webhook
+from .notify import deliver_feishu_message
 from .providers import TencentQuoteProvider
 from .storage import connect_db, insert_quote, insert_signal, load_recent_quotes
 
@@ -76,10 +75,7 @@ class MonitorRuntime:
         return True
 
     def _notify(self, symbol: str, title: str, message: str) -> None:
-        if self.config.monitor.notification.feishu.delivery_mode == "direct_dm":
-            write_direct_dm(title, message)
-        else:
-            send_feishu_webhook(self.config.monitor.notification.feishu.webhook_url, title, message)
+        deliver_feishu_message(self.config.monitor.notification.feishu, title, message)
         self.last_notifications[symbol] = ("\n".join(message.splitlines()[-len(message.splitlines()):]), datetime.now())
 
     def _hydrate_history(self, symbol: str) -> None:

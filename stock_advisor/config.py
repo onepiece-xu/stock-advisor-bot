@@ -25,6 +25,17 @@ class FeishuConfig:
 
 
 @dataclass(slots=True)
+class FeishuBotConfig:
+    enabled: bool
+    app_id: str
+    app_secret: str
+    verification_token: str
+    listen_host: str
+    listen_port: int
+    allowed_chat_ids: list[str]
+
+
+@dataclass(slots=True)
 class DedupConfig:
     enabled: bool
     cooldown_minutes: int
@@ -78,6 +89,7 @@ class AppConfig:
     monitor: MonitorConfig
     portfolio: PortfolioConfig
     storage: StorageConfig
+    feishu_bot: FeishuBotConfig
 
 
 def load_config(path: str | Path) -> AppConfig:
@@ -91,6 +103,7 @@ def load_config(path: str | Path) -> AppConfig:
     notification_raw = monitor_raw.get("notification", {})
     dedup_raw = notification_raw.get("dedup", {})
     feishu_raw = notification_raw.get("feishu", {})
+    bot_raw = raw.get("feishu_bot", {})
 
     stocks = [
         StockRef(exchange=item["exchange"], code=str(item["code"]))
@@ -137,5 +150,14 @@ def load_config(path: str | Path) -> AppConfig:
         ),
         storage=StorageConfig(
             sqlite_path=(config_path.parent / raw.get("storage", {}).get("sqlite_path", "data/market.db")).resolve()
+        ),
+        feishu_bot=FeishuBotConfig(
+            enabled=bool(bot_raw.get("enabled", False)),
+            app_id=str(bot_raw.get("app_id", "")),
+            app_secret=str(bot_raw.get("app_secret", "")),
+            verification_token=str(bot_raw.get("verification_token", "")),
+            listen_host=str(bot_raw.get("listen_host", "0.0.0.0")),
+            listen_port=int(bot_raw.get("listen_port", 8788)),
+            allowed_chat_ids=[str(item) for item in bot_raw.get("allowed_chat_ids", [])],
         ),
     )

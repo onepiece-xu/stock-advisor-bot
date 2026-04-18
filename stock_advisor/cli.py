@@ -4,7 +4,8 @@ import argparse
 
 from .config import load_config
 from .briefing import format_mobile_digest, format_mobile_replay, format_mobile_signal
-from .notify import send_feishu_webhook
+from .feishu_bot_server import serve_feishu_bot
+from .notify import deliver_feishu_message
 from .portfolio import build_daily_report, load_previous_snapshot, load_snapshot, save_snapshot
 from .providers import TencentQuoteProvider
 from .analysis import analyze_quotes
@@ -40,6 +41,9 @@ def main() -> None:
     digest_parser.add_argument("--config", required=True, help="配置文件路径")
     digest_parser.add_argument("--notify", action="store_true", help="把简报发送到飞书")
 
+    bot_parser = subparsers.add_parser("serve-feishu-bot", help="启动飞书机器人命令回调服务")
+    bot_parser.add_argument("--config", required=True, help="配置文件路径")
+
     args = parser.parse_args()
 
     if args.command == "monitor-once":
@@ -52,6 +56,8 @@ def main() -> None:
         run_replay_signals(args.config, args.symbol, args.level, args.action, args.notify)
     elif args.command == "mobile-brief":
         run_mobile_brief(args.config, args.notify)
+    elif args.command == "serve-feishu-bot":
+        run_feishu_bot(args.config)
 
 
 def run_monitor_once(config_path: str, force_notify: bool, mobile: bool) -> None:
@@ -71,10 +77,10 @@ def run_monitor_once(config_path: str, force_notify: bool, mobile: bool) -> None
         print(rendered)
         quote_id = insert_quote(conn, quote)
         insert_signal(conn, quote_id, quote, result)
-        if (force_notify or result.should_notify or config.monitor.notification.notify_on_neutral) and config.monitor.notification.feishu.enabled:
-            if config.monitor.notification.feishu.webhook_url:
+        if force_notify or result.should_notify or config.monitor.notification.notify_on_neutral:
+            if config.monitor.notification.feishu.enabled:
                 payload = format_mobile_signal(result.title, result.message, include_title=False) if mobile else result.message
-                send_feishu_webhook(config.monitor.notification.feishu.webhook_url, result.title, payload)
+                deliver_feishu_message(config.monitor.notification.feishu, result.title, payload)
 
 
 def run_monitor_daemon(config_path: str) -> None:
@@ -92,9 +98,9 @@ def run_portfolio_report(config_path: str, snapshot_path: str, notify: bool) -> 
     print(report)
     print(f"\n[saved] {saved_path}")
 
-    if notify and config.monitor.notification.feishu.enabled and config.monitor.notification.feishu.webhook_url:
-        send_feishu_webhook(
-            config.monitor.notification.feishu.webhook_url,
+    if notify and config.monitor.notification.feishu.enabled:
+        deliver_feishu_message(
+            config.monitor.notification.feishu,
             f"收盘持仓建议 {snapshot.trade_date.isoformat()}",
             report,
         )
@@ -112,8 +118,8 @@ def run_replay_signals(
     stats = replay_signal_stats(conn, symbol=symbol, signal_level=level, action=action)
     rendered = format_mobile_replay(stats, symbol=symbol, level=level, action=action)
     print(rendered)
-    if notify and config.monitor.notification.feishu.enabled and config.monitor.notification.feishu.webhook_url:
-        send_feishu_webhook(config.monitor.notification.feishu.webhook_url, "历史回放统计", rendered)
+    if notify and config.monitor.notification.feishu.enabled:
+        deliver_feishu_message(config.monitor.notification.feishu, "历史回放统计", rendered)
 
 
 def run_mobile_brief(config_path: str, notify: bool) -> None:
@@ -121,8 +127,13 @@ def run_mobile_brief(config_path: str, notify: bool) -> None:
     conn = connect_db(config.storage.sqlite_path)
     rendered = format_mobile_digest(fetch_latest_briefing(conn))
     print(rendered)
-    if notify and config.monitor.notification.feishu.enabled and config.monitor.notification.feishu.webhook_url:
-        send_feishu_webhook(config.monitor.notification.feishu.webhook_url, "AI股票决策简报", rendered)
+    if notify and config.monitor.notification.feishu.enabled:
+        deliver_feishu_message(config.monitor.notification.feishu, "AI股票决策简报", rendered)
+
+
+def run_feishu_bot(config_path: str) -> None:
+    config = load_config(config_path)
+    serve_feishu_bot(config)
 
 
 if __name__ == "__main__":

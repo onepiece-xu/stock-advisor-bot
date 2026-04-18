@@ -4,7 +4,7 @@ import argparse
 
 from decimal import Decimal
 
-from .config import load_config
+from .config import load_config, require_valid_config, validate_config
 from .briefing import format_mobile_digest, format_mobile_replay, format_mobile_signal
 from .feishu_bot_server import serve_feishu_bot
 from .notify import deliver_feishu_message
@@ -57,6 +57,9 @@ def main() -> None:
     init_trade_plan_parser = subparsers.add_parser("init-trading-plan", help="生成默认交易计划文件")
     init_trade_plan_parser.add_argument("--config", required=True, help="配置文件路径")
 
+    validate_parser = subparsers.add_parser("validate-config", help="校验配置文件和交易计划")
+    validate_parser.add_argument("--config", required=True, help="配置文件路径")
+
     args = parser.parse_args()
 
     if args.command == "monitor-once":
@@ -75,10 +78,12 @@ def main() -> None:
         run_record_fill(args.snapshot, args.side, args.code, args.quantity, args.price)
     elif args.command == "init-trading-plan":
         run_init_trading_plan(args.config)
+    elif args.command == "validate-config":
+        run_validate_config(args.config)
 
 
 def run_monitor_once(config_path: str, force_notify: bool, mobile: bool) -> None:
-    config = load_config(config_path)
+    config = require_valid_config(config_path)
     provider = TencentQuoteProvider(config.monitor)
     conn = connect_db(config.storage.sqlite_path)
 
@@ -100,13 +105,13 @@ def run_monitor_once(config_path: str, force_notify: bool, mobile: bool) -> None
 
 
 def run_monitor_daemon(config_path: str) -> None:
-    config = load_config(config_path)
+    config = require_valid_config(config_path)
     runtime = MonitorRuntime(config)
     runtime.serve_forever()
 
 
 def run_portfolio_report(config_path: str, snapshot_path: str, notify: bool) -> None:
-    config = load_config(config_path)
+    config = require_valid_config(config_path)
     snapshot = load_snapshot(snapshot_path)
     previous = load_previous_snapshot(config.portfolio.data_dir, snapshot.trade_date)
     saved_path = save_snapshot(snapshot, config.portfolio.data_dir)
@@ -129,7 +134,7 @@ def run_replay_signals(
     action: str | None,
     notify: bool,
 ) -> None:
-    config = load_config(config_path)
+    config = require_valid_config(config_path)
     conn = connect_db(config.storage.sqlite_path)
     stats = replay_signal_stats(conn, symbol=symbol, signal_level=level, action=action)
     rendered = format_mobile_replay(stats, symbol=symbol, level=level, action=action)
@@ -139,7 +144,7 @@ def run_replay_signals(
 
 
 def run_mobile_brief(config_path: str, notify: bool) -> None:
-    config = load_config(config_path)
+    config = require_valid_config(config_path)
     conn = connect_db(config.storage.sqlite_path)
     rendered = format_mobile_digest(fetch_latest_briefing(conn))
     print(rendered)
@@ -148,7 +153,7 @@ def run_mobile_brief(config_path: str, notify: bool) -> None:
 
 
 def run_feishu_bot(config_path: str) -> None:
-    config = load_config(config_path)
+    config = require_valid_config(config_path)
     serve_feishu_bot(config)
 
 
@@ -165,6 +170,16 @@ def run_init_trading_plan(config_path: str) -> None:
     config = load_config(config_path)
     path = ensure_trigger_file(config.trading_plan.path)
     print(f"已生成默认交易计划文件：{path}")
+
+
+def run_validate_config(config_path: str) -> None:
+    errors = validate_config(config_path)
+    if errors:
+        print("配置校验失败：")
+        for error in errors:
+            print(f"- {error}")
+        raise SystemExit(1)
+    print("配置校验通过")
 
 
 if __name__ == "__main__":

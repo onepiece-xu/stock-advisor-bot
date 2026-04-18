@@ -48,6 +48,7 @@ python3 -m pip install --user -r requirements.txt
 - 本地结构化快照：`portfolio-snapshot.json`
 - 飞书机器人监听配置：`feishu_bot`
 - 交易计划样例：`trading-plan.example.json`
+- 用户级 systemd 服务文件：`systemd/user/`
 
 ## 单次行情轮询
 
@@ -94,6 +95,12 @@ python3 -m stock_advisor.cli init-trading-plan --config config.yaml
 ```
 
 生成后直接编辑项目根目录下的 `trading-plan.json` 即可，不需要改代码重启部署逻辑。
+
+校验配置：
+
+```bash
+python3 -m stock_advisor.cli validate-config --config config.yaml
+```
 
 如果使用 `direct_dm` 模式，消息会先写到本地 outbox，可用下面脚本继续转发：
 
@@ -208,6 +215,48 @@ replay action=reduce level=ALERT symbol=601698
 - `scan`：实时拉一次最新行情并临时分析，不写库
 - `replay`：返回历史回放统计，可按动作 / 等级 / 股票过滤
 
+## systemd 自启动
+
+适合把家里的机器作为长期运行节点。
+
+先确认：
+
+- WSL 已启用 `systemd`
+- `config.yaml` 已填写完成
+- 飞书 bot 如果需要启用，`feishu_bot.enabled` 已设为 `true`
+
+安装用户级服务：
+
+```bash
+./scripts/install_systemd_user_services.sh
+```
+
+启用监控服务：
+
+```bash
+systemctl --user enable --now stock-advisor-monitor.service
+```
+
+启用飞书 bot 服务：
+
+```bash
+systemctl --user enable --now stock-advisor-feishu-bot.service
+```
+
+查看状态：
+
+```bash
+systemctl --user status stock-advisor-monitor.service
+systemctl --user status stock-advisor-feishu-bot.service
+```
+
+跟踪日志：
+
+```bash
+journalctl --user -u stock-advisor-monitor.service -f
+journalctl --user -u stock-advisor-feishu-bot.service -f
+```
+
 ## 历史回放统计
 
 ```bash
@@ -245,11 +294,11 @@ python3 -m stock_advisor.cli replay-signals \
 - 决策层目前是规则评分引擎，不是接入 LLM 的研究代理
 - 腾讯行情接口属于公开行情源，稳定性不如正式行情服务
 - 交易计划文件当前是 JSON，尚未接入飞书侧动态改价
-- 还没做 systemd / 开机自启
+- 当前只提供用户级 systemd 文件，未提供 root 级 system service
 
 ## 下一步建议
 
 - 给飞书机器人加菜单卡片和快捷按钮
 - 接入大模型做新闻 / 公告 / 财报摘要
-- 增加 systemd 托管和开机自启
+- 增加 systemd 健康检查和失败告警
 - 加入导出日报 / 周报

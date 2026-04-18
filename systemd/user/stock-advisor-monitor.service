@@ -1,0 +1,15 @@
+[Unit]
+Description=Stock Advisor Monitor Daemon
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=%h/projects/stock-advisor-bot
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/usr/bin/python3 -m stock_advisor.cli monitor-daemon --config %h/projects/stock-advisor-bot/config.yaml
+Restart=on-failure
+RestartSec=10
+
+[Install]
+WantedBy=default.target

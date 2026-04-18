@@ -7,6 +7,7 @@ from typing import Any
 import yaml
 
 from .models import StockRef
+from .trading_plan import load_triggers
 
 
 @dataclass(slots=True)
@@ -98,6 +99,10 @@ class AppConfig:
     feishu_bot: FeishuBotConfig
 
 
+class ConfigValidationError(RuntimeError):
+    pass
+
+
 def load_config(path: str | Path) -> AppConfig:
     config_path = Path(path)
     raw: dict[str, Any] = yaml.safe_load(config_path.read_text(encoding="utf-8")) or {}
@@ -171,3 +176,63 @@ def load_config(path: str | Path) -> AppConfig:
             allowed_chat_ids=[str(item) for item in bot_raw.get("allowed_chat_ids", [])],
         ),
     )
+
+
+def validate_config(path: str | Path) -> list[str]:
+    errors: list[str] = []
+    config = load_config(path)
+
+    if not config.monitor.stocks:
+        errors.append("monitor.stocks 不能为空")
+
+    if config.monitor.history_size < 2:
+        errors.append("monitor.signal.history_size 至少应为 2")
+
+    if config.monitor.schedule.fixed_delay_seconds <= 0:
+        errors.append("monitor.schedule.fixed_delay_seconds 必须大于 0")
+
+    if config.monitor.provider_settings.request_timeout_ms <= 0:
+        errors.append("monitor.provider_settings.request_timeout_ms 必须大于 0")
+
+    if config.monitor.notification.dedup.cooldown_minutes < 0:
+        errors.append("monitor.notification.dedup.cooldown_minutes 不能小于 0")
+
+    if config.monitor.notification.feishu.delivery_mode not in {"webhook", "direct_dm"}:
+        errors.append("monitor.notification.feishu.delivery_mode 仅支持 webhook 或 direct_dm")
+
+    if config.monitor.notification.feishu.enabled:
+        if config.monitor.notification.feishu.delivery_mode == "webhook" and not config.monitor.notification.feishu.webhook_url:
+            errors.append("开启 webhook 通知时必须填写 monitor.notification.feishu.webhook_url")
+
+    if config.feishu_bot.enabled:
+        if not config.feishu_bot.app_id:
+            errors.append("开启 feishu_bot 时必须填写 feishu_bot.app_id")
+        if not config.feishu_bot.app_secret:
+            errors.append("开启 feishu_bot 时必须填写 feishu_bot.app_secret")
+        if config.feishu_bot.listen_port <= 0 or config.feishu_bot.listen_port > 65535:
+            errors.append("feishu_bot.listen_port 必须在 1-65535 之间")
+
+    try:
+        triggers = load_triggers(config.trading_plan.path)
+    except Exception as exc:  # noqa: BLE001
+        errors.append(f"trading_plan.path 无法读取: {exc}")
+        return errors
+
+    for code, trigger in triggers.items():
+        if trigger.action not in {"sell", "hold", "buy"}:
+            errors.append(f"trading plan {code} 的 action 仅支持 sell/hold/buy")
+        if trigger.quantity <= 0:
+            errors.append(f"trading plan {code} 的 quantity 必须大于 0")
+        if trigger.price_min > trigger.price_max:
+            errors.append(f"trading plan {code} 的 priceMin 不能大于 priceMax")
+        if trigger.fallback_price <= 0:
+            errors.append(f"trading plan {code} 的 fallbackPrice 必须大于 0")
+
+    return errors
+
+
+def require_valid_config(path: str | Path) -> AppConfig:
+    errors = validate_config(path)
+    if errors:
+        raise ConfigValidationError("配置校验失败:\n- " + "\n- ".join(errors))
+    return load_config(path)

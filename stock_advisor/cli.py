@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import argparse
 
+from decimal import Decimal
+
 from .config import load_config
 from .briefing import format_mobile_digest, format_mobile_replay, format_mobile_signal
 from .feishu_bot_server import serve_feishu_bot
@@ -11,6 +13,7 @@ from .providers import TencentQuoteProvider
 from .analysis import analyze_quotes
 from .runtime import MonitorRuntime
 from .storage import connect_db, fetch_latest_briefing, insert_quote, insert_signal, load_recent_quotes, replay_signal_stats
+from .trading_plan import apply_trade_fill
 
 
 def main() -> None:
@@ -44,6 +47,13 @@ def main() -> None:
     bot_parser = subparsers.add_parser("serve-feishu-bot", help="启动飞书机器人命令回调服务")
     bot_parser.add_argument("--config", required=True, help="配置文件路径")
 
+    fill_parser = subparsers.add_parser("record-fill", help="记录成交结果并更新本地持仓快照")
+    fill_parser.add_argument("--snapshot", required=True, help="持仓快照 JSON 文件")
+    fill_parser.add_argument("--side", required=True, choices=["buy", "sell"], help="成交方向")
+    fill_parser.add_argument("--code", required=True, help="股票代码")
+    fill_parser.add_argument("--quantity", required=True, type=int, help="成交数量")
+    fill_parser.add_argument("--price", required=True, help="成交价")
+
     args = parser.parse_args()
 
     if args.command == "monitor-once":
@@ -58,6 +68,8 @@ def main() -> None:
         run_mobile_brief(args.config, args.notify)
     elif args.command == "serve-feishu-bot":
         run_feishu_bot(args.config)
+    elif args.command == "record-fill":
+        run_record_fill(args.snapshot, args.side, args.code, args.quantity, args.price)
 
 
 def run_monitor_once(config_path: str, force_notify: bool, mobile: bool) -> None:
@@ -134,6 +146,13 @@ def run_mobile_brief(config_path: str, notify: bool) -> None:
 def run_feishu_bot(config_path: str) -> None:
     config = load_config(config_path)
     serve_feishu_bot(config)
+
+
+def run_record_fill(snapshot_path: str, side: str, code: str, quantity: int, price: str) -> None:
+    snapshot = apply_trade_fill(snapshot_path, side, code, quantity, Decimal(price))
+    print(f"已更新持仓：{side} {code} {quantity} 股 @ {price}")
+    print(f"最新总资产：{snapshot.total_assets}")
+    print(f"最新现金：{snapshot.cash}")
 
 
 if __name__ == "__main__":

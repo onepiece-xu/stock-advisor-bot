@@ -4,6 +4,8 @@ import time
 from collections import defaultdict
 from datetime import datetime, timedelta
 
+from pathlib import Path
+
 from .analysis import analyze_quotes
 from .briefing import format_mobile_signal
 from .config import AppConfig
@@ -12,6 +14,7 @@ from .models import StockQuote
 from .notify import deliver_feishu_message
 from .providers import TencentQuoteProvider
 from .storage import connect_db, insert_quote, insert_signal, load_recent_quotes
+from .trading_plan import detect_trigger_hit, load_snapshot as load_trade_snapshot, render_trade_instruction
 
 
 class MonitorRuntime:
@@ -42,7 +45,10 @@ class MonitorRuntime:
             print(result.title)
             print(result.message)
 
-            if self._should_notify(stock.symbol, result):
+            trigger_message = self._build_trigger_message(quote)
+            if trigger_message:
+                self._notify(stock.symbol + ':trigger', f"{quote.code} {quote.name} 触发交易区间", trigger_message)
+            elif self._should_notify(stock.symbol, result):
                 self._notify(stock.symbol, result.title, format_mobile_signal(result.title, result.message, include_title=False))
 
     def serve_forever(self) -> None:
@@ -82,3 +88,13 @@ class MonitorRuntime:
         if self.history[symbol]:
             return
         self.history[symbol].extend(load_recent_quotes(self.db, symbol, self.config.monitor.history_size - 1))
+
+    def _build_trigger_message(self, quote: StockQuote) -> str | None:
+        snapshot_path = Path(self.config.storage.sqlite_path).resolve().parent.parent / "portfolio-snapshot.json"
+        if not snapshot_path.exists():
+            return None
+        snapshot = load_trade_snapshot(snapshot_path)
+        hit = detect_trigger_hit(quote, snapshot)
+        if hit is None:
+            return None
+        return render_trade_instruction(hit, snapshot)

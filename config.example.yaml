@@ -10,7 +10,7 @@ monitor:
   schedule:
     enabled: true
     run_on_startup: true
-    fixed_delay_seconds: 300
+    fixed_delay_seconds: 30
     restrict_to_trading_session: true
     market_time_zone: Asia/Shanghai
   signal:

@@ -1,0 +1,36 @@
+monitor:
+  provider: tencent
+  stocks:
+    - exchange: sz
+      code: "003035"
+    - exchange: sh
+      code: "601698"
+    - exchange: sh
+      code: "603993"
+  schedule:
+    enabled: true
+    run_on_startup: true
+    fixed_delay_seconds: 300
+    restrict_to_trading_session: true
+    market_time_zone: Asia/Shanghai
+  signal:
+    history_size: 24
+    thresholds:
+      daily_change_pct: 2.0
+      average_bias_pct: 1.0
+      abnormal_step_pct: 1.5
+      abnormal_range_pct: 3.0
+  provider_settings:
+    request_timeout_ms: 4000
+    tencent:
+      base_url: https://qt.gtimg.cn/q=
+  notification:
+    notify_on_neutral: true
+    dedup:
+      enabled: true
+      cooldown_minutes: 30
+    feishu:
+      enabled: false
+      webhook_url: ""
+portfolio:
+  data_dir: data/portfolio

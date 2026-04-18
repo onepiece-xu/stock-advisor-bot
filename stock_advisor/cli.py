@@ -13,7 +13,7 @@ from .providers import TencentQuoteProvider
 from .analysis import analyze_quotes
 from .runtime import MonitorRuntime
 from .storage import connect_db, fetch_latest_briefing, insert_quote, insert_signal, load_recent_quotes, replay_signal_stats
-from .trading_plan import apply_trade_fill
+from .trading_plan import apply_trade_fill, build_post_fill_execution_sheet, load_snapshot as load_trade_snapshot
 
 
 def main() -> None:
@@ -153,6 +153,8 @@ def run_record_fill(snapshot_path: str, side: str, code: str, quantity: int, pri
     print(f"已更新持仓：{side} {code} {quantity} 股 @ {price}")
     print(f"最新总资产：{snapshot.total_assets}")
     print(f"最新现金：{snapshot.cash}")
+    print("")
+    print(build_post_fill_execution_sheet(snapshot))
 
 
 if __name__ == "__main__":

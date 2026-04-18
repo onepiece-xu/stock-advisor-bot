@@ -168,6 +168,28 @@ def apply_trade_fill(snapshot_path: str | Path, side: str, code: str, quantity: 
     return snapshot
 
 
+def build_post_fill_execution_sheet(snapshot: PortfolioSnapshot) -> str:
+    lines = [
+        "【成交后新执行单】",
+        f"总资产：{_fmt_money(snapshot.total_assets)}",
+        f"可用现金：{_fmt_money(snapshot.cash)}",
+    ]
+    for holding in sorted(snapshot.holdings, key=lambda item: _holding_weight_pct(item, snapshot), reverse=True):
+        weight = _holding_weight_pct(holding, snapshot)
+        pnl = _holding_pnl_pct(holding)
+        category, instruction, reason = _post_fill_instruction(holding, snapshot)
+        lines.extend(
+            [
+                f"- {holding.name}({holding.code}) | 分类：{category}",
+                f"  指令：{instruction}",
+                f"  持仓：{holding.quantity} 股 | 仓位占比：{_fmt_pct(weight)} | 浮盈亏：{_fmt_pct(pnl)}",
+                f"  原因：{reason}",
+            ]
+        )
+    lines.append("成交后继续回传：买入/卖出 代码 数量 成交价")
+    return "\n".join(lines)
+
+
 def _save_snapshot(path: str | Path, snapshot: PortfolioSnapshot) -> None:
     payload = {
         "tradeDate": snapshot.trade_date.isoformat(),
@@ -223,3 +245,21 @@ def _fmt_pct(value: Decimal) -> str:
 
 def _fmt_money(value: Decimal) -> str:
     return str(value.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP))
+
+
+def _holding_pnl_pct(holding: PortfolioHolding) -> Decimal:
+    if holding.cost_price <= 0:
+        return Decimal("0")
+    return (((holding.current_price - holding.cost_price) / holding.cost_price) * Decimal("100")).quantize(Decimal("0.01"))
+
+
+def _post_fill_instruction(holding: PortfolioHolding, snapshot: PortfolioSnapshot) -> tuple[str, str, str]:
+    weight = _holding_weight_pct(holding, snapshot)
+    pnl = _holding_pnl_pct(holding)
+    if weight >= Decimal("30") and pnl <= Decimal("-8"):
+        return ("立即卖", f"若再反弹 1%-2%，继续减 300-500 股", "仓位仍重且浮亏较深，优先继续释放风险")
+    if pnl <= Decimal("-10"):
+        return ("禁止买", "只减不加，等待下一次反弹窗口", "深度浮亏阶段先控制回撤，不做摊平动作")
+    if weight >= Decimal("20"):
+        return ("反弹卖", "反弹到预设区间优先减仓，不主动加仓", "仓位不低，先用反弹换现金")
+    return ("持有观察", "暂时不动，等更清晰信号", "当前不是最急需处理的仓位")

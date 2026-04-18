@@ -93,6 +93,9 @@ def _build_message(
         "",
         "【AI辅助决策】",
         f"动作：{decision.action}",
+        f"直接建议：{decision.trade_advice}",
+        f"建议仓位：{decision.trade_size_hint}",
+        f"入场/处理：{decision.entry_note}",
         f"评分：{decision.score.quantize(Decimal('0.01'), rounding=ROUND_HALF_UP)}/100",
         f"置信度：{decision.confidence}",
         f"状态：{decision.regime}",
@@ -181,13 +184,18 @@ def _build_decision_signal(current: StockQuote, metrics: ObservationMetrics, sam
         rationale.append("当前多空信号较均衡，继续观察后续样本更稳妥")
 
     score = max(Decimal("0"), min(score, Decimal("100")))
+    action = _decision_action(score)
+    trade_advice, trade_size_hint, entry_note = _trade_plan(action, current, metrics)
     return DecisionSignal(
-        action=_decision_action(score),
+        action=action,
         score=score.quantize(Decimal("0.01")),
         confidence=_confidence_level(score, sample_size),
         regime=_market_regime(current, metrics),
         rationale=rationale,
         risk_flags=risk_flags,
+        trade_advice=trade_advice,
+        trade_size_hint=trade_size_hint,
+        entry_note=entry_note,
     )
 
 
@@ -213,15 +221,39 @@ def _market_regime(current: StockQuote, metrics: ObservationMetrics) -> str:
 
 
 def _decision_action(score: Decimal) -> str:
-    if score >= Decimal("68"):
-        return "accumulate-small"
+    if score >= Decimal("72"):
+        return "buy"
     if score >= Decimal("55"):
-        return "hold-watch"
-    if score >= Decimal("40"):
         return "hold"
-    if score >= Decimal("28"):
+    if score >= Decimal("35"):
         return "reduce"
     return "avoid"
+
+
+def _trade_plan(action: str, current: StockQuote, metrics: ObservationMetrics) -> tuple[str, str, str]:
+    if action == "buy":
+        return (
+            "可以小仓位试买，不追高",
+            "建议 10%-15% 试探仓",
+            f"优先等回踩不破 {_format_price(current.previous_close)} 或再次转强时再进",
+        )
+    if action == "hold":
+        return (
+            "继续持有观察，不主动加仓",
+            "维持原仓，不新增",
+            f"看能否稳在近3次均价 {_format_price(metrics.avg3)} 上方",
+        )
+    if action == "reduce":
+        return (
+            "逢反弹减仓一部分",
+            "建议减 15%-30%",
+            f"若反弹但不能有效站稳近6次均价 {_format_price(metrics.avg6)}，优先减仓",
+        )
+    return (
+        "暂时不要买，已有仓位也别急着补",
+        "禁止加仓",
+        f"至少等价格重新回到近3次均价 {_format_price(metrics.avg3)} 上方再看",
+    )
 
 
 def _format_price(value: Decimal) -> str:

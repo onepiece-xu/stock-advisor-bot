@@ -87,7 +87,7 @@ def build_action_candidates(current: StockQuote) -> list[ActionCandidate]:
 
 def render_action_candidates(candidates: list[ActionCandidate]) -> list[str]:
     return [
-        f"动作候选：{candidate.action}，原因：{candidate.reason}，触发条件：{candidate.trigger}，风险：{candidate.risk_level}。仅供参考，不构成投资建议。"
+        f"参考动作：{candidate.action}，原因：{candidate.reason}，触发条件：{candidate.trigger}，风险：{candidate.risk_level}。仅供参考，不构成投资建议。"
         for candidate in candidates
     ]
 

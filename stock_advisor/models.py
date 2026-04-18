@@ -60,6 +60,9 @@ class DecisionSignal:
     regime: str
     rationale: List[str]
     risk_flags: List[str]
+    trade_advice: str
+    trade_size_hint: str
+    entry_note: str
 
 
 @dataclass(slots=True)

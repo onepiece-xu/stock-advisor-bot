@@ -98,14 +98,14 @@ def build_daily_report(current: PortfolioSnapshot, previous: PortfolioSnapshot |
         for line in _build_diff_lines(current, previous):
             lines.append(f"- {line}")
 
-    lines.extend(["", "【动作候选】"])
+    lines.extend(["", "【执行单】"])
     advice_items = sorted((_advice_for_holding(h, current) for h in current.holdings), key=lambda x: x.priority)
     for item in advice_items:
         lines.append(item.title)
         lines.append(item.detail)
         for candidate in item.candidates:
             lines.append(
-                f"  - {candidate.action} | 风险:{candidate.risk_level} | 条件:{candidate.trigger} | 原因:{candidate.reason}"
+                f"  - 指令:{candidate.action} | 风险:{candidate.risk_level} | 条件:{candidate.trigger} | 原因:{candidate.reason}"
             )
 
     lines.extend(["", "【原则】"])
@@ -159,8 +159,8 @@ def _advice_for_holding(holding: PortfolioHolding, snapshot: PortfolioSnapshot) 
         candidates.append(ActionCandidate("hold", "暂无明确动作条件，继续观察。", "无显著规则触发", "low"))
 
     top_action = candidates[0].action
-    title = f"- {holding.name}({holding.code})：优先动作 {top_action}"
-    detail = f"  浮盈亏 {_format_percent(pnl_pct)}，仓位占比 {_format_percent(weight_pct)}"
+    title = f"- {holding.name}({holding.code})：执行优先级 {top_action}"
+    detail = f"  浮盈亏 {_format_percent(pnl_pct)}，仓位占比 {_format_percent(weight_pct)}，建议先按最高优先动作执行"
     priority = _priority_for_candidates(candidates)
     return AdviceItem(priority=priority, title=title, detail=detail, candidates=candidates)
 

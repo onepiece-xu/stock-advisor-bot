@@ -26,6 +26,9 @@ class TriggerHit:
     trigger: TradeTrigger
     current_price: Decimal
     hit_type: str
+    quantity: int
+    weight_pct: Decimal
+    cash_after_trade: Decimal
 
 
 DEFAULT_TRIGGERS = {
@@ -92,17 +95,19 @@ def detect_trigger_hit(quote: StockQuote, snapshot: PortfolioSnapshot) -> Trigge
     if holding is None or holding.quantity <= 0:
         return None
     price = quote.current_price
+    quantity = _dynamic_quantity(trigger, holding, snapshot)
+    weight_pct = _holding_weight_pct(holding, snapshot)
+    cash_after_trade = snapshot.cash + (price * Decimal(quantity)) if trigger.action == "sell" else snapshot.cash
     if trigger.price_min <= price <= trigger.price_max:
-        return TriggerHit(trigger=trigger, current_price=price, hit_type="target_range")
+        return TriggerHit(trigger=trigger, current_price=price, hit_type="target_range", quantity=quantity, weight_pct=weight_pct, cash_after_trade=cash_after_trade)
     if price <= trigger.fallback_price:
-        return TriggerHit(trigger=trigger, current_price=price, hit_type="fallback")
+        return TriggerHit(trigger=trigger, current_price=price, hit_type="fallback", quantity=quantity, weight_pct=weight_pct, cash_after_trade=cash_after_trade)
     return None
 
 
 def render_trade_instruction(hit: TriggerHit, snapshot: PortfolioSnapshot) -> str:
     trigger = hit.trigger
-    holding = _find_holding(snapshot, trigger.code)
-    qty = min(trigger.quantity, holding.quantity if holding else trigger.quantity)
+    qty = hit.quantity
     action_text = "卖出" if trigger.action == "sell" else "继续持有"
     if trigger.action == "hold" and hit.hit_type == "target_range":
         action_text = f"若冲高无力，减 {qty} 股"
@@ -117,12 +122,15 @@ def render_trade_instruction(hit: TriggerHit, snapshot: PortfolioSnapshot) -> st
         [
             f"【盘中交易指令】{trigger.name} {trigger.code}",
             f"当前价：{_fmt(hit.current_price)}",
-            f"指令：{action_text}",
+            f"执行动作：{action_text}",
+            f"建议数量：{qty} 股",
+            f"持仓占比：{_fmt_pct(hit.weight_pct)}",
+            f"执行后预计现金：{_fmt_money(hit.cash_after_trade)}",
             f"触发区间：{_fmt(trigger.price_min)} - {_fmt(trigger.price_max)}",
             f"防守位：{_fmt(trigger.fallback_price)}",
             f"原因：{trigger.note}",
-            f"补充：{'禁止补仓' if trigger.disable_buy else '按原计划执行'}",
-            "收到成交结果后，请回传：买入/卖出 股票 数量 成交价",
+            f"纪律：{'禁止补仓' if trigger.disable_buy else '按原计划执行'}",
+            "成交后请直接回传：卖出/买入 代码 数量 成交价",
         ]
     )
 
@@ -186,5 +194,32 @@ def _find_holding(snapshot: PortfolioSnapshot, code: str) -> PortfolioHolding | 
     return None
 
 
+def _dynamic_quantity(trigger: TradeTrigger, holding: PortfolioHolding, snapshot: PortfolioSnapshot) -> int:
+    base = trigger.quantity
+    if trigger.action != "sell":
+        return min(base, holding.quantity)
+    weight_pct = _holding_weight_pct(holding, snapshot)
+    if weight_pct >= Decimal("30"):
+        return min(max(base, 500), holding.quantity)
+    if weight_pct >= Decimal("20"):
+        return min(max(base, 200), holding.quantity)
+    return min(base, holding.quantity)
+
+
+def _holding_weight_pct(holding: PortfolioHolding, snapshot: PortfolioSnapshot) -> Decimal:
+    if snapshot.total_assets <= 0:
+        return Decimal("0")
+    market_value = holding.current_price * Decimal(holding.quantity)
+    return ((market_value / snapshot.total_assets) * Decimal("100")).quantize(Decimal("0.01"))
+
+
 def _fmt(value: Decimal) -> str:
     return str(value.quantize(Decimal("0.001"), rounding=ROUND_HALF_UP))
+
+
+def _fmt_pct(value: Decimal) -> str:
+    return f"{value.quantize(Decimal('0.01'), rounding=ROUND_HALF_UP)}%"
+
+
+def _fmt_money(value: Decimal) -> str:
+    return str(value.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP))

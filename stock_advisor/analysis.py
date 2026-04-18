@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from decimal import Decimal, ROUND_HALF_UP
 
-from .advice import build_position_advice
+from .advice import build_action_candidates, render_action_candidates
 from .config import MonitorConfig
 from .models import ObservationMetrics, ObservationResult, StockQuote
 
@@ -44,7 +44,7 @@ def analyze_quotes(history: list[StockQuote], monitor_config: MonitorConfig) -> 
     if not observations:
         observations.append("观察：当前未触发明显信号，建议继续跟踪价格、短期均价和成交额变化。仅供参考，不构成投资建议。")
 
-    observations.extend(build_position_advice(current))
+    observations.extend(render_action_candidates(build_action_candidates(current)))
     title = f"{current.code} {current.name} 行情观察"
     message = _build_message(current, avg3, avg6, step_change_pct, recent_range_pct, observations)
     should_notify = has_daily_change_alert or has_step_alert or has_range_alert

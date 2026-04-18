@@ -63,6 +63,14 @@ class ObservationResult:
 
 
 @dataclass(slots=True)
+class ActionCandidate:
+    action: str
+    reason: str
+    trigger: str
+    risk_level: str
+
+
+@dataclass(slots=True)
 class PortfolioHolding:
     name: str
     code: str

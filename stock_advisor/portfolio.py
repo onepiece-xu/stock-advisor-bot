@@ -2,11 +2,11 @@ from __future__ import annotations
 
 import json
 from dataclasses import dataclass
-from datetime import date, datetime
+from datetime import date
 from decimal import Decimal, ROUND_HALF_UP
 from pathlib import Path
 
-from .models import PortfolioHolding, PortfolioSnapshot
+from .models import ActionCandidate, PortfolioHolding, PortfolioSnapshot
 
 
 @dataclass(slots=True)
@@ -14,6 +14,7 @@ class AdviceItem:
     priority: int
     title: str
     detail: str
+    candidates: list[ActionCandidate]
 
 
 def load_snapshot(path: str | Path) -> PortfolioSnapshot:
@@ -97,11 +98,15 @@ def build_daily_report(current: PortfolioSnapshot, previous: PortfolioSnapshot |
         for line in _build_diff_lines(current, previous):
             lines.append(f"- {line}")
 
-    lines.extend(["", "【建议动作】"])
-    advice_items = sorted((_advice_for_holding(h) for h in current.holdings), key=lambda x: x.priority)
+    lines.extend(["", "【动作候选】"])
+    advice_items = sorted((_advice_for_holding(h, current) for h in current.holdings), key=lambda x: x.priority)
     for item in advice_items:
         lines.append(item.title)
         lines.append(item.detail)
+        for candidate in item.candidates:
+            lines.append(
+                f"  - {candidate.action} | 风险:{candidate.risk_level} | 条件:{candidate.trigger} | 原因:{candidate.reason}"
+            )
 
     lines.extend(["", "【原则】"])
     ratio = _position_ratio(current)
@@ -133,14 +138,36 @@ def _build_diff_lines(current: PortfolioSnapshot, previous: PortfolioSnapshot) -
     return lines or ["持仓数量未变化，主要是价格浮动"]
 
 
-def _advice_for_holding(holding: PortfolioHolding) -> AdviceItem:
-    if holding.name == "南网能源":
-        return AdviceItem(1, "1. 南网能源：优先减仓释放现金", "   先减仓 1000 股；若后续反弹到 10.20 附近，可再减 500 股；若明显转弱跌破 9.00，先不补仓，重新观察")
-    if holding.name == "洛阳钼业":
-        return AdviceItem(2, "2. 洛阳钼业：等企稳再决定", "   仅在 17.00 附近且止跌企稳时，考虑补 200~300 股；反弹到 19.50 附近可减 300 股，21.00 附近再减 300 股")
-    if holding.name == "中国卫通":
-        return AdviceItem(3, "3. 中国卫通：持有观察，设纪律位", "   若跌破 30.50 可减 150 股；若反弹到 33.30~33.80 区间，可减 150 股")
-    return AdviceItem(9, f"9. {holding.name}：暂时观察", "   暂无预设规则，结合收盘价、仓位和次日强弱再判断")
+def _advice_for_holding(holding: PortfolioHolding, snapshot: PortfolioSnapshot) -> AdviceItem:
+    pnl_pct = _pnl_percent(holding)
+    weight_pct = _holding_weight_percent(holding, snapshot)
+    candidates: list[ActionCandidate] = []
+
+    if weight_pct >= Decimal("40"):
+        candidates.append(ActionCandidate("reduce", "单票仓位过高，优先释放现金缓冲。", "单票仓位 >= 40%", "high"))
+    if pnl_pct <= Decimal("-10"):
+        candidates.append(ActionCandidate("avoid", "亏损较深，不适合边跌边补，先看修复质量。", "浮亏 >= 10%", "high"))
+    elif pnl_pct <= Decimal("-5"):
+        candidates.append(ActionCandidate("hold", "已有一定浮亏，先观察修复持续性。", "浮亏在 5%-10%", "medium"))
+    else:
+        candidates.append(ActionCandidate("hold", "距离成本线相对更近，保留观察灵活性。", "浮亏小于 5%", "low"))
+
+    if holding.current_price >= holding.cost_price and holding.cost_price > 0:
+        candidates.append(ActionCandidate("reduce", "价格接近或站上成本区，可考虑优化仓位。", "现价 >= 成本价", "medium"))
+
+    if not candidates:
+        candidates.append(ActionCandidate("hold", "暂无明确动作条件，继续观察。", "无显著规则触发", "low"))
+
+    top_action = candidates[0].action
+    title = f"- {holding.name}({holding.code})：优先动作 {top_action}"
+    detail = f"  浮盈亏 {_format_percent(pnl_pct)}，仓位占比 {_format_percent(weight_pct)}"
+    priority = _priority_for_candidates(candidates)
+    return AdviceItem(priority=priority, title=title, detail=detail, candidates=candidates)
+
+
+def _priority_for_candidates(candidates: list[ActionCandidate]) -> int:
+    ranking = {"reduce": 1, "avoid": 2, "hold": 3, "buy": 4}
+    return min(ranking.get(candidate.action, 9) for candidate in candidates)
 
 
 def _pnl_percent(holding: PortfolioHolding) -> Decimal:
@@ -153,6 +180,13 @@ def _position_ratio(snapshot: PortfolioSnapshot) -> Decimal:
     if snapshot.total_assets <= 0:
         return Decimal("0")
     return (((snapshot.total_assets - snapshot.cash) / snapshot.total_assets) * Decimal("100")).quantize(Decimal("0.01"))
+
+
+def _holding_weight_percent(holding: PortfolioHolding, snapshot: PortfolioSnapshot) -> Decimal:
+    if snapshot.total_assets <= 0:
+        return Decimal("0")
+    market_value = holding.current_price * Decimal(holding.quantity)
+    return ((market_value / snapshot.total_assets) * Decimal("100")).quantize(Decimal("0.01"))
 
 
 def _format_money(value: Decimal) -> str:

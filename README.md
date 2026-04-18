@@ -31,6 +31,8 @@ python3 -m pip install --user -r requirements.txt
 
 - 示例配置：`config.example.yaml`
 - 当前实际配置：`config.yaml`
+- 长期持仓文档（飞书）：`https://wcntg42cmak8.feishu.cn/docx/DXRDdRGRJohquex19VucUqh0nVd`
+- 本地结构化快照：`portfolio-snapshot.json`
 
 ## 单次行情轮询
 

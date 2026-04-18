@@ -10,6 +10,7 @@ from .market_hours import is_a_share_trading_time
 from .models import StockQuote
 from .notify import send_feishu_webhook
 from .providers import TencentQuoteProvider
+from .storage import connect_db, insert_quote, insert_signal
 
 
 class MonitorRuntime:
@@ -18,6 +19,7 @@ class MonitorRuntime:
         self.provider = TencentQuoteProvider(config.monitor)
         self.history: dict[str, list[StockQuote]] = defaultdict(list)
         self.last_notifications: dict[str, tuple[str, datetime]] = {}
+        self.db = connect_db(config.storage.sqlite_path)
 
     def run_once(self) -> None:
         if self.config.monitor.schedule.restrict_to_trading_session and not is_a_share_trading_time():
@@ -26,12 +28,14 @@ class MonitorRuntime:
 
         for stock in self.config.monitor.stocks:
             quote = self.provider.fetch_quote(stock)
+            quote_id = insert_quote(self.db, quote)
             bucket = self.history[stock.symbol]
             bucket.append(quote)
             if len(bucket) > self.config.monitor.history_size:
                 del bucket[:-self.config.monitor.history_size]
 
             result = analyze_quotes(bucket, self.config.monitor)
+            insert_signal(self.db, quote_id, quote, result)
             print("=" * 80)
             print(result.title)
             print(result.message)

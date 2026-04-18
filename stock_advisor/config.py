@@ -68,9 +68,15 @@ class PortfolioConfig:
 
 
 @dataclass(slots=True)
+class StorageConfig:
+    sqlite_path: Path
+
+
+@dataclass(slots=True)
 class AppConfig:
     monitor: MonitorConfig
     portfolio: PortfolioConfig
+    storage: StorageConfig
 
 
 def load_config(path: str | Path) -> AppConfig:
@@ -126,5 +132,8 @@ def load_config(path: str | Path) -> AppConfig:
         ),
         portfolio=PortfolioConfig(
             data_dir=(config_path.parent / raw.get("portfolio", {}).get("data_dir", "data/portfolio")).resolve()
+        ),
+        storage=StorageConfig(
+            sqlite_path=(config_path.parent / raw.get("storage", {}).get("sqlite_path", "data/market.db")).resolve()
         ),
     )

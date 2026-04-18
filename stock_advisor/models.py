@@ -42,12 +42,24 @@ class StockQuote:
 
 
 @dataclass(slots=True)
+class ObservationMetrics:
+    avg3: Decimal
+    avg6: Decimal
+    bias_to_avg3: Decimal
+    bias_to_avg6: Decimal
+    step_change_pct: Decimal
+    recent_range_pct: Decimal
+    intraday_amplitude_pct: Decimal
+
+
+@dataclass(slots=True)
 class ObservationResult:
     title: str
     message: str
     observations: List[str]
     should_notify: bool
     signal_level: str
+    metrics: ObservationMetrics
 
 
 @dataclass(slots=True)

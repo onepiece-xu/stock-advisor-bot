@@ -4,7 +4,7 @@ from decimal import Decimal, ROUND_HALF_UP
 
 from .advice import build_position_advice
 from .config import MonitorConfig
-from .models import ObservationResult, StockQuote
+from .models import ObservationMetrics, ObservationResult, StockQuote
 
 
 def analyze_quotes(history: list[StockQuote], monitor_config: MonitorConfig) -> ObservationResult:
@@ -49,7 +49,23 @@ def analyze_quotes(history: list[StockQuote], monitor_config: MonitorConfig) -> 
     message = _build_message(current, avg3, avg6, step_change_pct, recent_range_pct, observations)
     should_notify = has_daily_change_alert or has_step_alert or has_range_alert
     signal_level = "ALERT" if should_notify else ("INFO" if has_non_neutral else "NEUTRAL")
-    return ObservationResult(title=title, message=message, observations=observations, should_notify=should_notify, signal_level=signal_level)
+    metrics = ObservationMetrics(
+        avg3=avg3,
+        avg6=avg6,
+        bias_to_avg3=bias_to_avg3,
+        bias_to_avg6=bias_to_avg6,
+        step_change_pct=step_change_pct,
+        recent_range_pct=recent_range_pct,
+        intraday_amplitude_pct=current.intraday_amplitude_percent,
+    )
+    return ObservationResult(
+        title=title,
+        message=message,
+        observations=observations,
+        should_notify=should_notify,
+        signal_level=signal_level,
+        metrics=metrics,
+    )
 
 
 def _build_message(current: StockQuote, avg3: Decimal, avg6: Decimal, step_change_pct: Decimal, recent_range_pct: Decimal, observations: list[str]) -> str:

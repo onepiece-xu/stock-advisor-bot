@@ -34,3 +34,5 @@ monitor:
       webhook_url: ""
 portfolio:
   data_dir: data/portfolio
+storage:
+  sqlite_path: data/market.db

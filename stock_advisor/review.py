@@ -8,6 +8,7 @@ from pathlib import Path
 from zoneinfo import ZoneInfo
 
 from .config import AppConfig
+from .habit_learning import build_trading_habit_profile
 from .market_hours import MARKET_TZ
 from .portfolio import load_snapshot as load_portfolio_snapshot
 from .storage import connect_db, fetch_daily_review_snapshot, fetch_latest_trade_date
@@ -75,6 +76,8 @@ def mark_close_review_sent(config: AppConfig, trade_date: date) -> None:
 
 
 def _render_review_body(config: AppConfig, trade_date: date, items: list[dict], *, requested_trade_date: date) -> str:
+    conn = connect_db(config.storage.sqlite_path)
+    trading_habit_profile = build_trading_habit_profile(conn)
     lines = [f"【收盘复盘】{trade_date.isoformat()}"]
     if trade_date != requested_trade_date:
         lines.append(f"说明: 当日暂无落库行情，已回退到最近交易日 {trade_date.isoformat()}")
@@ -121,6 +124,16 @@ def _render_review_body(config: AppConfig, trade_date: date, items: list[dict], 
     if portfolio_path.exists():
         lines.extend(["", "【持仓复盘】"])
         lines.extend(_render_portfolio_section(portfolio_path, items))
+
+    if trading_habit_profile is not None:
+        lines.extend(["", "【交易习惯学习】"])
+        lines.append(f"样本数: {trading_habit_profile.sample_count}")
+        lines.append(f"画像: {trading_habit_profile.summary}")
+        lines.append(
+            f"建议已按习惯校准: 买入常用 {trading_habit_profile.preferred_buy_lot} 股 | "
+            f"加仓常用 {trading_habit_profile.preferred_add_lot} 股 | "
+            f"减仓习惯 {_fmt_decimal(trading_habit_profile.preferred_reduce_ratio * Decimal('100'))}%"
+        )
 
     lines.extend(["", "【结论】"])
     if avg_score is not None and avg_score >= Decimal("58"):

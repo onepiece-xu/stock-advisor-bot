@@ -4,7 +4,7 @@ from stock_advisor.notify import FAILED_OUTBOX_PATH, flush_failed_notifications
 
 
 def main() -> int:
-    if not OUTBOX_PATH.exists():
+    if not FAILED_OUTBOX_PATH.exists():
         print("NO_OUTBOX")
         return 0
     sent_count, pending_count = flush_failed_notifications()

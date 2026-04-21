@@ -7,7 +7,7 @@ from decimal import Decimal
 from pathlib import Path
 from statistics import median
 
-from .models import DecisionSignal, ObservationMetrics, ObservationResult, StockQuote
+from .models import DecisionSignal, ObservationMetrics, ObservationResult, StockQuote, TradeFillRecord
 
 
 def connect_db(db_path: str | Path) -> sqlite3.Connection:
@@ -15,6 +15,7 @@ def connect_db(db_path: str | Path) -> sqlite3.Connection:
     path.parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(path)
     conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA foreign_keys = ON")
     init_db(conn)
     return conn
 
@@ -65,13 +66,32 @@ def init_db(conn: sqlite3.Connection) -> None:
         CREATE TABLE IF NOT EXISTS signal_metrics (
           id INTEGER PRIMARY KEY AUTOINCREMENT,
           signal_id INTEGER NOT NULL,
-          avg3 REAL,
-          avg6 REAL,
-          bias_to_avg3 REAL,
-          bias_to_avg6 REAL,
+          ma5 REAL,
+          ma15 REAL,
+          ma60 REAL,
+          ma240 REAL,
+          rsi14 REAL,
+          bias_to_ma15 REAL,
+          bias_to_ma60 REAL,
           step_change_pct REAL,
           recent_range_pct REAL,
           intraday_amplitude_pct REAL,
+          minute_volume_shares REAL,
+          avg5_minute_volume_shares REAL,
+          avg30_minute_volume_shares REAL,
+          volume_ratio REAL,
+          volume_ratio_30 REAL,
+          volume_trend_ratio REAL,
+          breakout_above_prev30_high_pct REAL,
+          breakdown_below_prev30_low_pct REAL,
+          benchmark_change_pct REAL,
+          relative_strength_pct REAL,
+          macd_line REAL,
+          macd_signal REAL,
+          macd_histogram REAL,
+          macd_prev_histogram REAL,
+          market_advance_ratio REAL,
+          hot_stock_rank INTEGER,
           FOREIGN KEY (signal_id) REFERENCES signals(id)
         );
 
@@ -95,11 +115,52 @@ def init_db(conn: sqlite3.Connection) -> None:
 
         CREATE INDEX IF NOT EXISTS idx_decisions_symbol_time ON decision_signals(symbol, created_at);
         CREATE INDEX IF NOT EXISTS idx_decisions_action_time ON decision_signals(action, created_at);
+
+        CREATE TABLE IF NOT EXISTS trade_fills (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          side TEXT NOT NULL,
+          code TEXT NOT NULL,
+          quantity INTEGER NOT NULL,
+          price REAL NOT NULL,
+          before_quantity INTEGER NOT NULL,
+          after_quantity INTEGER NOT NULL,
+          filled_at TEXT NOT NULL,
+          created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_trade_fills_code_time ON trade_fills(code, filled_at);
+        CREATE INDEX IF NOT EXISTS idx_trade_fills_side_time ON trade_fills(side, filled_at);
         """
     )
     _ensure_column(conn, "decision_signals", "trade_advice", "TEXT NOT NULL DEFAULT ''")
     _ensure_column(conn, "decision_signals", "trade_size_hint", "TEXT NOT NULL DEFAULT ''")
     _ensure_column(conn, "decision_signals", "entry_note", "TEXT NOT NULL DEFAULT ''")
+    for column_name, ddl in (
+        ("ma5", "REAL"),
+        ("ma15", "REAL"),
+        ("ma60", "REAL"),
+        ("ma240", "REAL"),
+        ("rsi14", "REAL"),
+        ("bias_to_ma15", "REAL"),
+        ("bias_to_ma60", "REAL"),
+        ("minute_volume_shares", "REAL"),
+        ("avg5_minute_volume_shares", "REAL"),
+        ("avg30_minute_volume_shares", "REAL"),
+        ("volume_ratio", "REAL"),
+        ("volume_ratio_30", "REAL"),
+        ("volume_trend_ratio", "REAL"),
+        ("breakout_above_prev30_high_pct", "REAL"),
+        ("breakdown_below_prev30_low_pct", "REAL"),
+        ("benchmark_change_pct", "REAL"),
+        ("relative_strength_pct", "REAL"),
+        ("macd_line", "REAL"),
+        ("macd_signal", "REAL"),
+        ("macd_histogram", "REAL"),
+        ("macd_prev_histogram", "REAL"),
+        ("market_advance_ratio", "REAL"),
+        ("hot_stock_rank", "INTEGER"),
+    ):
+        _ensure_column(conn, "signal_metrics", column_name, ddl)
     conn.commit()
 
 
@@ -139,6 +200,51 @@ def insert_quote(conn: sqlite3.Connection, quote: StockQuote) -> int:
     return int(row["id"])
 
 
+def insert_trade_fill(conn: sqlite3.Connection, fill: TradeFillRecord) -> int:
+    cursor = conn.execute(
+        """
+        INSERT INTO trade_fills (
+          side, code, quantity, price, before_quantity, after_quantity, filled_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            fill.side,
+            fill.code,
+            fill.quantity,
+            float(fill.price),
+            fill.before_quantity,
+            fill.after_quantity,
+            fill.filled_at.isoformat(sep=" ", timespec="seconds"),
+        ),
+    )
+    return int(cursor.lastrowid)
+
+
+def load_trade_fills(conn: sqlite3.Connection, *, limit: int | None = None) -> list[TradeFillRecord]:
+    sql = """
+        SELECT side, code, quantity, price, before_quantity, after_quantity, filled_at
+        FROM trade_fills
+        ORDER BY filled_at DESC, id DESC
+    """
+    params: tuple[object, ...] = ()
+    if limit is not None:
+        sql += " LIMIT ?"
+        params = (limit,)
+    rows = conn.execute(sql, params).fetchall()
+    return [
+        TradeFillRecord(
+            side=str(row["side"]),
+            code=str(row["code"]),
+            quantity=int(row["quantity"]),
+            price=_decimal(row["price"]),
+            before_quantity=int(row["before_quantity"]),
+            after_quantity=int(row["after_quantity"]),
+            filled_at=datetime.fromisoformat(str(row["filled_at"])),
+        )
+        for row in rows
+    ]
+
+
 def insert_signal(conn: sqlite3.Connection, quote_id: int, quote: StockQuote, result: ObservationResult) -> int:
     cursor = conn.execute(
         """
@@ -174,18 +280,41 @@ def _insert_signal_metrics(conn: sqlite3.Connection, signal_id: int, metrics: Ob
     conn.execute(
         """
         INSERT INTO signal_metrics (
-          signal_id, avg3, avg6, bias_to_avg3, bias_to_avg6, step_change_pct, recent_range_pct, intraday_amplitude_pct
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+          signal_id, ma5, ma15, ma60, ma240, rsi14, bias_to_ma15, bias_to_ma60, step_change_pct, recent_range_pct,
+          intraday_amplitude_pct, minute_volume_shares, avg5_minute_volume_shares, avg30_minute_volume_shares,
+          volume_ratio, volume_ratio_30, volume_trend_ratio, breakout_above_prev30_high_pct, breakdown_below_prev30_low_pct,
+          benchmark_change_pct, relative_strength_pct, macd_line, macd_signal, macd_histogram, macd_prev_histogram,
+          market_advance_ratio, hot_stock_rank
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
             signal_id,
-            float(metrics.avg3),
-            float(metrics.avg6),
-            float(metrics.bias_to_avg3),
-            float(metrics.bias_to_avg6),
+            float(metrics.ma5),
+            float(metrics.ma15),
+            float(metrics.ma60),
+            float(metrics.ma240),
+            float(metrics.rsi14),
+            float(metrics.bias_to_ma15),
+            float(metrics.bias_to_ma60),
             float(metrics.step_change_pct),
             float(metrics.recent_range_pct),
             float(metrics.intraday_amplitude_pct),
+            float(metrics.minute_volume_shares),
+            float(metrics.avg5_minute_volume_shares),
+            float(metrics.avg30_minute_volume_shares),
+            float(metrics.volume_ratio),
+            float(metrics.volume_ratio_30),
+            float(metrics.volume_trend_ratio),
+            float(metrics.breakout_above_prev30_high_pct),
+            float(metrics.breakdown_below_prev30_low_pct),
+            float(metrics.benchmark_change_pct),
+            float(metrics.relative_strength_pct),
+            float(metrics.macd_line),
+            float(metrics.macd_signal),
+            float(metrics.macd_histogram),
+            float(metrics.macd_prev_histogram),
+            float(metrics.market_advance_ratio),
+            int(metrics.hot_stock_rank),
         ),
     )
 
@@ -302,6 +431,32 @@ def load_recent_quotes(conn: sqlite3.Connection, symbol: str, limit: int) -> lis
         (symbol, limit),
     ).fetchall()
     return [_row_to_quote(row) for row in reversed(rows)]
+
+
+def load_recent_quotes_before(conn: sqlite3.Connection, symbol: str, as_of: datetime, limit: int) -> list[StockQuote]:
+    rows = conn.execute(
+        """
+        SELECT provider, symbol, code, name, current_price, open_price, previous_close, high_price, low_price,
+               change_amount, change_percent, volume_shares, turnover_yuan, quote_time, raw_payload
+        FROM quotes
+        WHERE symbol = ? AND quote_time <= ?
+        ORDER BY quote_time DESC
+        LIMIT ?
+        """,
+        (symbol, as_of.isoformat(sep=" "), limit),
+    ).fetchall()
+    return [_row_to_quote(row) for row in reversed(rows)]
+
+
+def cache_quotes(conn: sqlite3.Connection, quotes: list[StockQuote]) -> int:
+    inserted = 0
+    with conn:
+        for quote in quotes:
+            before = conn.total_changes
+            insert_quote(conn, quote)
+            if conn.total_changes > before:
+                inserted += 1
+    return inserted
 
 
 def fetch_latest_briefing(conn: sqlite3.Connection) -> list[dict]:

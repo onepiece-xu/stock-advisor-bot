@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 from dataclasses import dataclass
+from datetime import date
 from decimal import Decimal, ROUND_HALF_UP
 from pathlib import Path
 from typing import Any
@@ -128,7 +129,7 @@ def ensure_trigger_file(path: str | Path) -> Path:
 def load_snapshot(path: str | Path) -> PortfolioSnapshot:
     raw = json.loads(Path(path).read_text(encoding="utf-8"))
     return PortfolioSnapshot(
-        trade_date=__import__("datetime").date.fromisoformat(raw["tradeDate"]),
+        trade_date=date.fromisoformat(raw["tradeDate"]),
         total_assets=Decimal(str(raw.get("totalAssets", 0))),
         cash=Decimal(str(raw.get("cash", 0))),
         holdings=[
@@ -197,8 +198,20 @@ def render_trade_instruction(hit: TriggerHit, snapshot: PortfolioSnapshot) -> st
     )
 
 
-def apply_trade_fill(snapshot_path: str | Path, side: str, code: str, quantity: int, price: Decimal) -> PortfolioSnapshot:
-    snapshot = load_snapshot(snapshot_path)
+def save_snapshot(path: str | Path, snapshot: PortfolioSnapshot) -> None:
+    _save_snapshot(path, snapshot)
+
+
+def apply_trade_fill(
+    snapshot_path: str | Path,
+    side: str,
+    code: str,
+    quantity: int,
+    price: Decimal,
+    *,
+    persist: bool = True,
+) -> PortfolioSnapshot:
+    snapshot = _clone_snapshot(load_snapshot(snapshot_path))
     holding = _find_holding(snapshot, code)
     if holding is None:
         raise RuntimeError(f"持仓中没有 {code}")
@@ -226,7 +239,8 @@ def apply_trade_fill(snapshot_path: str | Path, side: str, code: str, quantity: 
     for item in snapshot.holdings:
         if item.code == code:
             item.current_price = price
-    _save_snapshot(snapshot_path, snapshot)
+    if persist:
+        _save_snapshot(snapshot_path, snapshot)
     return snapshot
 
 
@@ -269,6 +283,24 @@ def _save_snapshot(path: str | Path, snapshot: PortfolioSnapshot) -> None:
         ],
     }
     Path(path).write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def _clone_snapshot(snapshot: PortfolioSnapshot) -> PortfolioSnapshot:
+    return PortfolioSnapshot(
+        trade_date=snapshot.trade_date,
+        total_assets=snapshot.total_assets,
+        cash=snapshot.cash,
+        holdings=[
+            PortfolioHolding(
+                name=item.name,
+                code=item.code,
+                quantity=item.quantity,
+                cost_price=item.cost_price,
+                current_price=item.current_price,
+            )
+            for item in snapshot.holdings
+        ],
+    )
 
 
 def _find_holding(snapshot: PortfolioSnapshot, code: str) -> PortfolioHolding | None:

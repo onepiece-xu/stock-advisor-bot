@@ -43,13 +43,32 @@ class StockQuote:
 
 @dataclass(slots=True)
 class ObservationMetrics:
-    avg3: Decimal
-    avg6: Decimal
-    bias_to_avg3: Decimal
-    bias_to_avg6: Decimal
+    ma5: Decimal
+    ma15: Decimal
+    ma60: Decimal
+    ma240: Decimal
+    rsi14: Decimal
+    bias_to_ma15: Decimal
+    bias_to_ma60: Decimal
     step_change_pct: Decimal
     recent_range_pct: Decimal
     intraday_amplitude_pct: Decimal
+    minute_volume_shares: Decimal
+    avg5_minute_volume_shares: Decimal
+    avg30_minute_volume_shares: Decimal
+    volume_ratio: Decimal
+    volume_ratio_30: Decimal
+    volume_trend_ratio: Decimal
+    breakout_above_prev30_high_pct: Decimal
+    breakdown_below_prev30_low_pct: Decimal
+    benchmark_change_pct: Decimal
+    relative_strength_pct: Decimal
+    macd_line: Decimal
+    macd_signal: Decimal
+    macd_histogram: Decimal
+    macd_prev_histogram: Decimal
+    market_advance_ratio: Decimal
+    hot_stock_rank: int
 
 
 @dataclass(slots=True)
@@ -99,3 +118,27 @@ class PortfolioSnapshot:
     total_assets: Decimal = Decimal("0")
     cash: Decimal = Decimal("0")
     holdings: List[PortfolioHolding] = field(default_factory=list)
+
+
+@dataclass(slots=True)
+class TradeFillRecord:
+    side: str
+    code: str
+    quantity: int
+    price: Decimal
+    before_quantity: int
+    after_quantity: int
+    filled_at: datetime
+
+
+@dataclass(slots=True)
+class TradingHabitProfile:
+    sample_count: int
+    buy_count: int
+    sell_count: int
+    preferred_buy_lot: int
+    preferred_add_lot: int
+    preferred_reduce_ratio: Decimal
+    buy_style: str
+    sell_style: str
+    summary: str

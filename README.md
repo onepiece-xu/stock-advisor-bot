@@ -4,14 +4,16 @@
 
 当前已具备：
 
-- 拉取 A 股公开行情（默认腾讯）
+- 拉取 A 股分钟级公开行情（默认东方财富分钟线，保留腾讯实时接口兼容）
 - 计算基础观察信号
 - 生成 AI 辅助决策分数、动作、置信度和状态
+- 支持最近 5 日分钟级信号回测
 - 把行情 / 信号 / 决策持久化到 SQLite
 - 基于历史信号做回放统计
 - 输出适合手机飞书机器人的短摘要
 - 支持飞书机器人消息回调服务
 - 支持每个交易日收盘后的复盘报告
+- 支持按任意历史分钟时点回放并重算当时建议
 - 输出控制台报告
 - 可选发送飞书 webhook 通知
 - 支持收盘持仓建议 CLI
@@ -29,7 +31,12 @@
 说明：
 
 - 当前的 “AI 辅助决策” 是可解释的规则 + 评分引擎，不是黑盒大模型推荐
+- 默认按分钟级窗口做多周期分析：MA5 / MA15 / MA60 / MA240、量比、相对大盘强弱
+- 量能分析已扩展到 5 分 / 30 分双基线，并识别“放量突破前高 / 缩量反弹 / 放量跌破前低”
+- 系统会根据你真实回传的成交记录学习交易习惯，并自动校准建议股数
+- 新增全市场扫描与热点板块概览，可直接查看行业/概念热度和市场涨跌家数
 - 每条决策都会给出动作、分数、状态、理由、风险标签，便于后续继续接 LLM 总结层
+- `monitor.signal.decision_thresholds` 可直接配置买入 / 持有 / 减仓分数阈值，不再写死在代码里
 - 当前使用场景按“手机飞书机器人查看”为主来优化输出，不假设你会长期守着电脑终端
 - 飞书通知支持两种投递方式：`webhook` 和 `direct_dm`
 - 飞书机器人服务使用 Feishu/Lark 应用凭证，可直接在手机里发命令查询
@@ -87,7 +94,8 @@ python3 -m stock_advisor.cli monitor-daemon --config config.yaml
 说明：
 
 - daemon 推送到飞书时，会自动使用手机友好摘要，而不是长篇原始报告
-- 单次分析会优先复用 SQLite 中的最近样本，避免只看当前一跳行情
+- 默认配置已切到 `eastmoney_minute + history_size=480 + benchmark=sh000001 + notify_on_neutral=false`
+- 单次分析会优先拉取最近 480 根分钟线窗口，不再只看最近几次轮询样本
 - `quote + signal + decision` 现在走单事务写入，避免孤立行情记录
 
 初始化默认交易计划文件：
@@ -103,6 +111,32 @@ python3 -m stock_advisor.cli init-trading-plan --config config.yaml
 ```bash
 python3 -m stock_advisor.cli validate-config --config config.yaml
 ```
+
+## 交易习惯学习
+
+每次真实成交后，建议回传一次，系统会自动记录样本并更新习惯画像：
+
+```bash
+python3 -m stock_advisor.cli record-fill \
+  --snapshot portfolio-snapshot.json \
+  --config config.yaml \
+  --side sell \
+  --code 601698 \
+  --quantity 100 \
+  --price 34.52
+```
+
+查看当前学到的习惯画像：
+
+```bash
+python3 -m stock_advisor.cli habit-profile --config config.yaml --mobile
+```
+
+说明：
+
+- 当前学习内容包括：常用买入手数、常用加仓手数、常见减仓比例、偏分批还是偏果断
+- 后续给出的买入/减仓股数，会优先参考你的历史成交，而不是一直写死 100 股
+- 飞书机器人支持：`habit`
 
 ## 收盘复盘
 
@@ -142,6 +176,116 @@ python3 scripts/flush_failed_notifications.py
 ```bash
 python3 -m stock_advisor.cli flush-failed-notifications
 ```
+
+## 历史时点建议
+
+按任意历史分钟时点，回放当时可用的分钟级行情，并重新计算建议：
+
+```bash
+python3 -m stock_advisor.cli advice-at \
+  --config config.yaml \
+  --at "2026-04-17 14:20"
+```
+
+只看单个标的：
+
+```bash
+python3 -m stock_advisor.cli advice-at \
+  --config config.yaml \
+  --at "2026-04-17 14:20" \
+  --symbol 601698
+```
+
+输出手机友好摘要：
+
+```bash
+python3 -m stock_advisor.cli advice-at \
+  --config config.yaml \
+  --at "2026-04-17 14:20" \
+  --mobile
+```
+
+比较两个历史时点：
+
+```bash
+python3 -m stock_advisor.cli compare-at \
+  --config config.yaml \
+  --from-time "2026-04-17 14:20" \
+  --to-time "2026-04-17 15:00" \
+  --mobile
+```
+
+比较单个标的：
+
+```bash
+python3 -m stock_advisor.cli compare-at \
+  --config config.yaml \
+  --from-time "2026-04-17 14:20" \
+  --to-time "2026-04-17 15:00" \
+  --symbol 601698 \
+  --mobile
+```
+
+说明：
+
+- 历史分钟数据默认按需从东方财富分钟线接口拉取，并自动缓存到 SQLite
+- 如果请求时点没有精确分钟样本，会回退到该时点之前最近一笔分钟样本，并在输出里明确标注
+- 这条能力也支持飞书机器人命令：`at 2026-04-17 14:20`、`at 2026-04-17 14:20 601698`、`at 601698 2026-04-17 14:20`
+- 历史对比命令支持：`compare 2026-04-17 14:20 2026-04-17 15:00`、`compare 601698 2026-04-17 14:20 2026-04-17 15:00`
+
+## 分钟级回测
+
+回测最近 5 个交易日的分钟级信号，统计 5/15/30 分钟后的表现：
+
+```bash
+python3 -m stock_advisor.cli backtest-minutes \
+  --config config.yaml \
+  --mobile
+```
+
+回测单个标的：
+
+```bash
+python3 -m stock_advisor.cli backtest-minutes \
+  --config config.yaml \
+  --days 3 \
+  --symbol 601698 \
+  --mobile
+```
+
+说明：
+
+- 原始收益均值：信号发出后实际涨跌幅
+- 策略边际均值：`buy/hold` 看上涨是否赚钱，`reduce/avoid` 看后续下跌是否判断正确
+- 手机摘要会额外给出 15 分钟动作拆解，避免总结果被 `reduce` 一类动作掩盖
+- 飞书机器人支持：`backtest`、`backtest 3`、`backtest 601698`、`backtest 3 601698`
+
+## 阈值优化
+
+用最近几日分钟样本，直接搜索更合适的 `buy/hold/reduce` 分数阈值：
+
+```bash
+python3 -m stock_advisor.cli optimize-thresholds \
+  --config config.yaml \
+  --days 5 \
+  --mobile
+```
+
+优化单个标的：
+
+```bash
+python3 -m stock_advisor.cli optimize-thresholds \
+  --config config.yaml \
+  --days 3 \
+  --symbol 601698 \
+  --mobile
+```
+
+说明：
+
+- 优化不会重新设计打分逻辑，只会在已有分数上重映射动作阈值，速度更快，也更容易解释
+- 输出会同时展示当前阈值表现、候选阈值排名，以及可直接写回 `config.yaml` 的配置片段
+- 飞书机器人支持：`optimize`、`optimize 3`、`optimize 601698`、`optimize 3 601698`
 
 查看状态：
 
@@ -194,6 +338,21 @@ python3 -m stock_advisor.cli mobile-brief --config config.yaml --notify
 
 适合后续在定时任务或飞书机器人命令里直接调用。
 
+## 全市场扫描
+
+查看当前全市场涨跌家数、热点行业、热点概念和龙头个股：
+
+```bash
+python3 -m stock_advisor.cli market-scan --config config.yaml --mobile
+```
+
+说明：
+
+- 数据来自东方财富行情列表接口
+- 默认输出上涨/平盘/下跌家数、热点行业、热点概念、领涨个股
+- 接口抖动时会自动重试；若实时接口暂不可用，会回退到最近一次成功的市场扫描快照
+- 飞书机器人支持：`market`
+
 ## 飞书机器人命令服务
 
 启动服务：
@@ -229,8 +388,23 @@ feishu_bot:
 help
 brief
 review
+market
 quote 601698
 scan 601698
+at 2026-04-17 14:20
+at 2026-04-17 14:20 601698
+at 601698 2026-04-17 14:20
+compare 2026-04-17 14:20 2026-04-17 15:00
+compare 601698 2026-04-17 14:20 2026-04-17 15:00
+backtest
+backtest 3
+backtest 601698
+backtest 3 601698
+optimize
+optimize 3
+optimize 601698
+optimize 3 601698
+habit
 replay
 replay reduce
 replay ALERT
@@ -242,8 +416,14 @@ replay action=reduce level=ALERT symbol=601698
 
 - `brief`：返回当前缓存中的聚合决策简报
 - `review`：返回最近一个交易日的收盘复盘
+- `market`：返回全市场涨跌家数、热点板块和龙头个股
 - `quote`：返回某个股票最近一次落库决策
 - `scan`：实时拉一次最新行情并临时分析，不写库
+- `at`：按历史分钟时点重算当时建议，股票代码可以写前面也可以写后面
+- `compare`：比较两个历史时点的价格、动作、评分和状态变化
+- `backtest`：回测最近几日的分钟级信号，验证策略是否真的有边际
+- `optimize`：回测后给出更合适的动作阈值建议
+- `habit`：返回系统当前学到的交易习惯画像
 - `replay`：返回历史回放统计，可按动作 / 等级 / 股票过滤
 
 ## systemd 自启动

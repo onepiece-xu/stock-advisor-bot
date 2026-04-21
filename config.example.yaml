@@ -1,5 +1,5 @@
 monitor:
-  provider: tencent
+  provider: eastmoney_minute
   stocks:
     - exchange: sz
       code: "003035"
@@ -7,6 +7,10 @@ monitor:
       code: "601698"
     - exchange: sh
       code: "603993"
+  benchmark:
+    enabled: true
+    exchange: sh
+    code: "000001"
   schedule:
     enabled: true
     run_on_startup: true
@@ -14,7 +18,11 @@ monitor:
     restrict_to_trading_session: true
     market_time_zone: Asia/Shanghai
   signal:
-    history_size: 24
+    history_size: 480
+    decision_thresholds:
+      buy_score: 78
+      hold_score: 58
+      reduce_score: 38
     thresholds:
       daily_change_pct: 2.0
       average_bias_pct: 1.0
@@ -25,7 +33,7 @@ monitor:
     tencent:
       base_url: https://qt.gtimg.cn/q=
   notification:
-    notify_on_neutral: true
+    notify_on_neutral: false
     dedup:
       enabled: true
       cooldown_minutes: 30

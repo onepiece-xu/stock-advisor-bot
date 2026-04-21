@@ -4,6 +4,8 @@ import json
 import re
 import time
 from dataclasses import dataclass
+from datetime import datetime
+from decimal import Decimal
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
@@ -11,16 +13,32 @@ from typing import Any
 import requests
 
 from .analysis import analyze_quotes
+from .backtest import (
+    optimize_decision_thresholds,
+    render_minute_backtest,
+    render_optimization_report,
+    run_minute_backtest,
+)
 from .briefing import format_mobile_digest, format_mobile_replay, format_mobile_signal
 from .config import AppConfig
+from .habit_learning import build_trading_habit_profile, render_trading_habit_profile
+from .historical import (
+    analyze_historical_point,
+    compare_historical_points,
+    render_historical_advice,
+    render_historical_compare,
+)
 from .logging_utils import get_logger
-from .models import StockRef
-from .providers import TencentQuoteProvider
+from .market_hours import is_high_volatility_period
+from .market_overview import build_market_overview, render_market_overview
+from .models import StockQuote, StockRef
+from .portfolio import find_holding, load_snapshot as load_portfolio_snapshot
+from .providers import EastmoneyMarketSnapshotProvider, EastmoneyMinuteHistoryProvider, TencentQuoteProvider
 from .review import build_close_review
-from .storage import connect_db, fetch_latest_briefing, load_recent_quotes, replay_signal_stats
+from .storage import cache_quotes, connect_db, fetch_latest_briefing, load_recent_quotes, replay_signal_stats
 
 
-SUPPORTED_ACTIONS = {"accumulate-small", "hold-watch", "hold", "reduce", "avoid"}
+SUPPORTED_ACTIONS = {"buy", "hold", "reduce", "avoid"}
 SUPPORTED_LEVELS = {"ALERT", "INFO", "NEUTRAL"}
 MENTION_PATTERNS = [
     re.compile(r"<at[^>]*>.*?</at>", re.IGNORECASE),
@@ -182,6 +200,11 @@ def run_feishu_command(config: AppConfig, command_text: str) -> str:
     if command.name == "review":
         artifact = build_close_review(config)
         return artifact.body
+    if command.name == "habit":
+        conn = connect_db(config.storage.sqlite_path)
+        return render_trading_habit_profile(build_trading_habit_profile(conn), mobile=True)
+    if command.name == "market":
+        return render_market_overview(build_market_overview(config), mobile=True)
     if command.name == "quote":
         if not command.args:
             return "用法: quote 601698"
@@ -191,6 +214,32 @@ def run_feishu_command(config: AppConfig, command_text: str) -> str:
         if not command.args:
             return "用法: scan 601698"
         return _scan_live_symbol(config, command.args[0])
+    if command.name == "at":
+        datetimes, stock_tokens = _extract_history_datetimes(command.args)
+        if len(datetimes) != 1:
+            return "用法: at 2026-04-17 14:20 [601698] 或 at 601698 2026-04-17 14:20"
+        requested_at = datetimes[0]
+        stocks = [_resolve_stock_ref(config, token) for token in stock_tokens] if stock_tokens else None
+        items = analyze_historical_point(config, requested_at, stocks=stocks)
+        return render_historical_advice(items, mobile=True)
+    if command.name == "compare":
+        datetimes, stock_tokens = _extract_history_datetimes(command.args)
+        if len(datetimes) != 2:
+            return "用法: compare 2026-04-17 14:20 2026-04-17 15:00 [601698]"
+        start_at, end_at = sorted(datetimes)
+        stocks = [_resolve_stock_ref(config, token) for token in stock_tokens] if stock_tokens else None
+        items = compare_historical_points(config, start_at, end_at, stocks=stocks)
+        return render_historical_compare(items, mobile=True)
+    if command.name == "backtest":
+        days, stock_tokens = _parse_backtest_args(command.args)
+        stocks = [_resolve_stock_ref(config, token) for token in stock_tokens] if stock_tokens else None
+        stats = run_minute_backtest(config, symbols=stocks, ndays=days)
+        return render_minute_backtest(stats, mobile=True)
+    if command.name == "optimize":
+        days, stock_tokens = _parse_backtest_args(command.args)
+        stocks = [_resolve_stock_ref(config, token) for token in stock_tokens] if stock_tokens else None
+        report = optimize_decision_thresholds(config, symbols=stocks, ndays=days)
+        return render_optimization_report(report, mobile=True)
     if command.name == "replay":
         conn = connect_db(config.storage.sqlite_path)
         filters = _parse_replay_filters(config, command.args)
@@ -222,12 +271,27 @@ def _render_latest_quote(items: list[dict], query: str) -> str:
 
 def _scan_live_symbol(config: AppConfig, query: str) -> str:
     stock = _resolve_stock_ref(config, query)
-    provider = TencentQuoteProvider(config.monitor)
+    provider = _build_provider(config)
     conn = connect_db(config.storage.sqlite_path)
-    history = load_recent_quotes(conn, stock.symbol, config.monitor.history_size - 1)
-    quote = provider.fetch_quote(stock)
-    history.append(quote)
-    result = analyze_quotes(history, config.monitor)
+    history = _load_stock_history(config, conn, provider, stock)
+    if not history:
+        raise RuntimeError(f"未拉到 {stock.code} 的实时窗口数据")
+    advance_ratio, rank_map, sector_boards = _fetch_market_context(config)
+    portfolio_snapshot = _load_portfolio_snapshot(config)
+    holding = find_holding(portfolio_snapshot, stock.code)
+    result = analyze_quotes(
+        history,
+        config.monitor,
+        portfolio_holding=holding,
+        benchmark_history=_load_benchmark_history(config),
+        trading_habit_profile=build_trading_habit_profile(conn),
+        market_advance_ratio=advance_ratio,
+        hot_stock_rank=rank_map.get(stock.code, 0),
+        is_volatile_period=is_high_volatility_period(),
+        portfolio_cash_ratio=_compute_cash_ratio(portfolio_snapshot),
+        sector_boards=sector_boards,
+        portfolio_position_ratio=_compute_position_ratio(portfolio_snapshot, holding, history[-1].current_price),
+    )
     return format_mobile_signal(result.title, result.message)
 
 
@@ -310,8 +374,24 @@ def _help_text(*, prefix: str | None = None) -> str:
             "help",
             "brief",
             "review",
+            "habit",
+            "market",
             "quote 601698",
             "scan 601698",
+            "at 2026-04-17 14:20",
+            "at 2026-04-17 14:20 601698",
+            "at 601698 2026-04-17 14:20",
+            "compare 2026-04-17 14:20 2026-04-17 15:00",
+            "compare 601698 2026-04-17 14:20 2026-04-17 15:00",
+            "backtest",
+            "backtest 3",
+            "backtest 601698",
+            "backtest 3 601698",
+            "optimize",
+            "optimize 3",
+            "optimize 601698",
+            "optimize 3 601698",
+            "market",
             "replay",
             "replay reduce",
             "replay ALERT",
@@ -344,3 +424,120 @@ def _chunk_text(text: str, limit: int = 1800) -> list[str]:
     if current:
         chunks.append(current)
     return chunks or [text]
+
+
+def _parse_history_datetime(text: str) -> datetime:
+    normalized = text.strip()
+    for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M", "%Y-%m-%dT%H:%M:%S", "%Y-%m-%dT%H:%M"):
+        try:
+            return datetime.strptime(normalized, fmt)
+        except ValueError:
+            continue
+    raise RuntimeError(f"无法解析历史时点: {text}")
+
+
+def _extract_history_datetimes(args: list[str]) -> tuple[list[datetime], list[str]]:
+    datetimes: list[datetime] = []
+    remaining: list[str] = []
+    index = 0
+    while index < len(args):
+        one_token = _try_parse_history_datetime(args[index])
+        if one_token is not None:
+            datetimes.append(one_token)
+            index += 1
+            continue
+        if index + 1 < len(args):
+            two_tokens = _try_parse_history_datetime(f"{args[index]} {args[index + 1]}")
+            if two_tokens is not None:
+                datetimes.append(two_tokens)
+                index += 2
+                continue
+        remaining.append(args[index])
+        index += 1
+    return datetimes, remaining
+
+
+def _try_parse_history_datetime(text: str) -> datetime | None:
+    try:
+        return _parse_history_datetime(text)
+    except RuntimeError:
+        return None
+
+
+def _parse_backtest_args(args: list[str]) -> tuple[int, list[str]]:
+    days = 5
+    remaining: list[str] = []
+    for token in args:
+        if token.isdigit() and len(token) <= 2:
+            days = max(1, min(int(token), 10))
+            continue
+        remaining.append(token)
+    return days, remaining
+
+
+def _compute_cash_ratio(snapshot) -> Decimal | None:
+    if snapshot is None or snapshot.total_assets <= 0:
+        return None
+    return (snapshot.cash / snapshot.total_assets).quantize(Decimal("0.0001"))
+
+
+def _compute_position_ratio(snapshot, holding, current_price: Decimal) -> Decimal | None:
+    if snapshot is None or snapshot.total_assets <= 0 or holding is None or holding.quantity <= 0:
+        return None
+    position_value = Decimal(str(holding.quantity)) * current_price
+    return (position_value / snapshot.total_assets).quantize(Decimal("0.0001"))
+
+
+def _fetch_market_context(config: AppConfig) -> tuple[Decimal, dict[str, int], list[dict]]:
+    advance_ratio = Decimal("0")
+    rank_map: dict[str, int] = {}
+    sector_boards: list[dict] = []
+    try:
+        provider = EastmoneyMarketSnapshotProvider(config.monitor)
+        breadth = provider.fetch_market_breadth()
+        total = breadth.get("up_count", 0) + breadth.get("flat_count", 0) + breadth.get("down_count", 0)
+        if total > 0:
+            advance_ratio = Decimal(str(breadth["up_count"])) / Decimal(str(total))
+        top_stocks = provider.fetch_top_stocks(limit=50)
+        rank_map = {item["code"]: idx + 1 for idx, item in enumerate(top_stocks)}
+        sector_boards = provider.fetch_sector_boards(kind="industry", limit=5) + provider.fetch_sector_boards(kind="concept", limit=5)
+    except Exception:
+        pass
+    return advance_ratio, rank_map, sector_boards
+
+
+def _load_portfolio_snapshot(config: AppConfig):
+    snapshot_path = config.storage.sqlite_path.resolve().parent.parent / "portfolio-snapshot.json"
+    if not snapshot_path.exists():
+        return None
+    return load_portfolio_snapshot(snapshot_path)
+
+
+def _load_benchmark_history(config: AppConfig) -> list[StockQuote] | None:
+    benchmark = config.monitor.benchmark
+    if benchmark is None:
+        return None
+    provider = _build_provider(config)
+    if config.monitor.provider == "eastmoney_minute":
+        return provider.fetch_recent_window(benchmark, config.monitor.history_size)
+    try:
+        return [provider.fetch_quote(benchmark)]
+    except Exception:
+        return None
+
+
+def _build_provider(config: AppConfig):
+    if config.monitor.provider == "eastmoney_minute":
+        return EastmoneyMinuteHistoryProvider(config.monitor)
+    return TencentQuoteProvider(config.monitor)
+
+
+def _load_stock_history(config: AppConfig, conn, provider, stock: StockRef) -> list[StockQuote]:
+    if config.monitor.provider == "eastmoney_minute":
+        history = provider.fetch_recent_window(stock, config.monitor.history_size)
+        if history:
+            cache_quotes(conn, history)
+        return history
+    history = load_recent_quotes(conn, stock.symbol, config.monitor.history_size - 1)
+    history.append(provider.fetch_quote(stock))
+    return history

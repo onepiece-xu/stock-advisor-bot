@@ -6,16 +6,43 @@ from datetime import datetime
 def format_mobile_signal(title: str, message: str, *, include_title: bool = True) -> str:
     lines = [line.strip() for line in message.splitlines() if line.strip()]
     selected: list[str] = []
-    prefixes = ("时间：", "现价：", "涨跌幅：", "动作：", "直接建议：", "建议仓位：", "入场/处理：", "评分：", "置信度：", "状态：", "理由：", "风险：")
-    for line in lines:
-        if line.startswith(prefixes):
+    preferred_prefixes = (
+        "时间：",
+        "现价：",
+        "涨跌幅：",
+        "走势（",
+        "样本窗口：",
+        "量比：",
+        "量能趋势：",
+        "RSI14：",
+        "基准：",
+        "动作：",
+        "直接建议：",
+        "评分：",
+        "理由：",
+        "风险：",
+    )
+    for prefix in preferred_prefixes:
+        line = next((item for item in lines if item.startswith(prefix)), None)
+        if line is not None:
             selected.append(line)
-        elif line.startswith("观察：") and len(selected) < 10:
-            selected.append(line)
-        elif line.startswith("参考动作：") and len(selected) < 12:
-            selected.append(line)
-        if len(selected) >= 12:
-            break
+
+    if len(selected) < 12:
+        for line in lines:
+            if line in selected:
+                continue
+            if line.startswith("观察："):
+                selected.append(line)
+            elif line.startswith("建议仓位：") and len(selected) < 12:
+                selected.append(line)
+            elif line.startswith("入场/处理：") and len(selected) < 12:
+                selected.append(line)
+            elif line.startswith("参考动作：") and len(selected) < 12:
+                selected.append(line)
+            if len(selected) >= 12:
+                break
+
+    selected = selected[:12]
     body = "\n".join(selected)
     if include_title:
         return f"{title}\n{body}"

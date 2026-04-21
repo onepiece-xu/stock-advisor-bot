@@ -75,6 +75,15 @@ def load_previous_snapshot(data_dir: Path, before_date: date) -> PortfolioSnapsh
     return load_snapshot(valid[-1][1])
 
 
+def find_holding(snapshot: PortfolioSnapshot | None, code: str) -> PortfolioHolding | None:
+    if snapshot is None:
+        return None
+    for holding in snapshot.holdings:
+        if holding.code == code:
+            return holding
+    return None
+
+
 def build_daily_report(current: PortfolioSnapshot, previous: PortfolioSnapshot | None) -> str:
     lines = [
         "【收盘持仓建议】",

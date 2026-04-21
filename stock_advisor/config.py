@@ -19,6 +19,13 @@ class Thresholds:
 
 
 @dataclass(slots=True)
+class DecisionThresholds:
+    buy_score: float
+    hold_score: float
+    reduce_score: float
+
+
+@dataclass(slots=True)
 class FeishuConfig:
     enabled: bool
     webhook_url: str
@@ -68,11 +75,14 @@ class ScheduleConfig:
 class MonitorConfig:
     provider: str
     stocks: list[StockRef]
+    benchmark: StockRef | None
     schedule: ScheduleConfig
     history_size: int
     thresholds: Thresholds
+    decision_thresholds: DecisionThresholds
     provider_settings: ProviderSettings
     notification: NotificationConfig
+    stop_loss_pct: float
 
 
 @dataclass(slots=True)
@@ -121,6 +131,7 @@ def load_config(path: str | Path) -> AppConfig:
     schedule_raw = monitor_raw.get("schedule", {})
     thresholds_raw = monitor_raw.get("signal", {}).get("thresholds", {})
     provider_settings_raw = monitor_raw.get("provider_settings", {})
+    benchmark_raw = monitor_raw.get("benchmark", {})
     notification_raw = monitor_raw.get("notification", {})
     dedup_raw = notification_raw.get("dedup", {})
     feishu_raw = notification_raw.get("feishu", {})
@@ -135,8 +146,16 @@ def load_config(path: str | Path) -> AppConfig:
 
     return AppConfig(
         monitor=MonitorConfig(
-            provider=monitor_raw.get("provider", "tencent"),
+            provider=monitor_raw.get("provider", "eastmoney_minute"),
             stocks=stocks,
+            benchmark=(
+                None
+                if benchmark_raw.get("enabled", True) is False
+                else StockRef(
+                    exchange=str(benchmark_raw.get("exchange", "sh")),
+                    code=str(benchmark_raw.get("code", "000001")),
+                )
+            ),
             schedule=ScheduleConfig(
                 enabled=bool(schedule_raw.get("enabled", True)),
                 run_on_startup=bool(schedule_raw.get("run_on_startup", True)),
@@ -144,19 +163,25 @@ def load_config(path: str | Path) -> AppConfig:
                 restrict_to_trading_session=bool(schedule_raw.get("restrict_to_trading_session", True)),
                 market_time_zone=str(schedule_raw.get("market_time_zone", "Asia/Shanghai")),
             ),
-            history_size=int(monitor_raw.get("signal", {}).get("history_size", 24)),
+            history_size=int(monitor_raw.get("signal", {}).get("history_size", 480)),
             thresholds=Thresholds(
                 daily_change_pct=float(thresholds_raw.get("daily_change_pct", 2.0)),
                 average_bias_pct=float(thresholds_raw.get("average_bias_pct", 1.0)),
                 abnormal_step_pct=float(thresholds_raw.get("abnormal_step_pct", 1.5)),
                 abnormal_range_pct=float(thresholds_raw.get("abnormal_range_pct", 3.0)),
             ),
+            decision_thresholds=DecisionThresholds(
+                buy_score=float(monitor_raw.get("signal", {}).get("decision_thresholds", {}).get("buy_score", 78.0)),
+                hold_score=float(monitor_raw.get("signal", {}).get("decision_thresholds", {}).get("hold_score", 58.0)),
+                reduce_score=float(monitor_raw.get("signal", {}).get("decision_thresholds", {}).get("reduce_score", 38.0)),
+            ),
             provider_settings=ProviderSettings(
                 request_timeout_ms=int(provider_settings_raw.get("request_timeout_ms", 4000)),
                 tencent_base_url=provider_settings_raw.get("tencent", {}).get("base_url", "https://qt.gtimg.cn/q="),
             ),
+            stop_loss_pct=float(monitor_raw.get("signal", {}).get("stop_loss_pct", 7.0)),
             notification=NotificationConfig(
-                notify_on_neutral=bool(notification_raw.get("notify_on_neutral", True)),
+                notify_on_neutral=bool(notification_raw.get("notify_on_neutral", False)),
                 dedup=DedupConfig(
                     enabled=bool(dedup_raw.get("enabled", True)),
                     cooldown_minutes=int(dedup_raw.get("cooldown_minutes", 30)),
@@ -203,8 +228,23 @@ def validate_config(path: str | Path) -> list[str]:
     if not config.monitor.stocks:
         errors.append("monitor.stocks 不能为空")
 
+    if config.monitor.provider not in {"tencent", "eastmoney_minute"}:
+        errors.append("monitor.provider 仅支持 tencent 或 eastmoney_minute")
+
     if config.monitor.history_size < 2:
         errors.append("monitor.signal.history_size 至少应为 2")
+    elif config.monitor.provider == "eastmoney_minute" and config.monitor.history_size < 240:
+        errors.append(
+            "monitor.signal.history_size 在 eastmoney_minute 模式下至少应为 240；"
+            "小于 240 会导致分钟均线和量能窗口失真，24 仅覆盖约 12 分钟"
+        )
+
+    thresholds = config.monitor.decision_thresholds
+    if not (0 <= thresholds.reduce_score < thresholds.hold_score < thresholds.buy_score <= 100):
+        errors.append("monitor.signal.decision_thresholds 必须满足 0 <= reduce_score < hold_score < buy_score <= 100")
+
+    if not (0 < config.monitor.stop_loss_pct <= 50):
+        errors.append("monitor.signal.stop_loss_pct 必须在 0-50 之间（单位：%，默认 7.0）")
 
     if config.monitor.schedule.fixed_delay_seconds <= 0:
         errors.append("monitor.schedule.fixed_delay_seconds 必须大于 0")

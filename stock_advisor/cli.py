@@ -7,6 +7,7 @@ from decimal import Decimal
 from pathlib import Path
 
 from .config import load_config, require_valid_config, validate_config
+from .snapshot_parser import parse_portfolio_text
 from .habit_learning import build_trading_habit_profile, render_trading_habit_profile
 from .backtest import (
     optimize_decision_thresholds,
@@ -15,6 +16,7 @@ from .backtest import (
     run_minute_backtest,
 )
 from .briefing import format_mobile_digest, format_mobile_replay, format_mobile_signal
+from .codex_bridge import pull_codex_notifications
 from .feishu_bot_server import serve_feishu_bot
 from .market_overview import build_market_overview, render_market_overview
 from .historical import (
@@ -38,6 +40,7 @@ from .storage import (
     insert_trade_fill,
     load_recent_quotes,
     persist_observation,
+    prune_old_data,
     replay_signal_stats,
 )
 from .trading_plan import (
@@ -102,6 +105,10 @@ def main() -> None:
     flush_parser = subparsers.add_parser("flush-failed-notifications", help="重放失败的 webhook 通知")
     flush_parser.add_argument("--config", required=False, help="保留参数位，兼容统一运维脚本")
 
+    codex_pull_parser = subparsers.add_parser("pull-codex-notifications", help="读取本地 Codex bridge 推送队列")
+    codex_pull_parser.add_argument("--limit", type=int, default=20, help="最多读取多少条未读消息，默认 20")
+    codex_pull_parser.add_argument("--keep-unread", action="store_true", help="只读取，不标记已读")
+
     review_parser = subparsers.add_parser("close-review", help="生成收盘复盘报告")
     review_parser.add_argument("--config", required=True, help="配置文件路径")
     review_parser.add_argument("--notify", action="store_true", help="把收盘复盘发送到飞书")
@@ -140,6 +147,16 @@ def main() -> None:
     habit_parser.add_argument("--config", required=True, help="配置文件路径")
     habit_parser.add_argument("--mobile", action="store_true", help="输出手机友好摘要")
 
+    prune_parser = subparsers.add_parser("prune-data", help="清理数据库中的过期数据")
+    prune_parser.add_argument("--config", required=True, help="配置文件路径")
+    prune_parser.add_argument("--retention-days", type=int, default=90, help="保留天数（默认 90）")
+
+    import_snap_parser = subparsers.add_parser("import-snapshot", help="从券商App复制文本解析并更新持仓快照")
+    import_snap_parser.add_argument("--snapshot", required=True, help="目标持仓快照 JSON 文件路径")
+    import_snap_parser.add_argument("--text", help="持仓文本（不传则从 stdin 读取）")
+    import_snap_parser.add_argument("--date", help="交易日期 YYYY-MM-DD，默认今天")
+    import_snap_parser.add_argument("--dry-run", action="store_true", help="仅打印解析结果，不写入文件")
+
     args = parser.parse_args()
 
     if args.command == "monitor-once":
@@ -164,6 +181,8 @@ def main() -> None:
         run_validate_config(args.config)
     elif args.command == "flush-failed-notifications":
         run_flush_failed_notifications()
+    elif args.command == "pull-codex-notifications":
+        run_pull_codex_notifications(args.limit, args.keep_unread)
     elif args.command == "close-review":
         run_close_review(args.config, args.notify)
     elif args.command == "advice-at":
@@ -176,6 +195,10 @@ def main() -> None:
         run_optimize_thresholds(args.config, args.days, args.symbol or [], args.mobile, args.notify, args.apply)
     elif args.command == "habit-profile":
         run_habit_profile(args.config, args.mobile)
+    elif args.command == "import-snapshot":
+        run_import_snapshot(args.snapshot, args.text, args.date, args.dry_run)
+    elif args.command == "prune-data":
+        run_prune_data(args.config, args.retention_days)
 
 
 def run_monitor_once(config_path: str, force_notify: bool, mobile: bool) -> None:
@@ -217,7 +240,13 @@ def run_monitor_once(config_path: str, force_notify: bool, mobile: bool) -> None
         if force_notify or result.should_notify or config.monitor.notification.notify_on_neutral:
             if config.monitor.notification.feishu.enabled:
                 payload = format_mobile_signal(result.title, result.message, include_title=False) if mobile else result.message
-                deliver_feishu_message(config.monitor.notification.feishu, result.title, payload)
+                deliver_feishu_message(
+                    config.monitor.notification.feishu,
+                    result.title,
+                    payload,
+                    app_id=config.feishu_bot.app_id,
+                    app_secret=config.feishu_bot.app_secret,
+                )
 
 
 def run_monitor_daemon(config_path: str) -> None:
@@ -256,7 +285,13 @@ def run_replay_signals(
     rendered = format_mobile_replay(stats, symbol=symbol, level=level, action=action)
     print(rendered)
     if notify and config.monitor.notification.feishu.enabled:
-        deliver_feishu_message(config.monitor.notification.feishu, "历史回放统计", rendered)
+        deliver_feishu_message(
+            config.monitor.notification.feishu,
+            "历史回放统计",
+            rendered,
+            app_id=config.feishu_bot.app_id,
+            app_secret=config.feishu_bot.app_secret,
+        )
 
 
 def run_mobile_brief(config_path: str, notify: bool) -> None:
@@ -265,7 +300,13 @@ def run_mobile_brief(config_path: str, notify: bool) -> None:
     rendered = format_mobile_digest(fetch_latest_briefing(conn))
     print(rendered)
     if notify and config.monitor.notification.feishu.enabled:
-        deliver_feishu_message(config.monitor.notification.feishu, "AI股票决策简报", rendered)
+        deliver_feishu_message(
+            config.monitor.notification.feishu,
+            "AI股票决策简报",
+            rendered,
+            app_id=config.feishu_bot.app_id,
+            app_secret=config.feishu_bot.app_secret,
+        )
 
 
 def run_market_scan(config_path: str, mobile: bool, notify: bool) -> None:
@@ -273,7 +314,13 @@ def run_market_scan(config_path: str, mobile: bool, notify: bool) -> None:
     rendered = render_market_overview(build_market_overview(config), mobile=mobile)
     print(rendered)
     if notify and config.monitor.notification.feishu.enabled:
-        deliver_feishu_message(config.monitor.notification.feishu, "全市场扫描", rendered)
+        deliver_feishu_message(
+            config.monitor.notification.feishu,
+            "全市场扫描",
+            rendered,
+            app_id=config.feishu_bot.app_id,
+            app_secret=config.feishu_bot.app_secret,
+        )
 
 
 def run_feishu_bot(config_path: str) -> None:
@@ -336,13 +383,33 @@ def run_flush_failed_notifications() -> None:
         print("没有待重放的失败通知")
 
 
+def run_pull_codex_notifications(limit: int, keep_unread: bool) -> None:
+    items = pull_codex_notifications(limit=max(limit, 1), mark_sent=not keep_unread)
+    if not items:
+        print("没有未读的 Codex 推送")
+        return
+
+    for idx, item in enumerate(items, start=1):
+        if idx > 1:
+            print("\n" + ("=" * 80))
+        print(f"[{item['created_at']}] {item['title']}")
+        print("")
+        print(item["message"])
+
+
 def run_close_review(config_path: str, notify: bool) -> None:
     config = require_valid_config(config_path)
     artifact = build_close_review(config)
     print(artifact.body)
     print(f"\n[saved] {artifact.saved_path}")
     if notify and config.monitor.notification.feishu.enabled:
-        deliver_feishu_message(config.monitor.notification.feishu, artifact.title, artifact.body)
+        deliver_feishu_message(
+            config.monitor.notification.feishu,
+            artifact.title,
+            artifact.body,
+            app_id=config.feishu_bot.app_id,
+            app_secret=config.feishu_bot.app_secret,
+        )
 
 
 def run_advice_at(config_path: str, at_text: str, symbols: list[str], mobile: bool, notify: bool) -> None:
@@ -353,7 +420,13 @@ def run_advice_at(config_path: str, at_text: str, symbols: list[str], mobile: bo
     rendered = render_historical_advice(items, mobile=mobile)
     print(rendered)
     if notify and config.monitor.notification.feishu.enabled:
-        deliver_feishu_message(config.monitor.notification.feishu, f"历史时点建议 {requested_at:%Y-%m-%d %H:%M}", rendered)
+        deliver_feishu_message(
+            config.monitor.notification.feishu,
+            f"历史时点建议 {requested_at:%Y-%m-%d %H:%M}",
+            rendered,
+            app_id=config.feishu_bot.app_id,
+            app_secret=config.feishu_bot.app_secret,
+        )
 
 
 def run_compare_at(
@@ -417,6 +490,74 @@ def run_habit_profile(config_path: str, mobile: bool) -> None:
     config = require_valid_config(config_path)
     conn = connect_db(config.storage.sqlite_path)
     print(render_trading_habit_profile(build_trading_habit_profile(conn), mobile=mobile))
+
+
+def run_import_snapshot(snapshot_path: str, text: str | None, trade_date_str: str | None, dry_run: bool) -> None:
+    import sys
+    from .models import PortfolioHolding, PortfolioSnapshot
+
+    raw_text = text if text is not None else sys.stdin.read()
+    result = parse_portfolio_text(raw_text)
+
+    for w in result.warnings:
+        print(f"[警告] {w}")
+
+    if not result.holdings:
+        print("解析失败：未找到持仓数据")
+        return
+
+    trade_date = date.fromisoformat(trade_date_str) if trade_date_str else date.today()
+    snap_path = Path(snapshot_path)
+
+    existing_total = result.total_assets
+    existing_cash = result.cash
+    if snap_path.exists() and (existing_total is None or existing_cash is None):
+        try:
+            old = load_snapshot(snap_path)
+            if existing_total is None:
+                existing_total = old.total_assets
+            if existing_cash is None:
+                existing_cash = old.cash
+        except Exception:
+            pass
+
+    total_assets = existing_total or Decimal("0")
+    cash = existing_cash or Decimal("0")
+
+    holdings = [
+        PortfolioHolding(
+            name=h.name,
+            code=h.code,
+            quantity=h.quantity,
+            cost_price=h.cost_price,
+            current_price=h.current_price,
+        )
+        for h in result.holdings
+    ]
+    snapshot = PortfolioSnapshot(trade_date=trade_date, total_assets=total_assets, cash=cash, holdings=holdings)
+
+    print(f"解析结果（{trade_date}）：")
+    print(f"  总资产：{total_assets}  现金：{cash}")
+    for h in holdings:
+        print(f"  {h.name}({h.code})  {h.quantity}股  成本{h.cost_price}  现价{h.current_price}")
+
+    if dry_run:
+        print("\n[dry-run] 未写入文件")
+        return
+
+    import json
+    payload = {
+        "tradeDate": snapshot.trade_date.isoformat(),
+        "totalAssets": float(snapshot.total_assets),
+        "cash": float(snapshot.cash),
+        "holdings": [
+            {"name": h.name, "code": h.code, "quantity": h.quantity,
+             "costPrice": float(h.cost_price), "currentPrice": float(h.current_price)}
+            for h in snapshot.holdings
+        ],
+    }
+    snap_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    print(f"\n已写入 {snap_path}")
 
 
 def _parse_history_datetime(text: str) -> datetime:
@@ -554,6 +695,18 @@ def _record_fill_and_render_habit_profile(
             )
             save_trade_snapshot(snapshot_path, snapshot)
         return render_trading_habit_profile(build_trading_habit_profile(conn), mobile=True)
+    finally:
+        conn.close()
+
+
+def run_prune_data(config_path: str, retention_days: int) -> None:
+    """Delete data older than retention_days from the database."""
+    config = require_valid_config(config_path)
+    conn = connect_db(config.storage.sqlite_path)
+    try:
+        result = prune_old_data(conn, retention_days=retention_days)
+        parts = [f"{table}={count}" for table, count in result.items()]
+        print(f"✅ 已清理 {retention_days} 天前的数据: {', '.join(parts)}")
     finally:
         conn.close()
 

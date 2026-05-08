@@ -22,6 +22,8 @@ def analyze_quotes(
     portfolio_cash_ratio: Decimal | None = None,
     sector_boards: list[dict] | None = None,
     portfolio_position_ratio: Decimal | None = None,
+    daily_closes: list[Decimal] | None = None,
+    portfolio_total_assets: Decimal | None = None,
 ) -> ObservationResult:
     current = history[-1]
     observations: list[str] = []
@@ -135,6 +137,12 @@ def analyze_quotes(
         observations.append(f"观察：MACD 红柱走宽（{_format_ratio(macd_histogram)}），多头动能持续增强。")
     elif macd_histogram < 0 and macd_histogram < macd_prev_histogram:
         observations.append(f"观察：MACD 绿柱走宽（{_format_ratio(macd_histogram)}），空头动能持续释放。")
+    ma_align = _ma_alignment_score(current.current_price, ma5, ma15, ma60, ma240)
+    if ma_align >= 4:
+        observations.append("观察：均线多头排列完整（价格>MA5>MA15>MA60>MA240），中长线趋势结构最优。")
+    elif ma_align <= -4:
+        observations.append("观察：均线空头排列完整（价格<MA5<MA15<MA60<MA240），各周期均线均偏空。")
+
     if hot_stock_rank == 1:
         observations.append("观察：今日涨幅全市场第一，属于市场热点龙头。")
     elif hot_stock_rank <= 5:
@@ -196,6 +204,8 @@ def analyze_quotes(
         market_advance_ratio=market_advance_ratio,
         hot_stock_rank=hot_stock_rank,
     )
+    daily_ma20 = _average_decimal_list(daily_closes, 20) if daily_closes else None
+    daily_ma60 = _average_decimal_list(daily_closes, 60) if daily_closes else None
     history_count = len(history)
     decision = _build_decision_signal(
         current,
@@ -208,6 +218,9 @@ def analyze_quotes(
         portfolio_cash_ratio=portfolio_cash_ratio,
         sector_boards=sector_boards,
         portfolio_position_ratio=portfolio_position_ratio,
+        daily_ma20=daily_ma20,
+        daily_ma60=daily_ma60,
+        portfolio_total_assets=portfolio_total_assets,
     )
     sparkline = _render_sparkline(history)
     title = f"{current.code} {current.name} 行情观察"
@@ -273,6 +286,7 @@ def _build_message(
         f"MA15：{_format_price(metrics.ma15)}",
         f"MA60：{_format_price(metrics.ma60)}",
         f"MA240：{_format_price(metrics.ma240)}",
+        f"均线排列：{_describe_ma_alignment(_ma_alignment_score(current.current_price, metrics.ma5, metrics.ma15, metrics.ma60, metrics.ma240))}",
         f"RSI14：{_format_ratio(metrics.rsi14)}",
         f"MACD：{_format_ratio(metrics.macd_line)} | 信号线：{_format_ratio(metrics.macd_signal)} | 柱线：{_format_ratio(metrics.macd_histogram)}",
         f"相对 MA15：{_format_percent(metrics.bias_to_ma15)}",
@@ -289,9 +303,9 @@ def _build_message(
         "",
         "【AI辅助决策】",
         f"动作：{decision.action}",
-        f"直接建议：{decision.trade_advice}",
-        f"建议仓位：{decision.trade_size_hint}",
-        f"入场/处理：{decision.entry_note}",
+        f"操作指令：{decision.trade_advice}",
+        f"执行数量：{decision.trade_size_hint}",
+        f"触发条件：{decision.entry_note}",
         f"评分：{decision.score.quantize(Decimal('0.01'), rounding=ROUND_HALF_UP)}/100",
         f"置信度：{decision.confidence}",
         f"状态：{decision.regime}",
@@ -454,10 +468,25 @@ def _build_decision_signal(
     portfolio_cash_ratio: Decimal | None = None,
     sector_boards: list[dict] | None = None,
     portfolio_position_ratio: Decimal | None = None,
+    daily_ma20: Decimal | None = None,
+    daily_ma60: Decimal | None = None,
+    portfolio_total_assets: Decimal | None = None,
 ) -> DecisionSignal:
     score = Decimal("50")
     rationale: list[str] = []
     risk_flags: list[str] = []
+    holding_return_pct = _holding_return_percent(current, portfolio_holding)
+
+    if daily_ma20 is not None and daily_ma60 is not None and daily_ma20 > 0 and daily_ma60 > 0:
+        if current.current_price > daily_ma20 > daily_ma60:
+            score += Decimal("8")
+            rationale.append("日线多头：现价站上日线MA20且MA20>MA60，大趋势向上")
+        elif current.current_price < daily_ma20 < daily_ma60:
+            score -= Decimal("10")
+            risk_flags.append("日线空头：现价<日线MA20<日线MA60，大趋势偏弱，买入信号被压制")
+        elif current.current_price < daily_ma60:
+            score -= Decimal("5")
+            risk_flags.append(f"现价跌破日线MA60（{_format_price(daily_ma60)}），中线趋势转弱")
 
     if current.change_percent >= Decimal("2.00"):
         score += Decimal("8")
@@ -486,6 +515,20 @@ def _build_decision_signal(
     elif metrics.ma240 > 0 and current.current_price < metrics.ma240:
         score -= Decimal("4")
         rationale.append("现价跌回 MA240 下方，全天结构偏弱")
+
+    ma_align = _ma_alignment_score(current.current_price, metrics.ma5, metrics.ma15, metrics.ma60, metrics.ma240)
+    if ma_align >= 4:
+        score += Decimal("8")
+        rationale.append("均线多头排列完整（价格>MA5>MA15>MA60>MA240），趋势结构自我强化")
+    elif ma_align == 3:
+        score += Decimal("4")
+        rationale.append("均线多头排列基本确立（4层中3层对齐），趋势偏强")
+    elif ma_align <= -4:
+        score -= Decimal("8")
+        risk_flags.append("均线空头排列完整（价格<MA5<MA15<MA60<MA240），空头结构无支撑")
+    elif ma_align == -3:
+        score -= Decimal("4")
+        risk_flags.append("均线空头排列基本确立（4层中3层对齐），短线承压")
 
     if metrics.step_change_pct >= Decimal("1.00"):
         score += Decimal("4")
@@ -628,6 +671,34 @@ def _build_decision_signal(
             score -= Decimal("4")
             risk_flags.append(f"单票持仓集中度偏高（占总资产 {_format_percent(portfolio_position_ratio * 100)}），注意控制仓位上限")
 
+    if holding_return_pct is not None:
+        if holding_return_pct <= Decimal("-12"):
+            score -= Decimal("10")
+            risk_flags.append(f"持仓浮亏已达 {_format_percent(holding_return_pct)}，弱势里不宜继续硬扛或盲目补仓")
+        elif holding_return_pct <= Decimal("-8"):
+            score -= Decimal("7")
+            risk_flags.append(f"持仓浮亏较深（{_format_percent(holding_return_pct)}），优先考虑风控而不是补仓")
+        elif holding_return_pct <= Decimal("-5") and metrics.bias_to_ma60 <= Decimal("0"):
+            score -= Decimal("4")
+            risk_flags.append(f"仍低于成本 {_format_percent(abs(holding_return_pct))} 且未收复 MA60，补仓胜率偏低")
+        elif holding_return_pct >= Decimal("8") and current.current_price < metrics.ma15:
+            score -= Decimal("4")
+            risk_flags.append(f"已有浮盈 {_format_percent(holding_return_pct)} 但跌回 MA15，下半场先守利润")
+        elif holding_return_pct >= Decimal("3") and metrics.bias_to_ma15 >= Decimal("0") and metrics.bias_to_ma60 >= Decimal("0"):
+            score += Decimal("4")
+            rationale.append(f"现价已高于持仓成本 {_format_percent(holding_return_pct)}，持仓安全垫开始形成")
+
+    if portfolio_holding is not None and portfolio_holding.cost_price > 0 and portfolio_holding.quantity > 0:
+        stop_pct = Decimal(str(monitor_config.stop_loss_pct))
+        fixed_stop = (portfolio_holding.cost_price * (1 - stop_pct / Decimal("100"))).quantize(Decimal("0.001"))
+        dist_to_stop = _percent_diff(current.current_price, fixed_stop)
+        if dist_to_stop <= Decimal("0"):
+            score -= Decimal("12")
+            risk_flags.append(f"已触及固定止损价 {_format_price(fixed_stop)}（成本 {_format_price(portfolio_holding.cost_price)} 下 {_format_ratio(stop_pct)}%），建议立即执行止损")
+        elif dist_to_stop <= Decimal("2.50"):
+            score -= Decimal("6")
+            risk_flags.append(f"距固定止损价 {_format_price(fixed_stop)} 仅剩 {_format_percent(dist_to_stop)}，收紧风控、做好出手准备")
+
     if is_volatile_period:
         score -= Decimal("5")
         risk_flags.append("当前处于开盘/收盘波动期，信号可靠性偏低，建议等市场稳定后再执行")
@@ -660,6 +731,16 @@ def _build_decision_signal(
         score -= Decimal("3")
         risk_flags.append(f"低开 {_format_percent(gap_pct)}，开盘承压，观望为主")
 
+    if current.high_price > current.low_price and current.high_price > 0 and current.low_price > 0:
+        intraday_range = current.high_price - current.low_price
+        price_in_range = ((current.current_price - current.low_price) / intraday_range).quantize(Decimal("0.01"))
+        if price_in_range >= Decimal("0.85") and metrics.volume_trend_ratio <= Decimal("0.85"):
+            score -= Decimal("5")
+            risk_flags.append(f"现价处于日内高位（{_format_percent(price_in_range * 100)} 分位）且量能趋势趋弱，高位缩量派发风险偏高")
+        elif price_in_range <= Decimal("0.15") and metrics.rsi14 <= Decimal("38") and metrics.relative_strength_pct >= Decimal("-1.00"):
+            score += Decimal("4")
+            rationale.append(f"现价处于日内低位（{_format_percent(price_in_range * 100)} 分位）且 RSI 偏低，相对强弱尚可，存在超卖反弹窗口")
+
     if not rationale:
         rationale.append("当前多空信号仍偏均衡，继续等待更明确的量价配合")
 
@@ -671,8 +752,85 @@ def _build_decision_signal(
         score += Decimal("4")
         rationale.append("超卖后出现止跌反弹迹象，关注量能确认")
 
+    # ── MERGED ENTRY GUARDS (baked into score, no separate override) ──
+    # Old _apply_entry_discipline_guards conditions now handled by scoring above.
+    # If score < 84 naturally, _decision_action won't output buy.
+    # But add extra penalty for the most common quality failure modes:
+    has_position = portfolio_holding is not None and portfolio_holding.quantity > 0
+
+    # Volume + relative strength insufficient → supplement penalty
+    vol_too_low = metrics.volume_ratio < Decimal("1.20") and metrics.volume_trend_ratio < Decimal("1.05")
+    rel_weak = metrics.relative_strength_pct < Decimal("0.50")
+    if vol_too_low and rel_weak:
+        score -= Decimal("4")
+        risk_flags.append("量能和相对大盘同步弱势，入场条件不足")
+    elif vol_too_low and not metrics.breakout_above_prev30_high_pct >= Decimal("0.10"):
+        score -= Decimal("3")
+        risk_flags.append("量能未见明显放大，缺乏突破确认")
+    elif rel_weak:
+        score -= Decimal("2")
+        risk_flags.append("相对大盘偏弱，买入胜率不够高")
+
+    # Chased too high
+    if current.change_percent >= Decimal("4.00"):
+        score -= Decimal("4")
+        risk_flags.append("当日涨幅已偏大，追价性价比不高")
+
+    # Cash buffer check
+    if portfolio_cash_ratio is not None and portfolio_cash_ratio < Decimal("0.20"):
+        score -= Decimal("3")
+        risk_flags.append("现金仓位不够宽裕，买入门槛进一步提高")
+
+    # ── MERGED PULLBACK REGIME GUARDS ──
+    healthy_pullback = all((
+        has_position,
+        metrics.bias_to_ma60 >= Decimal("0"),
+        metrics.breakdown_below_prev30_low_pct < Decimal("0.20"),
+        metrics.volume_ratio_30 < Decimal("1.50"),
+        metrics.relative_strength_pct >= Decimal("-0.30"),
+    ))
+    trend_failure = any((
+        metrics.bias_to_ma60 <= Decimal("-1.20"),
+        metrics.breakdown_below_prev30_low_pct >= Decimal("0.20") and metrics.volume_ratio_30 >= Decimal("1.20"),
+        metrics.relative_strength_pct <= Decimal("-1.50"),
+    ))
+    reclaim_setup = all((
+        not has_position,
+        metrics.bias_to_ma15 >= Decimal("0.60"),
+        metrics.bias_to_ma60 >= Decimal("0.20"),
+        metrics.volume_ratio >= Decimal("1.50"),
+        metrics.volume_trend_ratio >= Decimal("1.10"),
+        metrics.relative_strength_pct >= Decimal("0.80"),
+    ))
+    if healthy_pullback:
+        rationale.append("更像趋势内回撤，不把正常洗盘误判成卖点")
+    if trend_failure and has_position:
+        risk_flags.append("回撤已经从洗盘演变成走弱，注意减仓风险")
+        score -= Decimal("3")
+    if reclaim_setup:
+        rationale.append("卖后重新转强，允许按右侧确认接回")
+
+    # ── MERGED POSITION CONTEXT GUARDS ──
+    if has_position and holding_return_pct is not None:
+        if holding_return_pct <= Decimal("-5") and metrics.bias_to_ma60 <= Decimal("0"):
+            score -= Decimal("4")
+            risk_flags.append("浮亏股且未收复 MA60，停止逆势补仓")
+        if holding_return_pct <= Decimal("-10") and metrics.breakdown_below_prev30_low_pct >= Decimal("0.20"):
+            score -= Decimal("5")
+            risk_flags.append("浮亏较深且再破日内结构，减仓信号")
+
+    # ── ACCOUNT RISK GUARDS (kept as-is, these are position sizing logic) ──
     score = max(Decimal("0"), min(score, Decimal("100")))
-    action = _decision_action(score, monitor_config, metrics.benchmark_change_pct)
+    action = _decision_action(score, monitor_config, metrics.benchmark_change_pct, metrics.market_advance_ratio)
+    action, guard_rationales, guard_risk_flags = _apply_account_risk_guards(
+        action,
+        monitor_config,
+        portfolio_holding,
+        portfolio_cash_ratio=portfolio_cash_ratio,
+        portfolio_position_ratio=portfolio_position_ratio,
+    )
+    rationale.extend(guard_rationales)
+    risk_flags.extend(guard_risk_flags)
     trade_advice, trade_size_hint, entry_note = _trade_plan(
         action,
         score,
@@ -680,6 +838,8 @@ def _build_decision_signal(
         metrics,
         portfolio_holding,
         trading_habit_profile,
+        monitor_config=monitor_config,
+        total_assets=portfolio_total_assets,
     )
     return DecisionSignal(
         action=action,
@@ -700,7 +860,11 @@ def _confidence_level(score: Decimal, sample_size: int) -> str:
         return "low"
     if sample_size >= 240 and edge >= Decimal("18"):
         return "high"
+    if sample_size >= 120 and edge >= Decimal("14"):
+        return "high"
     if sample_size >= 120 and edge >= Decimal("10"):
+        return "medium"
+    if edge >= Decimal("16"):
         return "medium"
     return "low"
 
@@ -734,17 +898,13 @@ def _decision_action(
     score: Decimal,
     monitor_config: MonitorConfig,
     benchmark_change_pct: Decimal = Decimal("0"),
+    market_advance_ratio: Decimal = Decimal("0"),
 ) -> str:
     thresholds = monitor_config.decision_thresholds
     buy = Decimal(str(thresholds.buy_score))
     hold = Decimal(str(thresholds.hold_score))
     reduce = Decimal(str(thresholds.reduce_score))
-    if benchmark_change_pct >= Decimal("1.0"):
-        shift = Decimal("-4")   # bull day: lower bar, more willing to buy
-    elif benchmark_change_pct <= Decimal("-1.0"):
-        shift = Decimal("4")    # bear day: raise bar, more selective
-    else:
-        shift = Decimal("0")
+    shift = _compute_threshold_shift(benchmark_change_pct, market_advance_ratio)
     if score >= buy + shift:
         return "buy"
     if score >= hold + shift:
@@ -754,6 +914,56 @@ def _decision_action(
     return "avoid"
 
 
+def _apply_account_risk_guards(
+    action: str,
+    monitor_config: MonitorConfig,
+    portfolio_holding: PortfolioHolding | None,
+    *,
+    portfolio_cash_ratio: Decimal | None,
+    portfolio_position_ratio: Decimal | None,
+) -> tuple[str, list[str], list[str]]:
+    adjusted_action = action
+    rationale: list[str] = []
+    risk_flags: list[str] = []
+    has_position = portfolio_holding is not None and portfolio_holding.quantity > 0
+    risk_controls = monitor_config.risk_controls
+
+    total_position_pct = None
+    if portfolio_cash_ratio is not None:
+        total_position_pct = ((Decimal("1") - portfolio_cash_ratio) * Decimal("100")).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+    single_position_pct = None
+    if portfolio_position_ratio is not None:
+        single_position_pct = (portfolio_position_ratio * Decimal("100")).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+    min_cash_pct = Decimal(str(risk_controls.min_cash_pct))
+    max_total_position_pct = Decimal(str(risk_controls.max_total_position_pct))
+    max_single_position_pct = Decimal(str(risk_controls.max_single_position_pct))
+
+    if total_position_pct is not None and total_position_pct >= max_total_position_pct:
+        risk_flags.append(f"账户总仓位已到 {_format_percent(total_position_pct)}，触发总仓位上限 {_format_percent(max_total_position_pct)}")
+        if adjusted_action == "buy":
+            adjusted_action = "hold" if has_position else "avoid"
+            rationale.append("账户总仓位已触顶，新增仓位信号自动降级")
+
+    if portfolio_cash_ratio is not None:
+        cash_pct = (portfolio_cash_ratio * Decimal("100")).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+        if cash_pct <= min_cash_pct:
+            risk_flags.append(f"现金缓冲仅剩 {_format_percent(cash_pct)}，低于最低现金线 {_format_percent(min_cash_pct)}")
+            if adjusted_action == "buy":
+                adjusted_action = "hold" if has_position else "avoid"
+                rationale.append("现金缓冲不足，先守纪律，不再新增仓位")
+
+    if single_position_pct is not None and single_position_pct >= max_single_position_pct:
+        risk_flags.append(f"单票仓位达到 {_format_percent(single_position_pct)}，超过单票上限 {_format_percent(max_single_position_pct)}")
+        if adjusted_action == "buy":
+            adjusted_action = "reduce" if has_position else "avoid"
+            rationale.append("单票已超仓，买入信号被改写为降仓/观望")
+        elif adjusted_action == "hold" and has_position:
+            adjusted_action = "reduce"
+            rationale.append("单票仓位已超上限，持有信号改写为减仓")
+
+    return adjusted_action, rationale, risk_flags
+
+
 def _trade_plan(
     action: str,
     score: Decimal,
@@ -761,35 +971,40 @@ def _trade_plan(
     metrics: ObservationMetrics,
     portfolio_holding: PortfolioHolding | None,
     trading_habit_profile: TradingHabitProfile | None,
+    *,
+    monitor_config: MonitorConfig | None = None,
+    total_assets: Decimal | None = None,
 ) -> tuple[str, str, str]:
     habit_note = _habit_note(trading_habit_profile)
     if action == "buy":
-        buy_qty = _recommended_buy_quantity(score, portfolio_holding, trading_habit_profile)
+        position_pct = monitor_config.position_pct_per_trade if monitor_config is not None else 0.05
+        buy_qty = _recommended_buy_quantity(score, portfolio_holding, trading_habit_profile, total_assets=total_assets, current_price=current.current_price, position_pct=position_pct)
         return (
-            f"先买入 {buy_qty} 股试单，不追高{habit_note}",
-            f"买入 {buy_qty} 股",
-            f"优先等回踩不破 MA15 {_format_price(metrics.ma15)} 或再度放量转强时再进",
+            f"买入 {buy_qty} 股{habit_note}",
+            f"目标仓位约 {position_pct * 100:.1f}%（{buy_qty} 股）",
+            f"仅在现价不高于 MA15 {_format_price(metrics.ma15)} 且量能继续放大时执行；跌回 MA60 {_format_price(metrics.ma60)} 下方取消",
         )
     if action == "hold":
         hold_qty = portfolio_holding.quantity if portfolio_holding is not None and portfolio_holding.quantity > 0 else 0
-        hold_hint = f"继续持有 {hold_qty} 股" if hold_qty > 0 else "维持当前仓位，不新增"
+        hold_hint = f"继续持有 {hold_qty} 股" if hold_qty > 0 else "保持空仓"
         return (
-            f"继续持有观察，不主动加仓{habit_note}",
+            f"持有 {hold_qty} 股，禁止加仓{habit_note}" if hold_qty > 0 else f"空仓观望，禁止开仓{habit_note}",
             hold_hint,
-            f"观察能否持续站稳 MA15 {_format_price(metrics.ma15)} 与 MA60 {_format_price(metrics.ma60)}",
+            f"守住 MA60 {_format_price(metrics.ma60)} 就不动；跌破则转减仓，反弹缩量也不追",
         )
     if action == "reduce":
         reduce_qty = _recommended_reduce_quantity(score, portfolio_holding, trading_habit_profile)
         return (
-            f"反弹时先减仓 {reduce_qty} 股{habit_note}",
-            f"减仓 {reduce_qty} 股",
-            f"若反弹仍站不稳 MA60 {_format_price(metrics.ma60)}，优先卖出 {reduce_qty} 股",
+            f"卖出 {reduce_qty} 股{habit_note}",
+            f"先减 {reduce_qty} 股，回收现金",
+            f"优先在反弹靠近 MA60 {_format_price(metrics.ma60)} 时挂卖；若继续跌弱，按止损纪律执行",
         )
     avoid_qty = _recommended_avoid_quantity(portfolio_holding, trading_habit_profile)
+    has_position = portfolio_holding is not None and portfolio_holding.quantity > 0
     return (
-        f"暂时不要买；若已有持仓，先减仓 {avoid_qty} 股{habit_note}",
-        f"减仓 {avoid_qty} 股，禁止加仓",
-        f"至少等价格重新回到 MA15 {_format_price(metrics.ma15)} 上方，且量比回升后再看",
+        f"禁止买入；卖出 {avoid_qty} 股{habit_note}" if has_position else f"禁止买入，空仓等待{habit_note}",
+        f"先减仓 {avoid_qty} 股，停止加仓" if has_position else "空仓等待下一次机会",
+        f"等价格重新站回 MA15 {_format_price(metrics.ma15)} 且量能恢复后再评估，不在弱势里硬接",
     )
 
 
@@ -797,7 +1012,16 @@ def _recommended_buy_quantity(
     score: Decimal,
     portfolio_holding: PortfolioHolding | None,
     trading_habit_profile: TradingHabitProfile | None,
+    *,
+    total_assets: Decimal | None = None,
+    current_price: Decimal | None = None,
+    position_pct: float = 0.05,
 ) -> int:
+    if total_assets is not None and total_assets > 0 and current_price is not None and current_price > 0:
+        target_value = total_assets * Decimal(str(position_pct))
+        qty = int(target_value / current_price)
+        qty = (qty // 100) * 100
+        return max(100, qty)
     if trading_habit_profile is not None and trading_habit_profile.sample_count >= 3:
         if portfolio_holding is not None and portfolio_holding.quantity > 0:
             return trading_habit_profile.preferred_add_lot
@@ -849,6 +1073,51 @@ def _recommended_avoid_quantity(
     return _round_to_sellable_lot(quantity, ratio)
 
 
+def _ma_alignment_score(price: Decimal, ma5: Decimal, ma15: Decimal, ma60: Decimal, ma240: Decimal) -> int:
+    """Returns MA stack alignment score.
+    +4 = price>MA5>MA15>MA60>MA240 (full bull stack)
+    -4 = price<MA5<MA15<MA60<MA240 (full bear stack)
+    Intermediate values reflect partial alignment."""
+    levels = [v for v in [price, ma5, ma15, ma60, ma240] if v > 0]
+    if len(levels) < 2:
+        return 0
+    total = len(levels) - 1
+    bull = sum(1 for a, b in zip(levels, levels[1:]) if a > b)
+    bear = sum(1 for a, b in zip(levels, levels[1:]) if a < b)
+    if bull == total:
+        return total
+    if bear == total:
+        return -total
+    return bull - bear
+
+
+def _compute_threshold_shift(benchmark_change_pct: Decimal, market_advance_ratio: Decimal) -> Decimal:
+    """Dynamic threshold shift combining benchmark trend and market breadth.
+    Negative = lower bar (bullish market), Positive = raise bar (bearish market).
+    Capped at ±6 to prevent threshold collapse."""
+    if benchmark_change_pct >= Decimal("1.5"):
+        bench = Decimal("-5")
+    elif benchmark_change_pct >= Decimal("1.0"):
+        bench = Decimal("-3")
+    elif benchmark_change_pct <= Decimal("-1.5"):
+        bench = Decimal("5")
+    elif benchmark_change_pct <= Decimal("-1.0"):
+        bench = Decimal("3")
+    else:
+        bench = Decimal("0")
+    if market_advance_ratio >= Decimal("0.70"):
+        breadth = Decimal("-3")
+    elif market_advance_ratio >= Decimal("0.60"):
+        breadth = Decimal("-1")
+    elif Decimal("0") < market_advance_ratio <= Decimal("0.30"):
+        breadth = Decimal("3")
+    elif Decimal("0") < market_advance_ratio <= Decimal("0.40"):
+        breadth = Decimal("1")
+    else:
+        breadth = Decimal("0")
+    return max(Decimal("-6"), min(bench + breadth, Decimal("6")))
+
+
 def _round_to_sellable_lot(quantity: int, ratio: Decimal) -> int:
     raw = (Decimal(quantity) * ratio).quantize(Decimal("1"), rounding=ROUND_HALF_UP)
     target = int(raw)
@@ -866,6 +1135,12 @@ def _habit_note(trading_habit_profile: TradingHabitProfile | None) -> str:
     return "（已按你的历史成交习惯校准）"
 
 
+def _describe_ma_alignment(align: int) -> str:
+    labels = {4: "完整多头排列 ▲▲▲▲", 3: "多头排列为主 ▲▲▲", 2: "偏多排列 ▲▲", 1: "轻微偏多 ▲",
+              0: "多空交叉 ─", -1: "轻微偏空 ▼", -2: "偏空排列 ▼▼", -3: "空头排列为主 ▼▼▼", -4: "完整空头排列 ▼▼▼▼"}
+    return labels.get(align, "多空交叉 ─")
+
+
 _SPARK_CHARS = "▁▂▃▄▅▆▇█"
 
 
@@ -881,6 +1156,13 @@ def _render_sparkline(history: list[StockQuote], count: int = 30) -> str:
     return "".join(_SPARK_CHARS[int((p - min_p) / (max_p - min_p) * n)] for p in prices)
 
 
+def _average_decimal_list(values: list[Decimal], n: int) -> Decimal | None:
+    window = values[-n:] if len(values) >= n else values
+    if not window:
+        return None
+    return (sum(window, Decimal("0")) / Decimal(len(window))).quantize(Decimal("0.001"), rounding=ROUND_HALF_UP)
+
+
 def _format_price(value: Decimal) -> str:
     return str(value.quantize(Decimal("0.001"), rounding=ROUND_HALF_UP))
 
@@ -893,6 +1175,12 @@ def _format_percent(value: Decimal) -> str:
 
 def _format_ratio(value: Decimal) -> str:
     return str(value.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP))
+
+
+def _holding_return_percent(current: StockQuote, portfolio_holding: PortfolioHolding | None) -> Decimal | None:
+    if portfolio_holding is None or portfolio_holding.quantity <= 0 or portfolio_holding.cost_price <= 0:
+        return None
+    return _percent_diff(current.current_price, portfolio_holding.cost_price)
 
 
 def _format_volume(value: Decimal) -> str:

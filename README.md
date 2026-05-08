@@ -37,8 +37,10 @@
 - 新增全市场扫描与热点板块概览，可直接查看行业/概念热度和市场涨跌家数
 - 每条决策都会给出动作、分数、状态、理由、风险标签，便于后续继续接 LLM 总结层
 - `monitor.signal.decision_thresholds` 可直接配置买入 / 持有 / 减仓分数阈值，不再写死在代码里
+- `monitor.risk` 支持账户级风控线（总仓位上限、单票上限、最低现金线），会优先于个股买入信号生效
 - 当前使用场景按“手机飞书机器人查看”为主来优化输出，不假设你会长期守着电脑终端
-- 飞书通知支持两种投递方式：`webhook` 和 `direct_dm`
+- 通知投递支持四种模式：`webhook`、`direct_dm`、`app_dm` 和 `codex_bridge`
+- `codex_bridge` 会把消息写到本地队列，适合让当前 Codex 会话后续主动拉取查看；它不能反向主动唤起对话
 - 飞书机器人服务使用 Feishu/Lark 应用凭证，可直接在手机里发命令查询
 
 ## 安装依赖
@@ -163,6 +165,12 @@ python3 -m stock_advisor.cli close-review --config config.yaml --notify
 
 ```bash
 python3 scripts/flush_direct_dm_outbox.py
+```
+
+如果使用 `codex_bridge` 模式，消息会进入本地 Codex 队列，可用下面命令读取未读通知：
+
+```bash
+python3 -m stock_advisor.cli pull-codex-notifications --limit 20
 ```
 
 如果 `webhook` 推送重试后仍失败，会写入失败补偿队列，可用下面脚本重放：

@@ -28,6 +28,10 @@ monitor:
       average_bias_pct: 1.0
       abnormal_step_pct: 1.5
       abnormal_range_pct: 3.0
+  risk:
+    max_total_position_pct: 85
+    max_single_position_pct: 35
+    min_cash_pct: 15
   provider_settings:
     request_timeout_ms: 4000
     tencent:
@@ -41,6 +45,7 @@ monitor:
       enabled: false
       delivery_mode: webhook
       webhook_url: ""
+      receive_open_id: ""
 portfolio:
   data_dir: data/portfolio
 storage:

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
-from datetime import datetime
+from datetime import datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
 from statistics import median
@@ -602,6 +602,23 @@ def _row_to_quote(row: sqlite3.Row) -> StockQuote:
 
 def _decimal(value: object) -> Decimal:
     return Decimal(str(value))
+
+
+def prune_old_data(conn: sqlite3.Connection, retention_days: int = 90) -> dict[str, int]:
+    """Delete data older than retention_days. Returns {table: deleted_count}."""
+    cutoff = datetime.now() - timedelta(days=retention_days)
+    total: dict[str, int] = {}
+    for table, time_col in [
+        ("quotes", "quote_time"),
+        ("trade_fills", "filled_at"),
+        ("signals", "created_at"),
+    ]:
+        count = conn.execute(
+            f"DELETE FROM {table} WHERE {time_col} < ?", (cutoff.isoformat(),)
+        ).rowcount
+        conn.commit()
+        total[table] = count
+    return total
 
 
 def _ensure_column(conn: sqlite3.Connection, table_name: str, column_name: str, ddl: str) -> None:

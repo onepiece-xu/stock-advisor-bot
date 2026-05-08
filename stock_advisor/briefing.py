@@ -5,48 +5,35 @@ from datetime import datetime
 
 def format_mobile_signal(title: str, message: str, *, include_title: bool = True) -> str:
     lines = [line.strip() for line in message.splitlines() if line.strip()]
-    selected: list[str] = []
-    preferred_prefixes = (
-        "时间：",
-        "现价：",
-        "涨跌幅：",
-        "走势（",
-        "样本窗口：",
-        "量比：",
-        "量能趋势：",
-        "RSI14：",
-        "基准：",
-        "动作：",
-        "直接建议：",
-        "评分：",
-        "理由：",
-        "风险：",
-    )
-    for prefix in preferred_prefixes:
-        line = next((item for item in lines if item.startswith(prefix)), None)
-        if line is not None:
-            selected.append(line)
 
-    if len(selected) < 12:
-        for line in lines:
-            if line in selected:
-                continue
-            if line.startswith("观察："):
-                selected.append(line)
-            elif line.startswith("建议仓位：") and len(selected) < 12:
-                selected.append(line)
-            elif line.startswith("入场/处理：") and len(selected) < 12:
-                selected.append(line)
-            elif line.startswith("参考动作：") and len(selected) < 12:
-                selected.append(line)
-            if len(selected) >= 12:
-                break
+    def pick(*prefixes: str) -> str | None:
+        for prefix in prefixes:
+            for line in lines:
+                if line.startswith(prefix):
+                    return line
+        return None
 
-    selected = selected[:12]
-    body = "\n".join(selected)
+    brief_lines: list[str] = []
     if include_title:
-        return f"{title}\n{body}"
-    return body
+        brief_lines.append(title)
+
+    for line in (
+        pick("操作指令：", "直接建议：", "动作："),
+        pick("执行数量："),
+        pick("触发条件："),
+        pick("风险："),
+    ):
+        if line:
+            brief_lines.append(line)
+
+    if len(brief_lines) <= (1 if include_title else 0):
+        fallback = lines[:3]
+        if include_title:
+            brief_lines.extend(fallback)
+        else:
+            brief_lines = fallback
+
+    return "\n".join(brief_lines[:5])
 
 
 def format_mobile_digest(items: list[dict]) -> str:
@@ -68,6 +55,10 @@ def format_mobile_digest(items: list[dict]) -> str:
         )
         reason = "；".join(item["rationale"][:2]) if item["rationale"] else "暂无明显理由"
         lines.append(f"   理由:{reason}")
+        if item["trade_advice"]:
+            lines.append(f"   动作:{item['trade_advice']}")
+        if item["trade_size_hint"]:
+            lines.append(f"   仓位:{item['trade_size_hint']}")
         if item["risk_flags"]:
             lines.append(f"   风险:{'；'.join(item['risk_flags'][:2])}")
 

@@ -224,6 +224,33 @@ class EastmoneyMinuteHistoryProvider:
         quotes = self.fetch_quotes(stock, effective_end - timedelta(days=lookback_days), effective_end)
         return _tail_trade_days(quotes, ndays)
 
+    def fetch_daily_closes(self, stock: StockRef, ndays: int = 60) -> list[Decimal]:
+        today = datetime.now().date()
+        lookback = today - timedelta(days=ndays * 2)
+        response = requests.get(
+            "https://push2his.eastmoney.com/api/qt/stock/kline/get",
+            params={
+                "secid": self._secid(stock),
+                "klt": "101",
+                "fqt": "1",
+                "lmt": str(ndays + 10),
+                "beg": lookback.strftime("%Y%m%d"),
+                "end": today.strftime("%Y%m%d"),
+                "fields1": "f1,f2,f3,f4,f5,f6",
+                "fields2": "f51,f52,f53,f54,f55,f56",
+            },
+            headers={"User-Agent": "Mozilla/5.0"},
+            timeout=self.monitor_config.provider_settings.request_timeout_ms / 1000,
+        )
+        response.raise_for_status()
+        data = (response.json().get("data") or {})
+        closes: list[Decimal] = []
+        for line in data.get("klines") or []:
+            fields = str(line).split(",")
+            if len(fields) >= 3:
+                closes.append(Decimal(fields[2]))
+        return closes[-ndays:]
+
     def _secid(self, stock: StockRef) -> str:
         exchange = stock.exchange.lower()
         if exchange == "sh":

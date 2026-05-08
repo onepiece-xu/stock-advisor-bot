@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -26,10 +27,18 @@ class DecisionThresholds:
 
 
 @dataclass(slots=True)
+class RiskControlConfig:
+    max_total_position_pct: float
+    max_single_position_pct: float
+    min_cash_pct: float
+
+
+@dataclass(slots=True)
 class FeishuConfig:
     enabled: bool
     webhook_url: str
     delivery_mode: str
+    receive_open_id: str
 
 
 @dataclass(slots=True)
@@ -80,9 +89,11 @@ class MonitorConfig:
     history_size: int
     thresholds: Thresholds
     decision_thresholds: DecisionThresholds
+    risk_controls: RiskControlConfig
     provider_settings: ProviderSettings
     notification: NotificationConfig
     stop_loss_pct: float
+    position_pct_per_trade: float
 
 
 @dataclass(slots=True)
@@ -131,6 +142,7 @@ def load_config(path: str | Path) -> AppConfig:
     schedule_raw = monitor_raw.get("schedule", {})
     thresholds_raw = monitor_raw.get("signal", {}).get("thresholds", {})
     provider_settings_raw = monitor_raw.get("provider_settings", {})
+    risk_raw = monitor_raw.get("risk", {})
     benchmark_raw = monitor_raw.get("benchmark", {})
     notification_raw = monitor_raw.get("notification", {})
     dedup_raw = notification_raw.get("dedup", {})
@@ -175,11 +187,17 @@ def load_config(path: str | Path) -> AppConfig:
                 hold_score=float(monitor_raw.get("signal", {}).get("decision_thresholds", {}).get("hold_score", 58.0)),
                 reduce_score=float(monitor_raw.get("signal", {}).get("decision_thresholds", {}).get("reduce_score", 38.0)),
             ),
+            risk_controls=RiskControlConfig(
+                max_total_position_pct=float(risk_raw.get("max_total_position_pct", 85.0)),
+                max_single_position_pct=float(risk_raw.get("max_single_position_pct", 35.0)),
+                min_cash_pct=float(risk_raw.get("min_cash_pct", 15.0)),
+            ),
             provider_settings=ProviderSettings(
                 request_timeout_ms=int(provider_settings_raw.get("request_timeout_ms", 4000)),
                 tencent_base_url=provider_settings_raw.get("tencent", {}).get("base_url", "https://qt.gtimg.cn/q="),
             ),
             stop_loss_pct=float(monitor_raw.get("signal", {}).get("stop_loss_pct", 7.0)),
+            position_pct_per_trade=float(monitor_raw.get("signal", {}).get("position_pct_per_trade", 0.05)),
             notification=NotificationConfig(
                 notify_on_neutral=bool(notification_raw.get("notify_on_neutral", False)),
                 dedup=DedupConfig(
@@ -190,6 +208,7 @@ def load_config(path: str | Path) -> AppConfig:
                     enabled=bool(feishu_raw.get("enabled", False)),
                     webhook_url=str(feishu_raw.get("webhook_url", "")),
                     delivery_mode=str(feishu_raw.get("delivery_mode", "webhook")),
+                    receive_open_id=str(feishu_raw.get("receive_open_id", "")),
                 ),
             ),
         ),
@@ -211,8 +230,8 @@ def load_config(path: str | Path) -> AppConfig:
         ),
         feishu_bot=FeishuBotConfig(
             enabled=bool(bot_raw.get("enabled", False)),
-            app_id=str(bot_raw.get("app_id", "")),
-            app_secret=str(bot_raw.get("app_secret", "")),
+            app_id=str(os.environ.get("STOCK_ADVISOR_APP_ID", bot_raw.get("app_id", ""))),
+            app_secret=str(os.environ.get("STOCK_ADVISOR_APP_SECRET", bot_raw.get("app_secret", ""))),
             verification_token=str(bot_raw.get("verification_token", "")),
             listen_host=str(bot_raw.get("listen_host", "0.0.0.0")),
             listen_port=int(bot_raw.get("listen_port", 8788)),
@@ -243,6 +262,16 @@ def validate_config(path: str | Path) -> list[str]:
     if not (0 <= thresholds.reduce_score < thresholds.hold_score < thresholds.buy_score <= 100):
         errors.append("monitor.signal.decision_thresholds 必须满足 0 <= reduce_score < hold_score < buy_score <= 100")
 
+    risk_controls = config.monitor.risk_controls
+    if not (0 <= risk_controls.max_total_position_pct <= 100):
+        errors.append("monitor.risk.max_total_position_pct 必须在 0-100 之间")
+    if not (0 <= risk_controls.max_single_position_pct <= 100):
+        errors.append("monitor.risk.max_single_position_pct 必须在 0-100 之间")
+    if not (0 <= risk_controls.min_cash_pct <= 100):
+        errors.append("monitor.risk.min_cash_pct 必须在 0-100 之间")
+    if risk_controls.min_cash_pct + risk_controls.max_total_position_pct > 100:
+        errors.append("monitor.risk.min_cash_pct + monitor.risk.max_total_position_pct 不能超过 100")
+
     if not (0 < config.monitor.stop_loss_pct <= 50):
         errors.append("monitor.signal.stop_loss_pct 必须在 0-50 之间（单位：%，默认 7.0）")
 
@@ -255,12 +284,19 @@ def validate_config(path: str | Path) -> list[str]:
     if config.monitor.notification.dedup.cooldown_minutes < 0:
         errors.append("monitor.notification.dedup.cooldown_minutes 不能小于 0")
 
-    if config.monitor.notification.feishu.delivery_mode not in {"webhook", "direct_dm"}:
-        errors.append("monitor.notification.feishu.delivery_mode 仅支持 webhook 或 direct_dm")
+    if config.monitor.notification.feishu.delivery_mode not in {"webhook", "direct_dm", "app_dm", "codex_bridge"}:
+        errors.append("monitor.notification.feishu.delivery_mode 仅支持 webhook、direct_dm、app_dm 或 codex_bridge")
 
     if config.monitor.notification.feishu.enabled:
         if config.monitor.notification.feishu.delivery_mode == "webhook" and not config.monitor.notification.feishu.webhook_url:
             errors.append("开启 webhook 通知时必须填写 monitor.notification.feishu.webhook_url")
+        if config.monitor.notification.feishu.delivery_mode == "app_dm":
+            if not config.monitor.notification.feishu.receive_open_id:
+                errors.append("开启 app_dm 通知时必须填写 monitor.notification.feishu.receive_open_id")
+            if not config.feishu_bot.app_id and not os.environ.get("STOCK_ADVISOR_APP_ID"):
+                errors.append("开启 app_dm 通知时必须填写 feishu_bot.app_id 或设置 STOCK_ADVISOR_APP_ID 环境变量")
+            if not config.feishu_bot.app_secret and not os.environ.get("STOCK_ADVISOR_APP_SECRET"):
+                errors.append("开启 app_dm 通知时必须填写 feishu_bot.app_secret 或设置 STOCK_ADVISOR_APP_SECRET 环境变量")
 
     if config.review.send_after_hour < 0 or config.review.send_after_hour > 23:
         errors.append("review.send_after_hour 必须在 0-23 之间")
@@ -269,10 +305,10 @@ def validate_config(path: str | Path) -> list[str]:
         errors.append("review.send_after_minute 必须在 0-59 之间")
 
     if config.feishu_bot.enabled:
-        if not config.feishu_bot.app_id:
-            errors.append("开启 feishu_bot 时必须填写 feishu_bot.app_id")
-        if not config.feishu_bot.app_secret:
-            errors.append("开启 feishu_bot 时必须填写 feishu_bot.app_secret")
+        if not config.feishu_bot.app_id and not os.environ.get("STOCK_ADVISOR_APP_ID"):
+            errors.append("开启 feishu_bot 时必须填写 feishu_bot.app_id 或设置 STOCK_ADVISOR_APP_ID 环境变量")
+        if not config.feishu_bot.app_secret and not os.environ.get("STOCK_ADVISOR_APP_SECRET"):
+            errors.append("开启 feishu_bot 时必须填写 feishu_bot.app_secret 或设置 STOCK_ADVISOR_APP_SECRET 环境变量")
         if config.feishu_bot.listen_port <= 0 or config.feishu_bot.listen_port > 65535:
             errors.append("feishu_bot.listen_port 必须在 1-65535 之间")
 

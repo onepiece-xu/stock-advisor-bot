@@ -5,6 +5,7 @@ from zoneinfo import ZoneInfo
 
 
 MARKET_TZ = ZoneInfo("Asia/Shanghai")
+AUCTION_START = time(9, 25)
 MORNING_START = time(9, 30)
 MORNING_END = time(11, 30)
 AFTERNOON_START = time(13, 0)
@@ -51,6 +52,7 @@ def is_a_share_trading_time(now: datetime | None = None) -> bool:
         return False
 
     current = now.time()
+    in_auction = AUCTION_START <= current < MORNING_START
     in_morning = MORNING_START <= current <= MORNING_END
     in_afternoon = AFTERNOON_START <= current <= AFTERNOON_END
-    return in_morning or in_afternoon
+    return in_auction or in_morning or in_afternoon

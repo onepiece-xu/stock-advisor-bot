@@ -17,6 +17,7 @@ from .logging_utils import get_logger
 from .news import fetch_announcements_for_code
 from .notify import deliver_feishu_message
 from .portfolio import find_holding, load_snapshot as load_portfolio_snapshot
+from .portfolio_doc_sync import sync_snapshot_from_doc
 from .providers import EastmoneyMarketSnapshotProvider, EastmoneyMinuteHistoryProvider, TencentQuoteProvider
 from .review import already_sent_close_review, build_close_review, mark_close_review_sent, should_send_close_review_now
 from .storage import cache_quotes, connect_db, load_recent_quotes, persist_observation
@@ -40,26 +41,33 @@ class MonitorRuntime:
         self._market_context_cache: tuple[Decimal, dict[str, int], list[dict]] | None = None
         self._market_context_cached_at: datetime | None = None
         self._pre_market_sent_dates: set[date] = set()
+        self._daily_closes: dict[str, list[Decimal]] = {}
+        self._daily_closes_date: date | None = None
 
     def run_once(self) -> None:
         self._prune_notifications()
         if self.config.monitor.schedule.restrict_to_trading_session and not is_a_share_trading_time():
             self._maybe_send_pre_market_briefing()
             self._maybe_send_close_review()
-            print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] skip: outside A-share trading session")
+            print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] skip: outside A-share trading session", flush=True)
             return
 
         today = datetime.now(MARKET_TZ).date()
         if self._price_high_marks_date != today:
             self.price_high_marks.clear()
             self._price_high_marks_date = today
+        if self._daily_closes_date != today:
+            self._daily_closes.clear()
+            self._daily_closes_date = today
 
+        self._sync_portfolio_snapshot_if_needed()
         portfolio_snapshot = self._load_portfolio_snapshot()
         cash_ratio = _compute_cash_ratio(portfolio_snapshot)
         benchmark_history = self._load_benchmark_history()
         trading_habit_profile = build_trading_habit_profile(self.db)
         advance_ratio, rank_map, sector_boards = self._load_market_context()
         volatile_period = is_high_volatility_period()
+        pending_notifications: list[tuple[str, str, str]] = []
         for stock in self.config.monitor.stocks:
             bucket = self._load_stock_history(stock)
             if not bucket:
@@ -71,6 +79,7 @@ class MonitorRuntime:
             prev_peak = self.price_high_marks.get(stock.code, quote.current_price)
             if quote.current_price > prev_peak:
                 self.price_high_marks[stock.code] = quote.current_price
+            daily_closes = self._load_daily_closes(stock)
             result = analyze_quotes(
                 bucket,
                 self.config.monitor,
@@ -83,24 +92,25 @@ class MonitorRuntime:
                 portfolio_cash_ratio=cash_ratio,
                 sector_boards=sector_boards,
                 portfolio_position_ratio=_compute_position_ratio(portfolio_snapshot, holding, quote.current_price),
+                daily_closes=daily_closes,
+                portfolio_total_assets=portfolio_snapshot.total_assets if portfolio_snapshot else None,
             )
             persist_observation(self.db, quote, result)
             print("=" * 80)
             print(result.title)
             print(result.message)
 
-            stop_loss_msg = self._check_stop_loss(quote, holding)
-            if stop_loss_msg:
-                self._notify(stock.symbol + ':stop_loss', f"止损预警 {quote.code} {quote.name}", stop_loss_msg)
-            else:
-                approaching_msg = self._check_stop_loss_approaching(quote, holding)
-                if approaching_msg:
-                    self._notify(stock.symbol + ':stop_approaching', f"止损临近 {quote.code} {quote.name}", approaching_msg)
             trigger_message = self._build_trigger_message(quote)
             if trigger_message:
-                self._notify(stock.symbol + ':trigger', f"{quote.code} {quote.name} 触发交易区间", trigger_message)
-            elif self._should_notify(stock.symbol, result, volatile_period):
-                self._notify(stock.symbol, result.title, format_mobile_signal(result.title, result.message, include_title=False))
+                pending_notifications.append((stock.symbol + ':trigger', f"{quote.code} {quote.name} 触发交易区间", trigger_message))
+                continue
+
+            dedup_body = f"{result.decision.action}:{int(result.decision.score) // 10}"
+            if self._is_trade_signal(result, holding) and self._dedup_ok(stock.symbol, dedup_body, cooldown_minutes=self.config.monitor.notification.dedup.cooldown_minutes):
+                action_label = {"buy": "买入", "reduce": "减仓", "avoid": "清仓"}.get(result.decision.action, result.decision.action)
+                pending_notifications.append((stock.symbol, f"{quote.code} {quote.name} {action_label}", format_mobile_signal(result.title, result.message, include_title=False)))
+
+        self._notify_batch(pending_notifications)
 
     def serve_forever(self) -> None:
         if self.config.monitor.schedule.run_on_startup:
@@ -151,33 +161,102 @@ class MonitorRuntime:
         self._market_context_cached_at = datetime.now()
         return advance_ratio, rank_map, sector_boards
 
-    def _should_notify(self, symbol: str, result, volatile_period: bool = False) -> bool:
+    def _dedup_ok(self, key: str, message: str, cooldown_minutes: int = 10) -> bool:
+        prev = self.last_notifications.get(key)
+        if prev is None:
+            return True
+        prev_msg, prev_time = prev
+        return prev_msg != message or datetime.now() - prev_time >= timedelta(minutes=cooldown_minutes)
+
+    def _is_trade_signal(self, result, holding) -> bool:
         if not self.config.monitor.notification.feishu.enabled:
             return False
         if self.config.monitor.notification.feishu.delivery_mode == "webhook" and not self.config.monitor.notification.feishu.webhook_url:
             return False
-        if not (result.should_notify or self.config.monitor.notification.notify_on_neutral):
-            return False
-        if volatile_period and result.signal_level != "ALERT":
-            return False
-        if not self.config.monitor.notification.dedup.enabled:
+        action = result.decision.action
+        if action == "buy":
             return True
+        has_position = holding is not None and holding.quantity > 0
+        return action in ("reduce", "avoid") and has_position
 
-        key = symbol
-        summary = "\n".join(result.observations)
-        prev = self.last_notifications.get(key)
-        if prev is None:
-            return True
+    def _notify_batch(self, notifications: list[tuple[str, str, str]]) -> None:
+        if not notifications:
+            return
 
-        previous_summary, previous_time = prev
-        cooldown = timedelta(minutes=self.config.monitor.notification.dedup.cooldown_minutes)
-        if previous_summary == summary and datetime.now() - previous_time < cooldown:
-            return False
-        return True
+        batchable: list[tuple[str, str, str]] = []
+        for symbol, title, message in notifications:
+            if symbol.endswith(":trigger") or "【盘中交易指令】" in message or "触发交易区间" in title:
+                self._notify(symbol, title, message)
+            else:
+                batchable.append((symbol, title, message))
+
+        if not batchable:
+            return
+        if len(batchable) == 1:
+            symbol, title, message = batchable[0]
+            self._notify(symbol, title, message)
+            return
+
+        lines = [f"【盘中动作卡】{datetime.now(MARKET_TZ):%H:%M}"]
+        dedup_parts: list[str] = []
+        for symbol, title, message in batchable:
+            body_lines = [line.strip() for line in message.splitlines() if line.strip()]
+            action_line = next((line for line in body_lines if line.startswith("动作：") or line.startswith("操作指令：") or line.startswith("直接建议：")), body_lines[0] if body_lines else "")
+            size_line = next((line for line in body_lines if line.startswith("执行数量：")), "")
+            risk_line = next((line for line in body_lines if line.startswith("风险：")), "")
+            stock_name = title.replace(" 行情观察", "")
+            action_text = self._strip_label(action_line)
+            size_text = self._strip_label(size_line)
+            reasons = self._short_risk_reasons(risk_line)
+            card_label = self._action_card_label(title, action_text)
+            lines.append("")
+            lines.append(f"{stock_name}")
+            lines.append(f"- 类型：{card_label}")
+            if action_text:
+                lines.append(f"- 动作：{action_text}")
+            if size_text:
+                lines.append(f"- 执行：{size_text}")
+            if reasons:
+                lines.append(f"- 原因：{reasons}")
+            dedup_parts.append(f"{symbol}:{action_text}:{size_text}:{reasons}")
+
+        self._notify("batch", "盘中动作卡", "\n".join(lines))
+        self.last_notifications["batch"] = ("\n".join(dedup_parts), datetime.now())
+
+    @staticmethod
+    def _strip_label(line: str) -> str:
+        if not line:
+            return ""
+        return line.split("：", 1)[1].strip() if "：" in line else line.strip()
+
+    @staticmethod
+    def _short_risk_reasons(risk_line: str) -> str:
+        text = MonitorRuntime._strip_label(risk_line)
+        if not text or "暂无显著风险标记" in text:
+            return ""
+        parts = [part.strip() for part in text.split("；") if part.strip()]
+        return "；".join(parts[:2])
+
+    @staticmethod
+    def _action_card_label(title: str, action_text: str) -> str:
+        action_text = action_text or title
+        if "卖出" in action_text or "减仓" in title:
+            return "减仓观察"
+        if "买入" in action_text or "买入" in title:
+            return "右侧接回"
+        if "持有" in action_text or "持有" in title:
+            return "继续持有"
+        return "收盘后看"
 
     def _notify(self, symbol: str, title: str, message: str) -> None:
         try:
-            deliver_feishu_message(self.config.monitor.notification.feishu, title, message)
+            deliver_feishu_message(
+                self.config.monitor.notification.feishu,
+                title,
+                message,
+                app_id=self.config.feishu_bot.app_id,
+                app_secret=self.config.feishu_bot.app_secret,
+            )
             self.last_notifications[symbol] = (message, datetime.now())
         except Exception as exc:  # noqa: BLE001
             logger.exception("Notification delivery failed symbol=%s title=%s error=%s", symbol, title, exc)
@@ -213,6 +292,18 @@ class MonitorRuntime:
         except Exception as exc:  # noqa: BLE001
             logger.warning("Benchmark fetch failed symbol=%s error=%s", benchmark.symbol, exc)
             return None
+
+    def _load_daily_closes(self, stock) -> list[Decimal] | None:
+        if self.config.monitor.provider != "eastmoney_minute":
+            return None
+        if stock.symbol not in self._daily_closes:
+            try:
+                closes = self.provider.fetch_daily_closes(stock, ndays=60)
+                self._daily_closes[stock.symbol] = closes
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("Daily closes fetch failed symbol=%s error=%s", stock.symbol, exc)
+                return None
+        return self._daily_closes.get(stock.symbol)
 
     def _prune_notifications(self) -> None:
         cooldown = max(self.config.monitor.notification.dedup.cooldown_minutes, 1)
@@ -293,7 +384,13 @@ class MonitorRuntime:
         logger.info("Generated close review report path=%s", artifact.saved_path)
         if self.config.monitor.notification.feishu.enabled:
             try:
-                deliver_feishu_message(self.config.monitor.notification.feishu, artifact.title, artifact.body)
+                deliver_feishu_message(
+                    self.config.monitor.notification.feishu,
+                    artifact.title,
+                    artifact.body,
+                    app_id=self.config.feishu_bot.app_id,
+                    app_secret=self.config.feishu_bot.app_secret,
+                )
                 mark_close_review_sent(self.config, trade_date)
             except Exception as exc:  # noqa: BLE001
                 logger.exception("Close review delivery failed error=%s", exc)
@@ -341,9 +438,19 @@ class MonitorRuntime:
                     self.config.monitor.notification.feishu,
                     f"盘前简报 {today}",
                     "\n".join(lines),
+                    app_id=self.config.feishu_bot.app_id,
+                    app_secret=self.config.feishu_bot.app_secret,
                 )
             except Exception as exc:  # noqa: BLE001
                 logger.exception("Pre-market briefing delivery failed error=%s", exc)
+
+    def _sync_portfolio_snapshot_if_needed(self) -> None:
+        try:
+            synced = sync_snapshot_from_doc()
+            if synced:
+                logger.info("Portfolio snapshot synced from doc")
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Portfolio snapshot sync failed error=%s", exc)
 
     def _load_portfolio_snapshot(self):
         snapshot_path = Path(self.config.storage.sqlite_path).resolve().parent.parent / "portfolio-snapshot.json"

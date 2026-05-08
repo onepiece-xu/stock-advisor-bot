@@ -8,7 +8,9 @@ from pathlib import Path
 import requests
 
 from .config import FeishuConfig
+from .codex_bridge import queue_codex_notification
 from .direct_notify import write_direct_dm
+from .feishu_bot_server import FeishuBotClient
 from .logging_utils import get_logger
 
 
@@ -42,13 +44,34 @@ def send_feishu_webhook(webhook_url: str, title: str, message: str) -> None:
     raise RuntimeError(f"Feishu webhook delivery failed after retries: {last_error}")
 
 
-def deliver_feishu_message(feishu: FeishuConfig, title: str, message: str) -> None:
-    if feishu.delivery_mode == "direct_dm":
-        write_direct_dm(title, message)
-        return
-    if not feishu.webhook_url:
-        raise RuntimeError("Feishu webhook_url is required when delivery_mode=webhook")
-    send_feishu_webhook(feishu.webhook_url, title, message)
+def send_feishu_app_dm(app_id: str, app_secret: str, receive_open_id: str, title: str, message: str) -> None:
+    client = FeishuBotClient(app_id, app_secret)
+    text = f"{title}\n\n{message}"
+    for chunk in _chunk_text(text):
+        client._request(
+            "POST",
+            "https://open.feishu.cn/open-apis/im/v1/messages",
+            params={"receive_id_type": "open_id"},
+            json_body={
+                "receive_id": receive_open_id,
+                "msg_type": "text",
+                "content": json.dumps({"text": chunk}, ensure_ascii=False),
+            },
+        )
+
+def _chunk_text(text: str, limit: int = 1800) -> list[str]:
+    chunks: list[str] = []
+    remaining = text.strip()
+    while remaining:
+        if len(remaining) <= limit:
+            chunks.append(remaining)
+            break
+        split_at = remaining.rfind("\n", 0, limit)
+        if split_at <= 0:
+            split_at = limit
+        chunks.append(remaining[:split_at].rstrip())
+        remaining = remaining[split_at:].lstrip()
+    return chunks or [""]
 
 
 def _queue_failed_notification(delivery_mode: str, title: str, message: str, error: str, *, target: str | None = None) -> None:
@@ -64,6 +87,25 @@ def _queue_failed_notification(delivery_mode: str, title: str, message: str, err
     }
     with FAILED_OUTBOX_PATH.open("a", encoding="utf-8") as handle:
         handle.write(json.dumps(payload, ensure_ascii=False) + "\n")
+
+
+def deliver_feishu_message(feishu: FeishuConfig, title: str, message: str, *, app_id: str = "", app_secret: str = "") -> None:
+    if feishu.delivery_mode == "codex_bridge":
+        queue_codex_notification(title, message)
+        return
+    if feishu.delivery_mode == "direct_dm":
+        write_direct_dm(title, message)
+        return
+    if feishu.delivery_mode == "app_dm":
+        if not app_id or not app_secret:
+            raise RuntimeError("Feishu app_id/app_secret are required when delivery_mode=app_dm")
+        if not feishu.receive_open_id:
+            raise RuntimeError("Feishu receive_open_id is required when delivery_mode=app_dm")
+        send_feishu_app_dm(app_id, app_secret, feishu.receive_open_id, title, message)
+        return
+    if not feishu.webhook_url:
+        raise RuntimeError("Feishu webhook_url is required when delivery_mode=webhook")
+    send_feishu_webhook(feishu.webhook_url, title, message)
 
 
 def flush_failed_notifications() -> tuple[int, int]:

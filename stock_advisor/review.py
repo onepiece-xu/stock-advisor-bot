@@ -123,7 +123,7 @@ def _render_review_body(config: AppConfig, trade_date: date, items: list[dict], 
     portfolio_path = config.storage.sqlite_path.resolve().parent.parent / "portfolio-snapshot.json"
     if portfolio_path.exists():
         lines.extend(["", "【持仓复盘】"])
-        lines.extend(_render_portfolio_section(portfolio_path, items))
+        lines.extend(_render_portfolio_section(portfolio_path, items, stop_loss_pct=config.monitor.stop_loss_pct))
 
     if trading_habit_profile is not None:
         lines.extend(["", "【交易习惯学习】"])
@@ -146,7 +146,7 @@ def _render_review_body(config: AppConfig, trade_date: date, items: list[dict], 
     return "\n".join(lines)
 
 
-def _render_portfolio_section(snapshot_path: Path, items: list[dict]) -> list[str]:
+def _render_portfolio_section(snapshot_path: Path, items: list[dict], stop_loss_pct: float = 7.0) -> list[str]:
     snapshot = load_portfolio_snapshot(snapshot_path)
     item_map = {item["code"]: item for item in items}
     total_assets = snapshot.total_assets if snapshot.total_assets > 0 else Decimal("0")
@@ -154,6 +154,7 @@ def _render_portfolio_section(snapshot_path: Path, items: list[dict]) -> list[st
         f"总资产: {_fmt_decimal(snapshot.total_assets)}",
         f"现金: {_fmt_decimal(snapshot.cash)}",
     ]
+    stop_ratio = Decimal(str(stop_loss_pct)) / Decimal("100")
     for holding in snapshot.holdings:
         latest = item_map.get(holding.code)
         latest_price = Decimal(str(latest["current_price"])) if latest else holding.current_price
@@ -163,8 +164,14 @@ def _render_portfolio_section(snapshot_path: Path, items: list[dict]) -> list[st
         if total_assets > 0:
             weight = (market_value / total_assets * Decimal("100")).quantize(Decimal("0.01"))
         action = latest["action"] if latest else "unknown"
+        stop_line = ""
+        if holding.cost_price > 0:
+            stop_price = (holding.cost_price * (1 - stop_ratio)).quantize(Decimal("0.001"))
+            dist = _pnl_pct(stop_price, latest_price)
+            stop_line = f" | 止损参考 {_fmt_decimal(stop_price)}（距 {_signed_decimal(dist)}%）"
+        cost_line = f" | 成本 {_fmt_decimal(holding.cost_price)} | 现价 {_fmt_decimal(latest_price)}" if holding.cost_price > 0 else ""
         lines.append(
-            f"- {holding.name}({holding.code}) | 仓位 {_fmt_decimal(weight)}% | 浮盈亏 {_signed_decimal(pnl)}% | 最新动作 {action}"
+            f"- {holding.name}({holding.code}) | 仓位 {_fmt_decimal(weight)}%{cost_line} | 浮盈亏 {_signed_decimal(pnl)}%{stop_line} | 最新动作 {action}"
         )
     return lines
 

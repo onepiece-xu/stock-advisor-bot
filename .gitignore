@@ -14,3 +14,7 @@ data/reviews/
 data/direct_dm_outbox.jsonl
 data/direct_dm_spool.txt
 data/failed_notifications.jsonl
+data/codex_outbox.jsonl
+data/market_overview_cache.json
+data/portfolio_doc_latest.md
+*.bak

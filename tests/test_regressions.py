@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import json
+import os
 import sqlite3
 import tempfile
 import unittest
@@ -360,6 +362,104 @@ class PortfolioDocSyncRegressionTests(unittest.TestCase):
             self.assertTrue(synced)
             self.assertTrue(snapshot_path.exists())
             self.assertIn('"tradeDate": "2026-04-18"', snapshot_path.read_text(encoding="utf-8"))
+
+    def test_sync_snapshot_from_doc_skips_older_doc_even_when_forced(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            markdown_path = tmp / "portfolio.md"
+            snapshot_path = tmp / "portfolio-snapshot.json"
+            markdown_path.write_text(
+                Path(__file__).resolve().parent.parent.joinpath("data/portfolio_doc_latest.md").read_text(encoding="utf-8"),
+                encoding="utf-8",
+            )
+            snapshot_path.write_text(
+                json.dumps(
+                    {
+                        "tradeDate": "2026-05-08",
+                        "totalAssets": 47168.43,
+                        "cash": 30850.43,
+                        "holdings": [
+                            {"name": "中国卫通", "code": "601698", "quantity": 200, "costPrice": 36.703, "currentPrice": 38.0}
+                        ],
+                    },
+                    ensure_ascii=False,
+                    indent=2,
+                ),
+                encoding="utf-8",
+            )
+
+            synced = sync_snapshot_from_doc(markdown_path, snapshot_path, force=True)
+
+            self.assertFalse(synced)
+            self.assertIn('"tradeDate": "2026-05-08"', snapshot_path.read_text(encoding="utf-8"))
+
+    def test_sync_snapshot_from_doc_skips_same_day_conflict_by_default(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            markdown_path = tmp / "portfolio.md"
+            snapshot_path = tmp / "portfolio-snapshot.json"
+            markdown_path.write_text(
+                Path(__file__).resolve().parent.parent.joinpath("data/portfolio_doc_latest.md").read_text(encoding="utf-8"),
+                encoding="utf-8",
+            )
+            snapshot_path.write_text(
+                json.dumps(
+                    {
+                        "tradeDate": "2026-04-18",
+                        "totalAssets": 47000.00,
+                        "cash": 12000.00,
+                        "holdings": [
+                            {"name": "中国卫通", "code": "601698", "quantity": 200, "costPrice": 35.755, "currentPrice": 33.98}
+                        ],
+                    },
+                    ensure_ascii=False,
+                    indent=2,
+                ),
+                encoding="utf-8",
+            )
+            now = datetime.now().timestamp()
+            os.utime(snapshot_path, (now, now))
+            os.utime(markdown_path, (now - 60, now - 60))
+
+            synced = sync_snapshot_from_doc(markdown_path, snapshot_path, force=True)
+
+            self.assertFalse(synced)
+            self.assertIn('"quantity": 200', snapshot_path.read_text(encoding="utf-8"))
+
+    def test_sync_snapshot_from_doc_can_overwrite_same_day_conflict_when_explicitly_allowed(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            markdown_path = tmp / "portfolio.md"
+            snapshot_path = tmp / "portfolio-snapshot.json"
+            markdown_path.write_text(
+                Path(__file__).resolve().parent.parent.joinpath("data/portfolio_doc_latest.md").read_text(encoding="utf-8"),
+                encoding="utf-8",
+            )
+            snapshot_path.write_text(
+                json.dumps(
+                    {
+                        "tradeDate": "2026-04-18",
+                        "totalAssets": 47000.00,
+                        "cash": 12000.00,
+                        "holdings": [
+                            {"name": "中国卫通", "code": "601698", "quantity": 200, "costPrice": 35.755, "currentPrice": 33.98}
+                        ],
+                    },
+                    ensure_ascii=False,
+                    indent=2,
+                ),
+                encoding="utf-8",
+            )
+
+            synced = sync_snapshot_from_doc(
+                markdown_path,
+                snapshot_path,
+                force=True,
+                allow_equal_date_overwrite=True,
+            )
+
+            self.assertTrue(synced)
+            self.assertIn('"quantity": 300', snapshot_path.read_text(encoding="utf-8"))
 
 
 class StorageRegressionTests(unittest.TestCase):

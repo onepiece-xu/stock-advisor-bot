@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import re
+from datetime import date
 from decimal import Decimal
 from pathlib import Path
 
@@ -63,14 +64,28 @@ def sync_snapshot_from_doc(
     snapshot_path: Path = SNAPSHOT_PATH,
     *,
     force: bool = False,
+    allow_equal_date_overwrite: bool = False,
+    allow_rollback: bool = False,
 ) -> bool:
     if not markdown_path.exists():
-        return False
-    if not force and snapshot_path.exists() and snapshot_path.stat().st_mtime >= markdown_path.stat().st_mtime:
         return False
 
     text = markdown_path.read_text(encoding="utf-8")
     snapshot = parse_latest_snapshot(text)
+
+    if snapshot_path.exists():
+        current = _load_snapshot_json(snapshot_path)
+        if _should_skip_sync(
+            current_snapshot=current,
+            incoming_snapshot=snapshot,
+            snapshot_path=snapshot_path,
+            markdown_path=markdown_path,
+            force=force,
+            allow_equal_date_overwrite=allow_equal_date_overwrite,
+            allow_rollback=allow_rollback,
+        ):
+            return False
+
     snapshot_path.write_text(json.dumps(snapshot, ensure_ascii=False, indent=2), encoding="utf-8")
     return True
 
@@ -80,3 +95,39 @@ def _extract_decimal(text: str, pattern: str) -> Decimal:
     if not match:
         raise RuntimeError(f"pattern not found: {pattern}")
     return Decimal(match.group(1))
+
+
+def _load_snapshot_json(path: Path) -> dict:
+    return json.loads(path.read_text(encoding="utf-8"))
+
+
+def _trade_date(snapshot: dict) -> date:
+    return date.fromisoformat(str(snapshot["tradeDate"]))
+
+
+def _should_skip_sync(
+    *,
+    current_snapshot: dict,
+    incoming_snapshot: dict,
+    snapshot_path: Path,
+    markdown_path: Path,
+    force: bool,
+    allow_equal_date_overwrite: bool,
+    allow_rollback: bool,
+) -> bool:
+    current_date = _trade_date(current_snapshot)
+    incoming_date = _trade_date(incoming_snapshot)
+
+    if incoming_date < current_date and not allow_rollback:
+        return True
+
+    if incoming_date == current_date:
+        if current_snapshot == incoming_snapshot:
+            return False
+        if not allow_equal_date_overwrite:
+            return True
+
+    if not force and snapshot_path.stat().st_mtime >= markdown_path.stat().st_mtime:
+        return True
+
+    return False

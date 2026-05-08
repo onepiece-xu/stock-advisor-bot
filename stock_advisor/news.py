@@ -131,7 +131,8 @@ def _fmt_ctime(ctime: str) -> str:
         ts = int(ctime)
         dt = datetime.fromtimestamp(ts, tz=timezone.utc).astimezone()
         return dt.strftime("%m-%d %H:%M")
-    except Exception:
+    except Exception as exc:
+        logger.warning("Failed to format ctime error=%s", exc)
         return str(ctime)
 
 
@@ -140,5 +141,6 @@ def _fmt_notice_date(text: str) -> str:
         return "时间未知"
     try:
         return datetime.fromisoformat(text[:16]).strftime("%m-%d %H:%M")
-    except Exception:
+    except Exception as exc:
+        logger.warning("Failed to format notice date error=%s", exc)
         return text[:10]

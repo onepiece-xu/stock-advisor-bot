@@ -9,17 +9,9 @@ from .briefing import format_mobile_signal
 from .config import AppConfig
 from .habit_learning import build_trading_habit_profile
 from .models import ObservationResult, StockQuote, StockRef
-from .portfolio import find_holding, load_snapshot as load_portfolio_snapshot
+from .portfolio import compute_cash_ratio, find_holding, load_snapshot as load_portfolio_snapshot
 from .providers import EastmoneyMinuteHistoryProvider
 from .storage import cache_quotes, connect_db, load_recent_quotes_before
-
-from decimal import Decimal as _Decimal
-
-
-def _compute_cash_ratio(snapshot) -> _Decimal | None:
-    if snapshot is None or snapshot.total_assets <= 0:
-        return None
-    return (snapshot.cash / snapshot.total_assets).quantize(_Decimal("0.0001"))
 
 
 @dataclass(slots=True)
@@ -53,7 +45,7 @@ def analyze_historical_point(
     conn = connect_db(config.storage.sqlite_path)
     provider = EastmoneyMinuteHistoryProvider(config.monitor)
     portfolio_snapshot = _load_portfolio_snapshot(config)
-    cash_ratio = _compute_cash_ratio(portfolio_snapshot)
+    cash_ratio = compute_cash_ratio(portfolio_snapshot)
     benchmark_history = _load_benchmark_history(config, provider, requested_at)
     trading_habit_profile = build_trading_habit_profile(conn)
     items: list[HistoricalAdviceItem] = []
@@ -223,10 +215,9 @@ def _trend_summary(item: HistoricalComparisonItem) -> str:
 
 
 def _load_portfolio_snapshot(config: AppConfig):
-    snapshot_path = config.storage.sqlite_path.resolve().parent.parent / "portfolio-snapshot.json"
-    if not snapshot_path.exists():
+    if not config.snapshot_path.exists():
         return None
-    return load_portfolio_snapshot(snapshot_path)
+    return load_portfolio_snapshot(config.snapshot_path)
 
 
 def _load_benchmark_history(

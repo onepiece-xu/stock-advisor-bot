@@ -26,8 +26,9 @@ from .historical import (
     render_historical_compare,
 )
 from .models import StockRef, TradeFillRecord
-from .notify import deliver_feishu_message, flush_failed_notifications
-from .portfolio import build_daily_report, find_holding, load_previous_snapshot, load_snapshot, save_snapshot
+from .notify import deliver_feishu_message, flush_failed_notifications, notify_feishu_if_enabled
+from .portfolio import build_daily_report, compute_cash_ratio, compute_position_ratio, find_holding, generate_portfolio_report, load_previous_snapshot, load_snapshot, save_snapshot
+from .logging_utils import get_logger
 from .market_hours import is_high_volatility_period
 from .providers import EastmoneyMarketSnapshotProvider, EastmoneyMinuteHistoryProvider, TencentQuoteProvider
 from .analysis import analyze_quotes
@@ -50,6 +51,9 @@ from .trading_plan import (
     load_snapshot as load_trade_snapshot,
     save_snapshot as save_trade_snapshot,
 )
+
+
+logger = get_logger(__name__)
 
 
 def main() -> None:
@@ -205,7 +209,7 @@ def run_monitor_once(config_path: str, force_notify: bool, mobile: bool) -> None
     config = require_valid_config(config_path)
     conn = connect_db(config.storage.sqlite_path)
     portfolio_snapshot = _load_portfolio_snapshot(config)
-    cash_ratio = _compute_cash_ratio(portfolio_snapshot)
+    cash_ratio = compute_cash_ratio(portfolio_snapshot)
     benchmark_history = _load_benchmark_history(config)
     trading_habit_profile = build_trading_habit_profile(conn)
     provider = _build_provider(config)
@@ -229,7 +233,7 @@ def run_monitor_once(config_path: str, force_notify: bool, mobile: bool) -> None
             is_volatile_period=volatile_period,
             portfolio_cash_ratio=cash_ratio,
             sector_boards=sector_boards,
-            portfolio_position_ratio=_compute_position_ratio(portfolio_snapshot, holding, history[-1].current_price),
+            portfolio_position_ratio=compute_position_ratio(portfolio_snapshot, holding, history[-1].current_price),
         )
         print("=" * 80)
         rendered = format_mobile_signal(result.title, result.message) if mobile else result.message
@@ -257,10 +261,7 @@ def run_monitor_daemon(config_path: str) -> None:
 
 def run_portfolio_report(config_path: str, snapshot_path: str, notify: bool) -> None:
     config = require_valid_config(config_path)
-    snapshot = load_snapshot(snapshot_path)
-    previous = load_previous_snapshot(config.portfolio.data_dir, snapshot.trade_date)
-    saved_path = save_snapshot(snapshot, config.portfolio.data_dir)
-    report = build_daily_report(snapshot, previous)
+    snapshot, saved_path, report = generate_portfolio_report(snapshot_path, config.portfolio.data_dir)
     print(report)
     print(f"\n[saved] {saved_path}")
 
@@ -518,8 +519,8 @@ def run_import_snapshot(snapshot_path: str, text: str | None, trade_date_str: st
                 existing_total = old.total_assets
             if existing_cash is None:
                 existing_cash = old.cash
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.warning("Stale snapshot read failed error=%s", exc)
 
     total_assets = existing_total or Decimal("0")
     cash = existing_cash or Decimal("0")
@@ -590,19 +591,6 @@ def _apply_thresholds_to_config(config_path: str, buy_score: int, hold_score: in
     Path(config_path).write_text(text, encoding="utf-8")
 
 
-def _compute_cash_ratio(snapshot) -> Decimal | None:
-    if snapshot is None or snapshot.total_assets <= 0:
-        return None
-    return (snapshot.cash / snapshot.total_assets).quantize(Decimal("0.0001"))
-
-
-def _compute_position_ratio(snapshot, holding, current_price: Decimal) -> Decimal | None:
-    if snapshot is None or snapshot.total_assets <= 0 or holding is None or holding.quantity <= 0:
-        return None
-    position_value = Decimal(str(holding.quantity)) * current_price
-    return (position_value / snapshot.total_assets).quantize(Decimal("0.0001"))
-
-
 def _load_market_context(config) -> tuple[Decimal, dict[str, int], list[dict]]:
     advance_ratio = Decimal("0")
     rank_map: dict[str, int] = {}
@@ -616,16 +604,15 @@ def _load_market_context(config) -> tuple[Decimal, dict[str, int], list[dict]]:
         top_stocks = snapshot_provider.fetch_top_stocks(limit=50)
         rank_map = {item["code"]: idx + 1 for idx, item in enumerate(top_stocks)}
         sector_boards = snapshot_provider.fetch_sector_boards(kind="industry", limit=5) + snapshot_provider.fetch_sector_boards(kind="concept", limit=5)
-    except Exception:
-        pass
+    except Exception as exc:
+        logger.warning("Market context load failed error=%s", exc)
     return advance_ratio, rank_map, sector_boards
 
 
 def _load_portfolio_snapshot(config):
-    snapshot_path = config.storage.sqlite_path.resolve().parent.parent / "portfolio-snapshot.json"
-    if not snapshot_path.exists():
+    if not config.snapshot_path.exists():
         return None
-    return load_snapshot(snapshot_path)
+    return load_snapshot(config.snapshot_path)
 
 
 def _load_benchmark_history(config):
@@ -637,7 +624,8 @@ def _load_benchmark_history(config):
         return provider.fetch_recent_window(benchmark, config.monitor.history_size)
     try:
         return [provider.fetch_quote(benchmark)]
-    except Exception:
+    except Exception as exc:
+        logger.warning("Benchmark fetch failed error=%s", exc)
         return None
 
 

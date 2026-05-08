@@ -12,6 +12,9 @@ from .habit_learning import build_trading_habit_profile
 from .market_hours import MARKET_TZ
 from .portfolio import load_snapshot as load_portfolio_snapshot
 from .storage import connect_db, fetch_daily_review_snapshot, fetch_latest_trade_date
+from .logging_utils import get_logger
+
+logger = get_logger(__name__)
 
 
 @dataclass(slots=True)
@@ -120,7 +123,7 @@ def _render_review_body(config: AppConfig, trade_date: date, items: list[dict], 
         if item["risk_flags"]:
             lines.append(f"  风险 {'；'.join(item['risk_flags'][:2])}")
 
-    portfolio_path = config.storage.sqlite_path.resolve().parent.parent / "portfolio-snapshot.json"
+    portfolio_path = config.snapshot_path
     if portfolio_path.exists():
         lines.extend(["", "【持仓复盘】"])
         lines.extend(_render_portfolio_section(portfolio_path, items, stop_loss_pct=config.monitor.stop_loss_pct))
@@ -193,7 +196,8 @@ def _load_review_state(data_dir: Path) -> dict:
         return {}
     try:
         return json.loads(path.read_text(encoding="utf-8"))
-    except Exception:
+    except Exception as exc:
+        logger.warning("Failed to load review state error=%s", exc)
         return {}
 
 

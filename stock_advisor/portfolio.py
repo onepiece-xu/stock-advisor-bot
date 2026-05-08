@@ -58,6 +58,14 @@ def save_snapshot(snapshot: PortfolioSnapshot, data_dir: Path) -> Path:
     return path
 
 
+def generate_portfolio_report(snapshot_path: str | Path, data_dir: Path) -> tuple[PortfolioSnapshot, Path, str]:
+    snapshot = load_snapshot(snapshot_path)
+    previous = load_previous_snapshot(data_dir, snapshot.trade_date)
+    saved_path = save_snapshot(snapshot, data_dir)
+    report = build_daily_report(snapshot, previous)
+    return snapshot, saved_path, report
+
+
 def load_previous_snapshot(data_dir: Path, before_date: date) -> PortfolioSnapshot | None:
     if not data_dir.exists():
         return None
@@ -82,6 +90,19 @@ def find_holding(snapshot: PortfolioSnapshot | None, code: str) -> PortfolioHold
         if holding.code == code:
             return holding
     return None
+
+
+def compute_cash_ratio(snapshot) -> Decimal | None:
+    if snapshot is None or snapshot.total_assets <= 0:
+        return None
+    return (snapshot.cash / snapshot.total_assets).quantize(Decimal("0.0001"))
+
+
+def compute_position_ratio(snapshot, holding, current_price: Decimal) -> Decimal | None:
+    if snapshot is None or snapshot.total_assets <= 0 or holding is None or holding.quantity <= 0:
+        return None
+    position_value = Decimal(str(holding.quantity)) * current_price
+    return (position_value / snapshot.total_assets).quantize(Decimal("0.0001"))
 
 
 def build_daily_report(current: PortfolioSnapshot, previous: PortfolioSnapshot | None) -> str:

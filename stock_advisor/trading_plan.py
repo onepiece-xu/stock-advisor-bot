@@ -181,12 +181,16 @@ def render_trade_instruction(hit: TriggerHit, snapshot: PortfolioSnapshot) -> st
     else:
         action_text = f"执行 {action_text} {qty} 股"
 
+    holding = next((h for h in snapshot.holdings if h.code == trigger.code), None)
+    current_holding_line = f"当前持仓：{holding.quantity} 股" if holding else "当前持仓：未知"
+
     return "\n".join(
         [
             f"【盘中交易指令】{trigger.name} {trigger.code}",
             f"当前价：{_fmt(hit.current_price)}",
             f"执行动作：{action_text}",
             f"建议数量：{qty} 股",
+            current_holding_line,
             f"持仓占比：{_fmt_pct(hit.weight_pct)}",
             f"执行后预计现金：{_fmt_money(hit.cash_after_trade)}",
             f"触发区间：{_fmt(trigger.price_min)} - {_fmt(trigger.price_max)}",

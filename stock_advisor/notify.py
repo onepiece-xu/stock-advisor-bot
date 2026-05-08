@@ -108,6 +108,18 @@ def deliver_feishu_message(feishu: FeishuConfig, title: str, message: str, *, ap
     send_feishu_webhook(feishu.webhook_url, title, message)
 
 
+def notify_feishu_if_enabled(config, title: str, message: str) -> None:
+    if not config.monitor.notification.feishu.enabled:
+        return
+    deliver_feishu_message(
+        config.monitor.notification.feishu,
+        title,
+        message,
+        app_id=config.feishu_bot.app_id,
+        app_secret=config.feishu_bot.app_secret,
+    )
+
+
 def flush_failed_notifications() -> tuple[int, int]:
     if not FAILED_OUTBOX_PATH.exists():
         return (0, 0)

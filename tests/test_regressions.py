@@ -25,6 +25,85 @@ from stock_advisor.storage import connect_db, init_db, insert_trade_fill, load_t
 
 
 class MonitorRuntimeTests(unittest.TestCase):
+    def test_run_once_syncs_snapshot_and_pushes_portfolio_advice_outside_trading_hours(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            snapshot_path = root / "portfolio-snapshot.json"
+            snapshot_path.write_text(
+                json.dumps(
+                    {
+                        "tradeDate": "2026-05-08",
+                        "totalAssets": 47168.43,
+                        "cash": 30850.43,
+                        "holdings": [
+                            {
+                                "name": "中国卫通",
+                                "code": "601698",
+                                "quantity": 200,
+                                "costPrice": 36.703,
+                                "currentPrice": 38.0,
+                            }
+                        ],
+                    },
+                    ensure_ascii=False,
+                    indent=2,
+                ),
+                encoding="utf-8",
+            )
+            data_dir = root / "portfolio-data"
+            data_dir.mkdir()
+            (data_dir / "2026-05-07.json").write_text(
+                json.dumps(
+                    {
+                        "tradeDate": "2026-05-07",
+                        "totalAssets": 47000.00,
+                        "cash": 30000.00,
+                        "holdings": [
+                            {
+                                "name": "中国卫通",
+                                "code": "601698",
+                                "quantity": 100,
+                                "costPrice": 35.456,
+                                "currentPrice": 37.24,
+                            }
+                        ],
+                    },
+                    ensure_ascii=False,
+                    indent=2,
+                ),
+                encoding="utf-8",
+            )
+
+            runtime = object.__new__(MonitorRuntime)
+            runtime.config = SimpleNamespace(
+                storage=SimpleNamespace(sqlite_path=root / "var" / "app.db"),
+                snapshot_path=snapshot_path,
+                portfolio=SimpleNamespace(data_dir=data_dir),
+                monitor=SimpleNamespace(
+                    schedule=SimpleNamespace(restrict_to_trading_session=True),
+                    notification=SimpleNamespace(feishu=SimpleNamespace(enabled=True)),
+                ),
+                feishu_bot=SimpleNamespace(app_id="", app_secret=""),
+                trading_plan=SimpleNamespace(),
+            )
+            runtime._prune_notifications = Mock()
+            runtime._maybe_send_pre_market_briefing = Mock()
+            runtime._maybe_send_close_review = Mock()
+
+            with patch("stock_advisor.runtime.sync_snapshot_from_doc", return_value=True), \
+                 patch("stock_advisor.runtime.is_a_share_trading_time", return_value=False), \
+                 patch("stock_advisor.runtime.deliver_feishu_message") as deliver_mock:
+                runtime.run_once()
+
+            runtime._prune_notifications.assert_called_once()
+            runtime._maybe_send_pre_market_briefing.assert_called_once()
+            runtime._maybe_send_close_review.assert_called_once()
+            deliver_mock.assert_called_once()
+            self.assertEqual(deliver_mock.call_args.args[1], "持仓更新建议 2026-05-08")
+            self.assertIn("【收盘持仓建议】", deliver_mock.call_args.args[2])
+            self.assertIn("较昨日总资产变化：+168.43", deliver_mock.call_args.args[2])
+            self.assertTrue((data_dir / "2026-05-08.json").exists())
+
     def test_serve_forever_respects_disabled_schedule(self) -> None:
         runtime = object.__new__(MonitorRuntime)
         runtime.config = SimpleNamespace(
@@ -346,9 +425,9 @@ class PortfolioDocSyncRegressionTests(unittest.TestCase):
         markdown = Path(__file__).resolve().parent.parent.joinpath("data/portfolio_doc_latest.md").read_text(encoding="utf-8")
         snapshot = parse_latest_snapshot(markdown)
 
-        self.assertEqual(snapshot["tradeDate"], "2026-04-18")
+        self.assertEqual(snapshot["tradeDate"], "2026-05-08")
         self.assertEqual(snapshot["holdings"][0]["code"], "601698")
-        self.assertEqual(snapshot["holdings"][0]["quantity"], 300)
+        self.assertEqual(snapshot["holdings"][0]["quantity"], 200)
 
     def test_sync_snapshot_from_doc_updates_target_file(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -361,7 +440,7 @@ class PortfolioDocSyncRegressionTests(unittest.TestCase):
 
             self.assertTrue(synced)
             self.assertTrue(snapshot_path.exists())
-            self.assertIn('"tradeDate": "2026-04-18"', snapshot_path.read_text(encoding="utf-8"))
+            self.assertIn('"tradeDate": "2026-05-08"', snapshot_path.read_text(encoding="utf-8"))
 
     def test_sync_snapshot_from_doc_skips_older_doc_even_when_forced(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -405,7 +484,7 @@ class PortfolioDocSyncRegressionTests(unittest.TestCase):
             snapshot_path.write_text(
                 json.dumps(
                     {
-                        "tradeDate": "2026-04-18",
+                        "tradeDate": "2026-05-08",
                         "totalAssets": 47000.00,
                         "cash": 12000.00,
                         "holdings": [
@@ -438,7 +517,7 @@ class PortfolioDocSyncRegressionTests(unittest.TestCase):
             snapshot_path.write_text(
                 json.dumps(
                     {
-                        "tradeDate": "2026-04-18",
+                        "tradeDate": "2026-05-08",
                         "totalAssets": 47000.00,
                         "cash": 12000.00,
                         "holdings": [
@@ -459,7 +538,7 @@ class PortfolioDocSyncRegressionTests(unittest.TestCase):
             )
 
             self.assertTrue(synced)
-            self.assertIn('"quantity": 300', snapshot_path.read_text(encoding="utf-8"))
+            self.assertIn('"quantity": 200', snapshot_path.read_text(encoding="utf-8"))
 
 
 class StorageRegressionTests(unittest.TestCase):

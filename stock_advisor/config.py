@@ -129,6 +129,11 @@ class AppConfig:
     review: ReviewConfig
     feishu_bot: FeishuBotConfig
 
+    @property
+    def snapshot_path(self) -> Path:
+        """Return the resolved path to the portfolio snapshot JSON file."""
+        return self.storage.sqlite_path.resolve().parent.parent / "portfolio-snapshot.json"
+
 
 class ConfigValidationError(RuntimeError):
     pass

@@ -5,7 +5,6 @@ from collections import defaultdict
 from datetime import date, datetime, timedelta
 from decimal import Decimal
 
-from pathlib import Path
 
 from .analysis import analyze_quotes
 from .briefing import format_mobile_signal
@@ -16,7 +15,7 @@ from .models import StockQuote
 from .logging_utils import get_logger
 from .news import fetch_announcements_for_code
 from .notify import deliver_feishu_message
-from .portfolio import find_holding, load_snapshot as load_portfolio_snapshot
+from .portfolio import compute_cash_ratio, compute_position_ratio, find_holding, generate_portfolio_report, load_snapshot as load_portfolio_snapshot
 from .portfolio_doc_sync import sync_snapshot_from_doc
 from .providers import EastmoneyMarketSnapshotProvider, EastmoneyMinuteHistoryProvider, TencentQuoteProvider
 from .review import already_sent_close_review, build_close_review, mark_close_review_sent, should_send_close_review_now
@@ -46,10 +45,11 @@ class MonitorRuntime:
 
     def run_once(self) -> None:
         self._prune_notifications()
+        self._sync_portfolio_snapshot_if_needed()
         if self.config.monitor.schedule.restrict_to_trading_session and not is_a_share_trading_time():
             self._maybe_send_pre_market_briefing()
             self._maybe_send_close_review()
-            print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] skip: outside A-share trading session", flush=True)
+            logger.info("skip: outside A-share trading session")
             return
 
         today = datetime.now(MARKET_TZ).date()
@@ -60,9 +60,8 @@ class MonitorRuntime:
             self._daily_closes.clear()
             self._daily_closes_date = today
 
-        self._sync_portfolio_snapshot_if_needed()
         portfolio_snapshot = self._load_portfolio_snapshot()
-        cash_ratio = _compute_cash_ratio(portfolio_snapshot)
+        cash_ratio = compute_cash_ratio(portfolio_snapshot)
         benchmark_history = self._load_benchmark_history()
         trading_habit_profile = build_trading_habit_profile(self.db)
         advance_ratio, rank_map, sector_boards = self._load_market_context()
@@ -91,14 +90,14 @@ class MonitorRuntime:
                 is_volatile_period=volatile_period,
                 portfolio_cash_ratio=cash_ratio,
                 sector_boards=sector_boards,
-                portfolio_position_ratio=_compute_position_ratio(portfolio_snapshot, holding, quote.current_price),
+                portfolio_position_ratio=compute_position_ratio(portfolio_snapshot, holding, quote.current_price),
                 daily_closes=daily_closes,
                 portfolio_total_assets=portfolio_snapshot.total_assets if portfolio_snapshot else None,
             )
             persist_observation(self.db, quote, result)
-            print("=" * 80)
-            print(result.title)
-            print(result.message)
+            logger.info("=" * 80)  # type: ignore[arg-type]  # logging format interprets % as placeholder escape
+            logger.info(result.title)  # type: ignore[arg-type]
+            logger.info(result.message)  # type: ignore[arg-type]
 
             trigger_message = self._build_trigger_message(quote)
             if trigger_message:
@@ -365,10 +364,9 @@ class MonitorRuntime:
         )
 
     def _build_trigger_message(self, quote: StockQuote) -> str | None:
-        snapshot_path = Path(self.config.storage.sqlite_path).resolve().parent.parent / "portfolio-snapshot.json"
-        if not snapshot_path.exists():
+        if not self.config.snapshot_path.exists():
             return None
-        snapshot = load_trade_snapshot(snapshot_path)
+        snapshot = load_trade_snapshot(self.config.snapshot_path)
         hit = detect_trigger_hit(quote, snapshot, self.trade_triggers)
         if hit is None:
             return None
@@ -446,32 +444,35 @@ class MonitorRuntime:
 
     def _sync_portfolio_snapshot_if_needed(self) -> None:
         try:
-            synced = sync_snapshot_from_doc()
+            synced = sync_snapshot_from_doc(snapshot_path=self.config.snapshot_path)
             if synced:
                 logger.info("Portfolio snapshot synced from doc")
+                self._notify_portfolio_snapshot_update()
         except Exception as exc:  # noqa: BLE001
             logger.warning("Portfolio snapshot sync failed error=%s", exc)
 
+    def _notify_portfolio_snapshot_update(self) -> None:
+        if not self.config.snapshot_path.exists():
+            logger.warning("Portfolio snapshot update skipped: missing snapshot path=%s", self.config.snapshot_path)
+            return
+        snapshot, saved_path, report = generate_portfolio_report(self.config.snapshot_path, self.config.portfolio.data_dir)
+        logger.info("Portfolio report refreshed from snapshot saved_path=%s trade_date=%s", saved_path, snapshot.trade_date)
+        if not self.config.monitor.notification.feishu.enabled:
+            return
+        deliver_feishu_message(
+            self.config.monitor.notification.feishu,
+            f"持仓更新建议 {snapshot.trade_date.isoformat()}",
+            report,
+            app_id=self.config.feishu_bot.app_id,
+            app_secret=self.config.feishu_bot.app_secret,
+        )
+
     def _load_portfolio_snapshot(self):
-        snapshot_path = Path(self.config.storage.sqlite_path).resolve().parent.parent / "portfolio-snapshot.json"
-        if not snapshot_path.exists():
+        if not self.config.snapshot_path.exists():
             return None
-        return load_portfolio_snapshot(snapshot_path)
+        return load_portfolio_snapshot(self.config.snapshot_path)
 
     def _build_provider(self):
         if self.config.monitor.provider == "eastmoney_minute":
             return EastmoneyMinuteHistoryProvider(self.config.monitor)
         return TencentQuoteProvider(self.config.monitor)
-
-
-def _compute_cash_ratio(snapshot) -> Decimal | None:
-    if snapshot is None or snapshot.total_assets <= 0:
-        return None
-    return (snapshot.cash / snapshot.total_assets).quantize(Decimal("0.0001"))
-
-
-def _compute_position_ratio(snapshot, holding, current_price: Decimal) -> Decimal | None:
-    if snapshot is None or snapshot.total_assets <= 0 or holding is None or holding.quantity <= 0:
-        return None
-    position_value = Decimal(str(holding.quantity)) * current_price
-    return (position_value / snapshot.total_assets).quantize(Decimal("0.0001"))

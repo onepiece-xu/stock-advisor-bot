@@ -32,7 +32,7 @@ from .logging_utils import get_logger
 from .market_hours import is_high_volatility_period
 from .market_overview import build_market_overview, render_market_overview
 from .models import StockQuote, StockRef
-from .portfolio import find_holding, load_snapshot as load_portfolio_snapshot
+from .portfolio import compute_cash_ratio, compute_position_ratio, find_holding, load_snapshot as load_portfolio_snapshot
 from .providers import EastmoneyMarketSnapshotProvider, EastmoneyMinuteHistoryProvider, TencentQuoteProvider
 from .review import build_close_review
 from .storage import cache_quotes, connect_db, fetch_latest_briefing, load_recent_quotes, replay_signal_stats
@@ -288,9 +288,9 @@ def _scan_live_symbol(config: AppConfig, query: str) -> str:
         market_advance_ratio=advance_ratio,
         hot_stock_rank=rank_map.get(stock.code, 0),
         is_volatile_period=is_high_volatility_period(),
-        portfolio_cash_ratio=_compute_cash_ratio(portfolio_snapshot),
+        portfolio_cash_ratio=compute_cash_ratio(portfolio_snapshot),
         sector_boards=sector_boards,
-        portfolio_position_ratio=_compute_position_ratio(portfolio_snapshot, holding, history[-1].current_price),
+        portfolio_position_ratio=compute_position_ratio(portfolio_snapshot, holding, history[-1].current_price),
     )
     return format_mobile_signal(result.title, result.message)
 
@@ -475,19 +475,6 @@ def _parse_backtest_args(args: list[str]) -> tuple[int, list[str]]:
     return days, remaining
 
 
-def _compute_cash_ratio(snapshot) -> Decimal | None:
-    if snapshot is None or snapshot.total_assets <= 0:
-        return None
-    return (snapshot.cash / snapshot.total_assets).quantize(Decimal("0.0001"))
-
-
-def _compute_position_ratio(snapshot, holding, current_price: Decimal) -> Decimal | None:
-    if snapshot is None or snapshot.total_assets <= 0 or holding is None or holding.quantity <= 0:
-        return None
-    position_value = Decimal(str(holding.quantity)) * current_price
-    return (position_value / snapshot.total_assets).quantize(Decimal("0.0001"))
-
-
 def _fetch_market_context(config: AppConfig) -> tuple[Decimal, dict[str, int], list[dict]]:
     advance_ratio = Decimal("0")
     rank_map: dict[str, int] = {}
@@ -501,16 +488,15 @@ def _fetch_market_context(config: AppConfig) -> tuple[Decimal, dict[str, int], l
         top_stocks = provider.fetch_top_stocks(limit=50)
         rank_map = {item["code"]: idx + 1 for idx, item in enumerate(top_stocks)}
         sector_boards = provider.fetch_sector_boards(kind="industry", limit=5) + provider.fetch_sector_boards(kind="concept", limit=5)
-    except Exception:
-        pass
+    except Exception as exc:
+        logger.warning("_fetch_market_context failed error=%s", exc)
     return advance_ratio, rank_map, sector_boards
 
 
 def _load_portfolio_snapshot(config: AppConfig):
-    snapshot_path = config.storage.sqlite_path.resolve().parent.parent / "portfolio-snapshot.json"
-    if not snapshot_path.exists():
+    if not config.snapshot_path.exists():
         return None
-    return load_portfolio_snapshot(snapshot_path)
+    return load_portfolio_snapshot(config.snapshot_path)
 
 
 def _load_benchmark_history(config: AppConfig) -> list[StockQuote] | None:
@@ -522,7 +508,8 @@ def _load_benchmark_history(config: AppConfig) -> list[StockQuote] | None:
         return provider.fetch_recent_window(benchmark, config.monitor.history_size)
     try:
         return [provider.fetch_quote(benchmark)]
-    except Exception:
+    except Exception as exc:
+        logger.warning("Failed to load benchmark history error=%s", exc)
         return None
 
 

@@ -23,28 +23,44 @@ def parse_latest_snapshot(markdown: str) -> dict:
     parts = date_match.group(1).split(".")
     trade_date = f"{parts[0]}-{int(parts[1]):02d}-{int(parts[2]):02d}"
 
-    total_assets = _extract_decimal(markdown, r"- 总资产：([0-9.]+)")
-    cash = _extract_decimal(markdown, r"- 可用/可取：([0-9.]+)")
+    # Extract only the latest section (from first date heading to next # heading)
+    section_start = date_match.start()
+    next_heading = re.search(r"\n#\s", markdown[section_start + len(date_match.group(0)):])
+    if next_heading:
+        section = markdown[section_start:section_start + len(date_match.group(0)) + next_heading.start()]
+    else:
+        section = markdown[section_start:]
+
+    total_assets = _extract_decimal(section, r"- 总资产[：:]\s*([0-9.]+)")
+    cash = _extract_decimal(section, r"- 可用/可取[：:]\s*([0-9.]+)")
 
     holdings: list[dict] = []
-    row_pattern = re.compile(
-        r"<lark-tr>\s*<lark-td>\s*(?P<name>[^<\n]+)\s*</lark-td>\s*<lark-td>\s*(?P<qty>[0-9]+) \{align=\"right\"\}\s*</lark-td>\s*<lark-td>\s*(?P<cost>[0-9.]+) \{align=\"right\"\}\s*</lark-td>\s*<lark-td>\s*(?P<price>[0-9.]+) \{align=\"right\"\}\s*</lark-td>",
-        re.S,
-    )
-    for match in row_pattern.finditer(markdown):
-        name = match.group("name").strip()
+    cell_re = re.compile(r"<lark-td>\s*(?P<cell>.*?)\s*</lark-td>", re.S)
+    row_re = re.compile(r"<lark-tr>(?P<body>.*?)</lark-tr>", re.S)
+
+    for row_match in row_re.finditer(section):
+        cells = [m.group("cell").split(" {align=")[0].strip() for m in cell_re.finditer(row_match.group("body"))]
+        if len(cells) < 7:
+            continue
+        name = cells[0]
         if name == "股票":
             continue
         code = CODE_MAP.get(name)
         if not code:
             continue
+        # Col 4 (0-indexed) is 持仓/可用: "200 / 100" → take first number
+        qty_str = cells[4].split("/")[0].strip()
+        try:
+            quantity = int(qty_str)
+        except ValueError:
+            continue
         holdings.append(
             {
                 "name": name,
                 "code": code,
-                "quantity": int(match.group("qty")),
-                "costPrice": float(match.group("cost")),
-                "currentPrice": float(match.group("price")),
+                "quantity": quantity,
+                "costPrice": float(cells[5]),
+                "currentPrice": float(cells[6]),
             }
         )
 

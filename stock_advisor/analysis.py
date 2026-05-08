@@ -233,6 +233,7 @@ def analyze_quotes(
         history_count=history_count,
         expected_history_count=monitor_config.history_size,
         sparkline=sparkline,
+        portfolio_holding=portfolio_holding,
     )
     should_notify = any(
         (
@@ -267,6 +268,7 @@ def _build_message(
     history_count: int,
     expected_history_count: int,
     sparkline: str = "",
+    portfolio_holding: PortfolioHolding | None = None,
 ) -> str:
     benchmark_line = (
         f"基准：{benchmark_quote.name} {_format_percent(metrics.benchmark_change_pct)} | 相对强弱 {_format_percent(metrics.relative_strength_pct)}"
@@ -305,6 +307,7 @@ def _build_message(
         f"动作：{decision.action}",
         f"操作指令：{decision.trade_advice}",
         f"执行数量：{decision.trade_size_hint}",
+        f"当前持仓：{portfolio_holding.quantity} 股" if portfolio_holding and portfolio_holding.quantity > 0 else "当前持仓：无",
         f"触发条件：{decision.entry_note}",
         f"评分：{decision.score.quantize(Decimal('0.01'), rounding=ROUND_HALF_UP)}/100",
         f"置信度：{decision.confidence}",

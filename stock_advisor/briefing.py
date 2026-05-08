@@ -20,6 +20,7 @@ def format_mobile_signal(title: str, message: str, *, include_title: bool = True
     for line in (
         pick("操作指令：", "直接建议：", "动作："),
         pick("执行数量："),
+        pick("当前持仓："),
         pick("触发条件："),
         pick("风险："),
     ):

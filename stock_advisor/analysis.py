@@ -536,16 +536,16 @@ def _build_decision_signal(
 
     ma_align = _ma_alignment_score(current.current_price, metrics.ma5, metrics.ma15, metrics.ma60, metrics.ma240)
     if ma_align >= 4:
-        score += Decimal("8")
+        score += Decimal("4")
         rationale.append("均线多头排列完整（价格>MA5>MA15>MA60>MA240），趋势结构自我强化")
     elif ma_align == 3:
-        score += Decimal("4")
+        score += Decimal("2")
         rationale.append("均线多头排列基本确立（4层中3层对齐），趋势偏强")
     elif ma_align <= -4:
-        score -= Decimal("8")
+        score -= Decimal("4")
         risk_flags.append("均线空头排列完整（价格<MA5<MA15<MA60<MA240），空头结构无支撑")
     elif ma_align == -3:
-        score -= Decimal("4")
+        score -= Decimal("2")
         risk_flags.append("均线空头排列基本确立（4层中3层对齐），短线承压")
 
     if metrics.step_change_pct >= Decimal("1.00"):
@@ -569,8 +569,15 @@ def _build_decision_signal(
         score += Decimal("10")
         rationale.append("放量上行，量价配合较好")
     elif metrics.volume_ratio <= Decimal("0.80") and current.change_percent > 0:
-        score -= Decimal("8")
-        risk_flags.append("上涨缩量，冲高持续性存疑")
+        # Scale penalty by how much the stock rose: tiny gains with low volume
+        # are normal, not bearish.  Only penalize meaningful gains without volume.
+        if current.change_percent >= Decimal("0.50"):
+            score -= Decimal("8")
+            risk_flags.append("上涨缩量，冲高持续性存疑")
+        elif current.change_percent >= Decimal("0.20"):
+            score -= Decimal("3")
+            risk_flags.append("微涨缩量，方向尚不明确")
+        # else: price barely moved, low volume is neutral — no penalty
     elif metrics.volume_ratio >= Decimal("1.80") and current.change_percent < 0:
         score -= Decimal("10")
         risk_flags.append("下跌放量，抛压仍在释放")
@@ -705,6 +712,15 @@ def _build_decision_signal(
         elif holding_return_pct >= Decimal("3") and metrics.bias_to_ma15 >= Decimal("0") and metrics.bias_to_ma60 >= Decimal("0"):
             score += Decimal("4")
             rationale.append(f"现价已高于持仓成本 {_format_percent(holding_return_pct)}，持仓安全垫开始形成")
+        # Position-age guard: positions with small losses (<5%) are likely recent
+        # purchases.  Minute-level MA noise should not trigger "avoid/sell" signals
+        # for positions that haven't had time to prove themselves.
+        if holding_return_pct >= Decimal("-5") and holding_return_pct <= Decimal("2"):
+            score += Decimal("6")
+            rationale.append(
+                f"浮亏仅 {_format_percent(abs(holding_return_pct))}，属正常波动范围，"
+                f"分钟级噪音不构成清仓理由"
+            )
 
     if portfolio_holding is not None and portfolio_holding.cost_price > 0 and portfolio_holding.quantity > 0:
         from .stop_loss import compute_effective_stop as compute_stop
@@ -714,8 +730,19 @@ def _build_decision_signal(
             stop_loss_pct=monitor_config.stop_loss_pct,
         )
         if dist_to_stop <= 0:
-            score -= Decimal("12")
-            risk_flags.append(f"已触及{_label}价 {_eff_stop}（成本 {_format_price(portfolio_holding.cost_price)}），建议立即执行止损")
+            # How far below the stop-loss price is the current price?
+            # If the stop was triggered long ago (current >15% below stop),
+            # the "execute now" advice is misleading — the window has passed.
+            stop_gap_pct = ((_eff_stop - current.current_price) / _eff_stop * 100) if _eff_stop > 0 else Decimal("0")
+            if stop_gap_pct >= Decimal("15"):
+                score -= Decimal("3")
+                risk_flags.append(
+                    f"⚠️ 止损价 {_eff_stop} 已远高于现价（差 {_format_percent(stop_gap_pct)}），"
+                    f"止损窗口早已过去，反弹减仓优于现价割肉"
+                )
+            else:
+                score -= Decimal("12")
+                risk_flags.append(f"已触及{_label}价 {_eff_stop}（成本 {_format_price(portfolio_holding.cost_price)}），建议立即执行止损")
         elif dist_to_stop <= Decimal("2.50"):
             score -= Decimal("6")
             risk_flags.append(f"距{_label}价 {_eff_stop} 仅剩 {_format_percent(dist_to_stop)}，收紧风控、做好出手准备")

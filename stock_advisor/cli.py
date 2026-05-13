@@ -13,8 +13,11 @@ from .backtest import (
     optimize_decision_thresholds,
     render_minute_backtest,
     render_optimization_report,
+    run_daily_backtest,
     run_minute_backtest,
 )
+from .cash_deploy import generate_deploy_signal, render_deploy_signal
+from .trade_journal import TradeJournal
 from .briefing import format_mobile_digest, format_mobile_replay, format_mobile_signal
 from .codex_bridge import pull_codex_notifications
 from .feishu_bot_server import serve_feishu_bot
@@ -161,6 +164,32 @@ def main() -> None:
     status_parser = subparsers.add_parser("status", help="输出当前系统状态：交易日历、持仓摘要、触发单")
     status_parser.add_argument("--config", required=True, help="配置文件路径")
 
+    # ── 现金部署信号 ──
+    deploy_parser = subparsers.add_parser("cash-deploy", help="检查现金部署条件，输出可入场标的和买入建议")
+    deploy_parser.add_argument("--config", required=True, help="配置文件路径")
+    deploy_parser.add_argument("--mobile", action="store_true", help="输出手机友好摘要")
+    deploy_parser.add_argument("--notify", action="store_true", help="把部署信号发送到飞书")
+
+    # ── 日线回测 ──
+    daily_bt_parser = subparsers.add_parser("backtest-daily", help="单只股票日线级别回测，验证买入次日胜率")
+    daily_bt_parser.add_argument("--config", required=True, help="配置文件路径")
+    daily_bt_parser.add_argument("--stock", required=True, help="股票代码，如 601698")
+    daily_bt_parser.add_argument("--days", type=int, default=60, help="回测天数（默认60）")
+    daily_bt_parser.add_argument("--mobile", action="store_true", help="输出手机友好摘要")
+    daily_bt_parser.add_argument("--notify", action="store_true", help="把回测结果发送到飞书")
+
+    # ── 交易日志 ──
+    journal_stats_parser = subparsers.add_parser("journal-stats", help="查看交易日志统计")
+    journal_stats_parser.add_argument("--config", required=True, help="配置文件路径")
+    journal_stats_parser.add_argument("--notify", action="store_true", help="把统计发送到飞书")
+
+    journal_verify_parser = subparsers.add_parser("journal-verify", help="事后验证一笔交易")
+    journal_verify_parser.add_argument("--config", required=True, help="配置文件路径")
+    journal_verify_parser.add_argument("--entry-id", required=True, help="交易 entry_id")
+    journal_verify_parser.add_argument("--verdict", required=True, choices=["good", "bad", "neutral"], help="评价")
+    journal_verify_parser.add_argument("--lessons", required=True, help="经验教训")
+
+
     import_snap_parser = subparsers.add_parser("import-snapshot", help="从券商App复制文本解析并更新持仓快照")
     import_snap_parser.add_argument("--snapshot", required=True, help="目标持仓快照 JSON 文件路径")
     import_snap_parser.add_argument("--text", help="持仓文本（不传则从 stdin 读取）")
@@ -207,6 +236,14 @@ def main() -> None:
         run_habit_profile(args.config, args.mobile)
     elif args.command == "status":
         run_status(args.config)
+    elif args.command == "cash-deploy":
+        run_cash_deploy(args.config, args.mobile, args.notify)
+    elif args.command == "backtest-daily":
+        run_backtest_daily(args.config, args.stock, args.days, args.mobile, args.notify)
+    elif args.command == "journal-stats":
+        run_journal_stats(args.config, args.notify)
+    elif args.command == "journal-verify":
+        run_journal_verify(args.config, args.entry_id, args.verdict, args.lessons)
     elif args.command == "import-snapshot":
         run_import_snapshot(args.snapshot, args.text, args.date, args.dry_run)
     elif args.command == "prune-data":
@@ -738,6 +775,75 @@ def run_prune_data(config_path: str, retention_days: int) -> None:
         print(f"✅ 已清理 {retention_days} 天前的数据: {', '.join(parts)}")
     finally:
         conn.close()
+
+
+def run_cash_deploy(config_path: str, mobile: bool, notify: bool) -> None:
+    """检查现金部署条件，输出可入场标的和买入建议。"""
+    config = require_valid_config(config_path)
+    signal = generate_deploy_signal(config, mobile=mobile)
+    rendered = render_deploy_signal(signal, mobile=mobile)
+    print(rendered)
+    if notify:
+        notify_feishu_if_enabled(config, f"【现金部署信号】\n{rendered}")
+
+
+def run_backtest_daily(config_path: str, stock_code: str, days: int, mobile: bool, notify: bool) -> None:
+    """日线级别单股回测。"""
+    config = require_valid_config(config_path)
+    # Determine exchange prefix from code
+    code = stock_code
+    exchange = "sh" if code.startswith(("6", "5")) else "sz"
+    stock = StockRef(exchange, code)
+    result = run_daily_backtest(config, stock, days=days)
+    lines = [result.summary]
+    if not mobile:
+        lines.append("")
+        buy_signals = [s for s in result.daily_returns if s["action"] == "buy"]
+        if buy_signals:
+            lines.append(f"买入信号明细（共 {len(buy_signals)} 次）：")
+            for s in buy_signals[-10:]:
+                mark = "✅" if s["next_day_return"] > 0 else "❌"
+                lines.append(
+                    f"  {mark} {s['date']} | 评分 {s['score']:.0f} | 收盘 {s['close']:.2f} | 次日回报 {s['next_day_return']:+.2f}%"
+                )
+        lines.append("")
+        lines.append("仅供参考，不构成投资建议")
+    rendered = "\n".join(lines)
+    print(rendered)
+    if notify:
+        notify_feishu_if_enabled(config, f"【日线回测】{stock_code}\n{rendered}")
+
+
+def run_journal_stats(config_path: str, notify: bool) -> None:
+    """查看交易日志统计。"""
+    config = require_valid_config(config_path)
+    journal = TradeJournal(Path(config.portfolio.data_dir) / "trade_journal")
+    stats = journal.get_stats()
+    lines = [
+        "【交易日志统计】",
+        f"总交易笔数：{stats['total_trades']}",
+        f"买入：{stats['total_buys']} | 卖出：{stats['total_sells']}",
+        f"已验证交易：{stats['verified_trades']}",
+        f"好交易：{stats['good_trades']} | 坏交易：{stats['bad_trades']}",
+        f"胜率：{stats['win_rate']:.1f}%",
+        f"累计盈亏：{stats['total_pnl_pct']:+.2f}%",
+        f"平均持仓天数：{stats['avg_holding_days']}天",
+    ]
+    rendered = "\n".join(lines)
+    print(rendered)
+    if notify:
+        notify_feishu_if_enabled(config, rendered)
+
+
+def run_journal_verify(config_path: str, entry_id: str, verdict: str, lessons: str) -> None:
+    """事后验证一笔交易。"""
+    config = require_valid_config(config_path)
+    journal = TradeJournal(Path(config.portfolio.data_dir) / "trade_journal")
+    ok = journal.verify_trade(entry_id, verdict, lessons)
+    if ok:
+        print(f"✅ 已验证交易 {entry_id}：{verdict}")
+    else:
+        print(f"❌ 未找到交易 {entry_id}")
 
 
 if __name__ == "__main__":

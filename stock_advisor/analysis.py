@@ -219,6 +219,7 @@ def analyze_quotes(
     daily_ma60 = _average_decimal_list(daily_closes, 60) if daily_closes else None
     daily_rsi14 = _daily_rsi(daily_closes, 14) if daily_closes and len(daily_closes) >= 15 else None
     daily_vol_ratio = _daily_volume_ratio(daily_volumes, 5) if daily_volumes and len(daily_volumes) >= 6 else None
+    recent_ex_div = _detect_ex_dividend_gap(daily_closes) if daily_closes and len(daily_closes) >= 5 else False
     history_count = len(history)
     decision = _build_decision_signal(
         current,
@@ -235,6 +236,7 @@ def analyze_quotes(
         daily_ma60=daily_ma60,
         daily_rsi14=daily_rsi14,
         daily_vol_ratio=daily_vol_ratio,
+        recent_ex_dividend=recent_ex_div,
         portfolio_total_assets=portfolio_total_assets,
     )
     sparkline = _render_sparkline(history)
@@ -495,6 +497,7 @@ def _build_decision_signal(
     daily_ma60: Decimal | None = None,
     daily_rsi14: Decimal | None = None,
     daily_vol_ratio: Decimal | None = None,
+    recent_ex_dividend: bool = False,
     portfolio_total_assets: Decimal | None = None,
 ) -> DecisionSignal:
     score = Decimal("50")
@@ -1051,6 +1054,19 @@ def _build_decision_signal(
         )
         rationale.append("不追高纪律：涨超3%坚决不入场，等确认回踩支撑")
 
+    # ── EX-DIVIDEND GUARD ──
+    # When a stock recently went ex-dividend, today's price change is
+    # artificially inflated.  Buying on this false signal means the user
+    # sees an immediate "loss" the next day when the adjustment reverses.
+    if recent_ex_dividend and action in ("buy", "hold"):
+        prev_action = action
+        action = "avoid"
+        risk_flags.append(
+            "⚠️ 除权除息预警：近期日线存在异常跳空缺口，疑似除权除息调整，"
+            f"今日涨幅可能为技术性修复而非真实上涨，{prev_action} 信号被降级为观望"
+        )
+        rationale.append("除权除息防护：异常跳空缺口后不追涨，等缺口修复确认")
+
     # ── STOP-PROFIT GUARD ──
     # When a take-profit tier has been triggered (risk_flags already contain
     # the tier message from scoring phase), force the action to "reduce".
@@ -1425,6 +1441,27 @@ def _daily_volume_ratio(volumes: list[Decimal], lookback: int = 5) -> Decimal | 
     if avg_vol <= 0:
         return None
     return (today_vol / avg_vol).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+
+
+def _detect_ex_dividend_gap(closes: list[Decimal]) -> bool:
+    """Detect recent ex-dividend gap in daily closes.
+
+    Corporate actions (除权除息) cause a one-day price adjustment that looks like
+    a crash but isn't.  Signature: a single day with >3% drop followed by a
+    recovery day (not continued selling).  Detecting this prevents false buy
+    signals on the recovery bounce.
+    """
+    if len(closes) < 5:
+        return False
+    # Look at the last 5 days for a single large drop followed by recovery
+    changes = [(closes[i] - closes[i-1]) / closes[i-1] * 100
+               for i in range(1, len(closes))]
+    # Check most recent 3 changes for the pattern: big drop then bounce
+    recent = changes[-4:]
+    for i in range(len(recent) - 1):
+        if recent[i] <= -3 and recent[i+1] >= 0:
+            return True  # Drop followed by recovery → likely ex-dividend
+    return False
 
 
 def _format_price(value: Decimal) -> str:

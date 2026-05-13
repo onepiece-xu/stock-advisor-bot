@@ -225,6 +225,11 @@ class EastmoneyMinuteHistoryProvider:
         return _tail_trade_days(quotes, ndays)
 
     def fetch_daily_closes(self, stock: StockRef, ndays: int = 60) -> list[Decimal]:
+        closes, _ = self.fetch_daily_klines(stock, ndays=ndays)
+        return closes
+
+    def fetch_daily_klines(self, stock: StockRef, ndays: int = 60) -> tuple[list[Decimal], list[Decimal]]:
+        """Fetch daily K-line data. Returns (closes, volumes) for the last ndays."""
         today = datetime.now().date()
         lookback = today - timedelta(days=ndays * 2)
         response = requests.get(
@@ -245,11 +250,13 @@ class EastmoneyMinuteHistoryProvider:
         response.raise_for_status()
         data = (response.json().get("data") or {})
         closes: list[Decimal] = []
+        volumes: list[Decimal] = []
         for line in data.get("klines") or []:
             fields = str(line).split(",")
-            if len(fields) >= 3:
+            if len(fields) >= 6:
                 closes.append(Decimal(fields[2]))
-        return closes[-ndays:]
+                volumes.append(Decimal(fields[5]))
+        return closes[-ndays:], volumes[-ndays:]
 
     def _secid(self, stock: StockRef) -> str:
         exchange = stock.exchange.lower()

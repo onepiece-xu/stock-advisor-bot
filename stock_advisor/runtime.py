@@ -85,7 +85,7 @@ class MonitorRuntime:
             prev_peak = self.price_high_marks.get(stock.code, quote.current_price)
             if quote.current_price > prev_peak:
                 self.price_high_marks[stock.code] = quote.current_price
-            daily_closes = self._load_daily_closes(stock)
+            daily_closes, daily_volumes = self._load_daily_klines(stock)
             result = analyze_quotes(
                 bucket,
                 self.config.monitor,
@@ -99,6 +99,7 @@ class MonitorRuntime:
                 sector_boards=sector_boards,
                 portfolio_position_ratio=compute_position_ratio(portfolio_snapshot, holding, quote.current_price),
                 daily_closes=daily_closes,
+                daily_volumes=daily_volumes,
                 portfolio_total_assets=portfolio_snapshot.total_assets if portfolio_snapshot else None,
             )
             persist_observation(self.db, quote, result)
@@ -333,17 +334,22 @@ class MonitorRuntime:
             logger.warning("Benchmark fetch failed symbol=%s error=%s", benchmark.symbol, exc)
             return None
 
-    def _load_daily_closes(self, stock) -> list[Decimal] | None:
+    def _load_daily_klines(self, stock) -> tuple[list[Decimal] | None, list[Decimal] | None]:
+        """Returns (daily_closes, daily_volumes) for the stock, cached per day."""
         if self.config.monitor.provider != "eastmoney_minute":
-            return None
-        if stock.symbol not in self._daily_closes:
+            return None, None
+        cache_key = stock.symbol
+        if cache_key not in self._daily_closes:
             try:
-                closes = self.provider.fetch_daily_closes(stock, ndays=60)
-                self._daily_closes[stock.symbol] = closes
-            except Exception as exc:  # noqa: BLE001
-                logger.warning("Daily closes fetch failed symbol=%s error=%s", stock.symbol, exc)
-                return None
-        return self._daily_closes.get(stock.symbol)
+                closes, volumes = self.provider.fetch_daily_klines(stock, ndays=60)
+                self._daily_closes[cache_key] = closes
+                self._daily_volumes = getattr(self, '_daily_volumes', {})
+                self._daily_volumes[cache_key] = volumes
+            except Exception as exc:
+                logger.warning("Daily klines fetch failed symbol=%s error=%s", stock.symbol, exc)
+                return None, None
+        daily_volumes_dict = getattr(self, '_daily_volumes', {})
+        return self._daily_closes.get(cache_key), daily_volumes_dict.get(cache_key)
 
     def _prune_notifications(self) -> None:
         cooldown = max(self.config.monitor.notification.dedup.cooldown_minutes, 1)
@@ -502,16 +508,26 @@ class MonitorRuntime:
         except Exception:
             pass
 
-        # ── 4. 热点板块 ──
+        # ── 4. 板块轮动热力图 ──
         try:
-            industry_boards = self.market_snapshot.fetch_sector_boards(kind="industry", limit=3)
-            concept_boards = self.market_snapshot.fetch_sector_boards(kind="concept", limit=3)
-            all_boards = industry_boards + concept_boards
+            industry_boards = self.market_snapshot.fetch_sector_boards(kind="industry", limit=5)
+            concept_boards = self.market_snapshot.fetch_sector_boards(kind="concept", limit=5)
+            all_boards = sorted(
+                industry_boards + concept_boards,
+                key=lambda b: abs(b.get("change_percent", 0)),
+                reverse=True,
+            )
             if all_boards:
-                lines.append("\n【热点板块】")
-                for board in all_boards:
-                    leader_part = f" 龙头: {board['leader_name']}({board['leader_code']}) {board['leader_change_percent']:+.2f}%" if board.get("leader_name") else ""
-                    lines.append(f"- {board['name']} {board.get('change_percent', 0):+.2f}%{leader_part}")
+                lines.append("\n【板块轮动热力图】")
+                # Rank by absolute change (hottest/coldest first)
+                for i, board in enumerate(all_boards[:8], 1):
+                    chg = board.get("change_percent", 0)
+                    heat = "🔥" if chg >= 2 else "🟢" if chg >= 0.5 else "🟡" if chg >= -0.5 else "🔴"
+                    leader_part = (
+                        f" 龙头:{board['leader_name']}({board['leader_code']}){board.get('leader_change_percent', 0):+.1f}%"
+                        if board.get("leader_name") else ""
+                    )
+                    lines.append(f"{heat} {board['name']} {chg:+.2f}%{leader_part}")
         except Exception as exc:
             logger.warning("Pre-market sector boards fetch failed error=%s", exc)
 

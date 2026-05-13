@@ -502,3 +502,150 @@ def _safe_optional_value(value: float | None) -> float:
 
 def _fmt_pct(value: float | None) -> str:
     return "N/A" if value is None else f"{value:.2f}%"
+
+
+# ── Daily-level backtest (item #5: 回测框架) ──
+
+@dataclass(slots=True)
+class DailyBacktestResult:
+    """日线级别回测结果 — 验证每日评分策略"""
+    symbol: str
+    start_date: str
+    end_date: str
+    total_signals: int
+    buy_signals: int
+    hold_signals: int
+    reduce_signals: int
+    avoid_signals: int
+    avg_score: Decimal
+    daily_returns: list[dict]
+    summary: str
+
+
+def run_daily_backtest(
+    config: AppConfig,
+    stock: StockRef,
+    days: int = 60,
+    *,
+    initial_cost: Decimal | None = None,
+    initial_quantity: int = 0,
+) -> DailyBacktestResult:
+    """Run backtest on a single stock using daily scoring data."""
+    from collections import defaultdict
+    from datetime import date, timedelta
+
+    from .models import PortfolioHolding
+
+    provider = EastmoneyMinuteHistoryProvider(config.monitor)
+    end_date = date.today()
+    start_date = end_date - timedelta(days=days * 2)
+
+    # Fetch daily closes/volumes for daily scoring
+    daily_closes: list[Decimal] | None = None
+    daily_volumes: list[Decimal] | None = None
+    try:
+        daily_closes, daily_volumes = provider.fetch_daily_klines(stock, ndays=max(days, 60))
+    except Exception:
+        pass
+
+    # Fetch minute history per day
+    all_quotes = provider.fetch_quotes(stock, start_date, end_date)
+    if not all_quotes:
+        raise RuntimeError(f"No historical data for {stock.symbol}")
+
+    day_groups: dict[date, list[StockQuote]] = defaultdict(list)
+    for q in all_quotes:
+        day_groups[q.quote_time.date()].append(q)
+
+    trading_dates = sorted(day_groups.keys())[-days:]
+
+    signals: list[dict] = []
+    total_score = Decimal("0")
+    buy_count = hold_count = reduce_count = avoid_count = 0
+
+    holding = PortfolioHolding(
+        name=stock.code,
+        code=stock.code,
+        quantity=initial_quantity,
+        cost_price=initial_cost or Decimal("0"),
+        current_price=Decimal("0"),
+    ) if initial_quantity > 0 else None
+
+    for i, td in enumerate(trading_dates):
+        quotes = day_groups[td]
+        if len(quotes) < 5:
+            continue
+
+        try:
+            result = analyze_quotes(
+                quotes,
+                config.monitor,
+                portfolio_holding=holding,
+                include_news=False,
+                daily_closes=daily_closes[:i+1] if daily_closes else None,
+                daily_volumes=daily_volumes[:i+1] if daily_volumes else None,
+            )
+        except Exception:
+            continue
+
+        action = result.decision.action
+        score = result.decision.score
+        total_score += score
+
+        if action == "buy":
+            buy_count += 1
+        elif action == "hold":
+            hold_count += 1
+        elif action == "reduce":
+            reduce_count += 1
+        else:
+            avoid_count += 1
+
+        next_day_return = Decimal("0")
+        if i + 1 < len(trading_dates):
+            next_quotes = day_groups[trading_dates[i + 1]]
+            if next_quotes:
+                next_close = next_quotes[-1].current_price
+                today_close = quotes[-1].current_price
+                if today_close > 0:
+                    next_day_return = ((next_close - today_close) / today_close * 100).quantize(Decimal("0.01"))
+
+        signals.append({
+            "date": td.isoformat(),
+            "close": float(quotes[-1].current_price),
+            "action": action,
+            "score": float(score),
+            "confidence": result.decision.confidence,
+            "next_day_return": float(next_day_return),
+            "rationale": result.decision.rationale[:2],
+        })
+
+    total = buy_count + hold_count + reduce_count + avoid_count
+    avg_score = (total_score / Decimal(str(total))).quantize(Decimal("0.01")) if total > 0 else Decimal("50")
+
+    buy_signals_list = [s for s in signals if s["action"] == "buy"]
+    winning_buys = sum(1 for s in buy_signals_list if s["next_day_return"] > 0)
+    win_rate = (winning_buys / len(buy_signals_list) * 100) if buy_signals_list else 0
+
+    summary_lines = [
+        f"日线回测 {stock.symbol} | {trading_dates[0]} → {trading_dates[-1]}",
+        f"交易日: {len(trading_dates)} | 有效信号: {total}",
+        f"买入: {buy_count} | 持有: {hold_count} | 减仓: {reduce_count} | 观望: {avoid_count}",
+        f"平均评分: {avg_score}",
+    ]
+    if buy_signals_list:
+        summary_lines.append(f"买入次日胜率: {win_rate:.1f}% ({winning_buys}/{len(buy_signals_list)})")
+
+    return DailyBacktestResult(
+        symbol=stock.symbol,
+        start_date=trading_dates[0].isoformat(),
+        end_date=trading_dates[-1].isoformat(),
+        total_signals=total,
+        buy_signals=buy_count,
+        hold_signals=hold_count,
+        reduce_signals=reduce_count,
+        avoid_signals=avoid_count,
+        avg_score=avg_score,
+        daily_returns=signals,
+        summary="\\n".join(summary_lines),
+    )

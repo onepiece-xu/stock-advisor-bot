@@ -163,8 +163,24 @@ def _render_review_body(config: AppConfig, trade_date: date, items: list[dict], 
             current_price = Decimal(str(item.get("current_price", holding.current_price)))
             action = item.get("action", "hold")
             lines.append(f"- {holding.name}({holding.code})：持仓 {holding.quantity}股 浮盈亏 {_signed_decimal(pnl)}% | 建议 {action}")
-            if pnl >= 5:
+            if pnl >= 10:
+                lines.append(f"  🎯 止盈提醒：浮盈 {_signed_decimal(pnl)}%，已触发止盈关注区")
+                # Show take profit tiers
+                if config.monitor.take_profit_tiers:
+                    for tier in config.monitor.take_profit_tiers:
+                        if float(pnl) >= tier.profit_pct:
+                            sell_qty = int(holding.quantity * Decimal(str(tier.sell_ratio)))
+                            sell_qty = (sell_qty // 100) * 100 if sell_qty >= 100 else holding.quantity
+                            lines.append(f"     {tier.label}：建议卖出 {sell_qty} 股（{tier.sell_ratio*100:.0f}%）")
+            elif pnl >= 5:
                 lines.append(f"  关注止盈：若冲高至 {_fmt_decimal(current_price * Decimal('1.05'))} 附近可考虑减仓")
+            elif pnl <= -20:
+                # Deep loss exit roadmap
+                lines.append(f"  ⚠️ 深套退出路线图：浮亏 {_signed_decimal(pnl)}%")
+                lines.append(f"  最近阻力位：MA15 约 {_fmt_decimal(current_price * Decimal('1.10')) if holding.cost_price > current_price * Decimal('2') else _fmt_decimal(holding.cost_price * Decimal('0.5'))}")
+                lines.append(f"  第一阶段：反弹至 {_fmt_decimal(current_price * Decimal('1.15'))} 附近卖 50 股" if holding.quantity >= 100 else f"  反弹减仓：反弹至 {_fmt_decimal(current_price * Decimal('1.10'))} 附近减仓")
+                lines.append(f"  保命底线：跌至 {_fmt_decimal(current_price * Decimal('0.90'))} 全部清仓" if holding.quantity > 100 else "  保命底线：跌至整数关口下方全部清仓")
+                lines.append(f"  纪律：深套股绝不补仓，只等反弹减仓" if pnl <= -50 else "  纪律：不补仓，反弹减仓，止损保命")
             elif pnl <= -5:
                 lines.append(f"  关注减亏：反弹至成本线 {_fmt_decimal(holding.cost_price)} 附近可减仓")
             lines.append(f"  止损参考：{_fmt_decimal(holding.cost_price * (1 - Decimal(str(config.monitor.stop_loss_pct)) / Decimal('100')))}")

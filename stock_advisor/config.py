@@ -81,6 +81,13 @@ class ScheduleConfig:
 
 
 @dataclass(slots=True)
+class TakeProfitTier:
+    profit_pct: float
+    sell_ratio: float
+    label: str
+
+
+@dataclass(slots=True)
 class MonitorConfig:
     provider: str
     stocks: list[StockRef]
@@ -94,6 +101,7 @@ class MonitorConfig:
     notification: NotificationConfig
     stop_loss_pct: float
     position_pct_per_trade: float
+    take_profit_tiers: list[TakeProfitTier]
 
 
 @dataclass(slots=True)
@@ -203,6 +211,14 @@ def load_config(path: str | Path) -> AppConfig:
             ),
             stop_loss_pct=float(monitor_raw.get("signal", {}).get("stop_loss_pct", 7.0)),
             position_pct_per_trade=float(monitor_raw.get("signal", {}).get("position_pct_per_trade", 0.05)),
+            take_profit_tiers=[
+                TakeProfitTier(
+                    profit_pct=float(t.get("profit_pct", 10)),
+                    sell_ratio=float(t.get("sell_ratio", 0.5)),
+                    label=str(t.get("label", "止盈位")),
+                )
+                for t in monitor_raw.get("signal", {}).get("take_profit_tiers", [])
+            ],
             notification=NotificationConfig(
                 notify_on_neutral=bool(notification_raw.get("notify_on_neutral", False)),
                 dedup=DedupConfig(

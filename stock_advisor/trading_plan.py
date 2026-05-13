@@ -1,13 +1,53 @@
 from __future__ import annotations
 
 import json
-from dataclasses import dataclass
+import logging
+from dataclasses import dataclass, field
 from datetime import date
 from decimal import Decimal, ROUND_HALF_UP
 from pathlib import Path
 from typing import Any
 
 from .models import PortfolioHolding, PortfolioSnapshot, StockQuote
+
+logger = logging.getLogger(__name__)
+
+
+@dataclass(slots=True)
+class TriggerRiskContext:
+    """Risk context passed to trigger detection for validation.
+
+    All fields optional — missing fields skip that check.
+    """
+    change_percent: Decimal = Decimal("0")
+    volume_ratio: Decimal | None = None
+    step_change_pct: Decimal | None = None
+    is_limit_up: bool = False
+    is_limit_down: bool = False
+
+    def is_blocked(self) -> tuple[bool, str]:
+        """Returns (blocked, reason) if any risk condition blocks the trigger."""
+        if self.is_limit_down:
+            return True, "跌停板，禁止任何触发执行"
+        if self.is_limit_up:
+            return True, "涨停板，买入无法成交，卖出可等待开板"
+        if self.volume_ratio is not None and self.volume_ratio < Decimal("0.2"):
+            return True, f"量比极低（{self.volume_ratio}），流动性不足，禁止触发"
+        if self.step_change_pct is not None and abs(self.step_change_pct) > Decimal("8"):
+            return True, f"分钟级波动剧烈（{self.step_change_pct}%），暂停触发等待稳定"
+        return False, ""
+
+
+def build_risk_context(quote: StockQuote, history: list[StockQuote] | None = None) -> TriggerRiskContext:
+    """Build risk context from a quote and optional history."""
+    ctx = TriggerRiskContext(change_percent=quote.change_percent)
+    ctx.is_limit_up = quote.change_percent >= Decimal("9.5")
+    ctx.is_limit_down = quote.change_percent <= Decimal("-9.5")
+    if history and len(history) >= 2:
+        prev = history[-2]
+        if prev.current_price > 0:
+            ctx.step_change_pct = ((quote.current_price - prev.current_price) / prev.current_price * Decimal("100")).quantize(Decimal("0.01"))
+    return ctx
 
 
 @dataclass(slots=True)
@@ -149,6 +189,7 @@ def detect_trigger_hit(
     quote: StockQuote,
     snapshot: PortfolioSnapshot,
     triggers: dict[str, TradeTrigger] | None = None,
+    risk: TriggerRiskContext | None = None,
 ) -> TriggerHit | None:
     trigger_map = triggers or DEFAULT_TRIGGER_MAP
     trigger = trigger_map.get(quote.code)
@@ -157,6 +198,17 @@ def detect_trigger_hit(
     holding = _find_holding(snapshot, quote.code)
     if holding is None or holding.quantity <= 0:
         return None
+
+    # Risk pre-check — block trigger execution in dangerous conditions
+    if risk is not None:
+        blocked, reason = risk.is_blocked()
+        if blocked:
+            logger.warning(
+                "Trigger blocked for %s(%s) price=%s action=%s reason=%s",
+                trigger.name, trigger.code, quote.current_price, trigger.action, reason,
+            )
+            return None
+
     price = quote.current_price
     quantity = _dynamic_quantity(trigger, holding, snapshot)
     weight_pct = _holding_weight_pct(holding, snapshot)
@@ -361,3 +413,33 @@ def _post_fill_instruction(holding: PortfolioHolding, snapshot: PortfolioSnapsho
     if weight >= Decimal("20"):
         return ("反弹卖", "反弹到预设区间优先减仓，不主动加仓", "仓位不低，先用反弹换现金")
     return ("持有观察", "暂时不动，等更清晰信号", "当前不是最急需处理的仓位")
+
+
+def check_stale_triggers(triggers: dict[str, TradeTrigger], snapshot: PortfolioSnapshot) -> list[str]:
+    """Return warnings for triggers whose price ranges are too far from current prices.
+
+    A trigger is stale if:
+    - Action is sell/hold and current price is >20% above trigger range (you'd be selling too early)
+    - Action is sell/hold and current price is >15% below fallback (trigger is unreachable)
+    """
+    warnings: list[str] = []
+    for code, trigger in triggers.items():
+        holding = _find_holding(snapshot, code)
+        if holding is None or holding.quantity <= 0:
+            continue
+        current = holding.current_price
+        if trigger.price_max > 0:
+            deviation_above = ((current - trigger.price_max) / trigger.price_max * Decimal("100")).quantize(Decimal("0.1"))
+            if deviation_above > Decimal("20"):
+                warnings.append(
+                    f"- ⚠️ {trigger.name}({code}) 现价 {current}，远超触发区间上限 {trigger.price_max}（+{deviation_above}%），"
+                    f"触发区间可能过时，建议更新"
+                )
+        if trigger.fallback_price > 0:
+            deviation_below = ((current - trigger.fallback_price) / trigger.fallback_price * Decimal("100")).quantize(Decimal("0.1"))
+            if current < trigger.price_min and abs(deviation_below) > Decimal("15"):
+                warnings.append(
+                    f"- ⚠️ {trigger.name}({code}) 现价 {current}，已大幅跌破防守位 {trigger.fallback_price}（{deviation_below}%），"
+                    f"触发单可能已失效"
+                )
+    return warnings

@@ -9,9 +9,10 @@ from zoneinfo import ZoneInfo
 
 from .config import AppConfig
 from .habit_learning import build_trading_habit_profile
-from .market_hours import MARKET_TZ
+from .market_hours import MARKET_TZ, next_session_str
 from .portfolio import load_snapshot as load_portfolio_snapshot
 from .storage import connect_db, fetch_daily_review_snapshot, fetch_latest_trade_date
+from .trading_plan import check_stale_triggers, load_triggers
 from .logging_utils import get_logger
 
 logger = get_logger(__name__)
@@ -127,6 +128,56 @@ def _render_review_body(config: AppConfig, trade_date: date, items: list[dict], 
     if portfolio_path.exists():
         lines.extend(["", "【持仓复盘】"])
         lines.extend(_render_portfolio_section(portfolio_path, items, stop_loss_pct=config.monitor.stop_loss_pct))
+        # Check for stale trading triggers
+        try:
+            snapshot = load_portfolio_snapshot(portfolio_path)
+            triggers = load_triggers(config.trading_plan_path)
+            stale_warnings = check_stale_triggers(triggers, snapshot)
+            if stale_warnings:
+                lines.extend(["", "【⚠️ 过期触发单提醒】"])
+                lines.extend(stale_warnings)
+                lines.append("建议用 /plan 命令或直接编辑 trading-plan.json 更新触发区间。")
+        except Exception:
+            pass  # Non-critical — don't break the review for this
+
+    # ── Tomorrow's action plan & orphan trigger check ──
+    try:
+        snapshot = load_portfolio_snapshot(portfolio_path)
+        triggers = load_triggers(config.trading_plan_path)
+        active_codes = {h.code for h in snapshot.holdings if h.quantity > 0}
+        # Check for triggers on cleared positions
+        orphan_triggers = [t for t in triggers if t.code not in active_codes]
+        if orphan_triggers:
+            lines.extend(["", "【⚠️ 已清仓触发单提醒】"])
+            for t in orphan_triggers:
+                lines.append(f"- {t.code} {t.name}：已清仓但触发单仍为 {t.action} {t.quantity}股 @ {t.price_min}-{t.price_max}，建议清理或改写为入场单")
+        # Tomorrow's key levels
+        lines.extend(["", "【明日操作计划】"])
+        for holding in snapshot.holdings:
+            if holding.quantity <= 0:
+                continue
+            item = item_map.get(holding.code)
+            if not item:
+                continue
+            pnl = _pnl_pct(holding.cost_price, Decimal(str(item.get("current_price", holding.current_price))))
+            current_price = Decimal(str(item.get("current_price", holding.current_price)))
+            action = item.get("action", "hold")
+            lines.append(f"- {holding.name}({holding.code})：持仓 {holding.quantity}股 浮盈亏 {_signed_decimal(pnl)}% | 建议 {action}")
+            if pnl >= 5:
+                lines.append(f"  关注止盈：若冲高至 {_fmt_decimal(current_price * Decimal('1.05'))} 附近可考虑减仓")
+            elif pnl <= -5:
+                lines.append(f"  关注减亏：反弹至成本线 {_fmt_decimal(holding.cost_price)} 附近可减仓")
+            lines.append(f"  止损参考：{_fmt_decimal(holding.cost_price * (1 - Decimal(str(config.monitor.stop_loss_pct)) / Decimal('100')))}")
+        active_triggers = [t for t in triggers if t.code in active_codes]
+        if active_triggers:
+            lines.append("")
+            lines.append("【明日触发单关注】")
+            for t in active_triggers:
+                lines.append(f"- {t.code} {t.name}：{t.action} {t.quantity}股，区间 {t.price_min}-{t.price_max}，回落 {t.fallback_price}")
+        lines.append("")
+        lines.append("以上为辅助参考，不构成投资建议。请根据明日盘前实际情况做出决策。")
+    except Exception:
+        pass  # Non-critical
 
     if trading_habit_profile is not None:
         lines.extend(["", "【交易习惯学习】"])
@@ -138,6 +189,45 @@ def _render_review_body(config: AppConfig, trade_date: date, items: list[dict], 
             f"减仓习惯 {_fmt_decimal(trading_habit_profile.preferred_reduce_ratio * Decimal('100'))}%"
         )
 
+    # ── Friday weekly wrap + cash deployment ──
+    is_friday = trade_date.weekday() == 4
+    if is_friday:
+        lines.extend(["", "【周末准备 — 周线回顾】"])
+        if portfolio_path.exists():
+            try:
+                snapshot = load_portfolio_snapshot(portfolio_path)
+                for holding in snapshot.holdings:
+                    if holding.quantity <= 0:
+                        continue
+                    pnl = _pnl_pct(holding.cost_price, holding.current_price)
+                    lines.append(
+                        f"- {holding.name}：周收盘 {_fmt_decimal(holding.current_price)}"
+                        f" | 持仓盈亏 {_signed_decimal(pnl)}%"
+                        f" | 距成本 {_fmt_decimal(abs(holding.current_price - holding.cost_price))}"
+                    )
+            except Exception:
+                pass
+        lines.append("- 周末关注：周末政策消息、外围市场走势、下周财经日历")
+        lines.append("- 周一盘前简报将更新下周关键价位")
+
+    # ── Cash deployment conditions ──
+    if portfolio_path.exists():
+        try:
+            snapshot = load_portfolio_snapshot(portfolio_path)
+            if snapshot.total_assets > 0:
+                cash_pct = (snapshot.cash / snapshot.total_assets * 100)
+                if cash_pct > 60:
+                    lines.extend(["", "【现金部署条件】"])
+                    lines.append(f"当前现金占比 {cash_pct:.0f}%，偏保守。")
+                    lines.append("部署条件（需同时满足）：")
+                    lines.append("  1. 大盘不暴跌（上证 > -1.5%）")
+                    lines.append("  2. 标的评分 >= 84（买入阈值）")
+                    lines.append("  3. 单票仓位不超过 35%")
+                    lines.append("  4. 不补仓深套股（-30%+）")
+                    lines.append("  审视现有持仓，优先加仓趋势向好、浮盈的标的")
+        except Exception:
+            pass
+
     lines.extend(["", "【结论】"])
     if avg_score is not None and avg_score >= Decimal("58"):
         lines.append("- 今日整体评分偏中性偏强，优先保留强势、弱势只做反弹处理。")
@@ -145,6 +235,34 @@ def _render_review_body(config: AppConfig, trade_date: date, items: list[dict], 
         lines.append("- 今日整体评分偏弱，控制仓位与现金比盲目抄底更重要。")
     else:
         lines.append("- 今日整体仍是分化市况，按个股评分和仓位纪律执行。")
+
+    # ── LLM 明日解读 ──
+    try:
+        from .llm_analyst import generate_close_verdict
+        llm_data: list[dict] = []
+        if portfolio_path.exists():
+            snap = load_portfolio_snapshot(portfolio_path)
+            for h in snap.holdings:
+                if h.quantity <= 0:
+                    continue
+                item = item_map.get(h.code, {})
+                llm_data.append({
+                    "name": h.name, "code": h.code, "quantity": h.quantity,
+                    "cost_price": float(h.cost_price), "current_price": float(h.current_price),
+                    "pnl_pct": float(_pnl_pct(h.cost_price, h.current_price)),
+                    "action": item.get("action", "hold"),
+                    "score": item.get("score"),
+                })
+        if llm_data:
+            market_info = f"平均评分{avg_score:.0f}" if avg_score else ""
+            verdict = generate_close_verdict(llm_data, avg_score=float(avg_score) if avg_score else 50, market_summary=market_info, today=trade_date.isoformat())
+            if verdict:
+                lines.append(f"\n【AI 明日解读】")
+                lines.append(verdict)
+    except Exception:
+        pass
+
+    lines.append(f"- 下次开盘：{next_session_str()}")
     lines.append("- 仅供参考，不构成投资建议。")
     return "\n".join(lines)
 

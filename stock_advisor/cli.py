@@ -29,10 +29,11 @@ from .models import StockRef, TradeFillRecord
 from .notify import deliver_feishu_message, flush_failed_notifications, notify_feishu_if_enabled
 from .portfolio import build_daily_report, compute_cash_ratio, compute_position_ratio, find_holding, generate_portfolio_report, load_previous_snapshot, load_snapshot, save_snapshot
 from .logging_utils import get_logger
-from .market_hours import is_high_volatility_period
+from .market_hours import is_high_volatility_period, next_session_str
 from .providers import EastmoneyMarketSnapshotProvider, EastmoneyMinuteHistoryProvider, TencentQuoteProvider
 from .analysis import analyze_quotes
 from .review import build_close_review
+from .trading_plan import load_triggers
 from .runtime import MonitorRuntime
 from .storage import (
     cache_quotes,
@@ -51,6 +52,8 @@ from .trading_plan import (
     load_snapshot as load_trade_snapshot,
     save_snapshot as save_trade_snapshot,
 )
+
+from .shared_helpers import build_provider, load_market_context, load_stock_history, parse_history_datetime
 
 
 logger = get_logger(__name__)
@@ -155,6 +158,9 @@ def main() -> None:
     prune_parser.add_argument("--config", required=True, help="配置文件路径")
     prune_parser.add_argument("--retention-days", type=int, default=90, help="保留天数（默认 90）")
 
+    status_parser = subparsers.add_parser("status", help="输出当前系统状态：交易日历、持仓摘要、触发单")
+    status_parser.add_argument("--config", required=True, help="配置文件路径")
+
     import_snap_parser = subparsers.add_parser("import-snapshot", help="从券商App复制文本解析并更新持仓快照")
     import_snap_parser.add_argument("--snapshot", required=True, help="目标持仓快照 JSON 文件路径")
     import_snap_parser.add_argument("--text", help="持仓文本（不传则从 stdin 读取）")
@@ -199,6 +205,8 @@ def main() -> None:
         run_optimize_thresholds(args.config, args.days, args.symbol or [], args.mobile, args.notify, args.apply)
     elif args.command == "habit-profile":
         run_habit_profile(args.config, args.mobile)
+    elif args.command == "status":
+        run_status(args.config)
     elif args.command == "import-snapshot":
         run_import_snapshot(args.snapshot, args.text, args.date, args.dry_run)
     elif args.command == "prune-data":
@@ -212,16 +220,18 @@ def run_monitor_once(config_path: str, force_notify: bool, mobile: bool) -> None
     cash_ratio = compute_cash_ratio(portfolio_snapshot)
     benchmark_history = _load_benchmark_history(config)
     trading_habit_profile = build_trading_habit_profile(conn)
-    provider = _build_provider(config)
-    advance_ratio, rank_map, sector_boards = _load_market_context(config)
+    provider = build_provider(config)
+    advance_ratio, rank_map, sector_boards = load_market_context(config)
     volatile_period = is_high_volatility_period()
 
     for stock in config.monitor.stocks:
-        history = _load_stock_history(config, conn, provider, stock)
+        history = load_stock_history(config, conn, provider, stock)
         if not history:
             continue
         quote = history[-1]
         holding = find_holding(portfolio_snapshot, stock.code)
+        if holding is not None and holding.quantity <= 0:
+            continue
         result = analyze_quotes(
             history,
             config.monitor,
@@ -415,7 +425,7 @@ def run_close_review(config_path: str, notify: bool) -> None:
 
 def run_advice_at(config_path: str, at_text: str, symbols: list[str], mobile: bool, notify: bool) -> None:
     config = require_valid_config(config_path)
-    requested_at = _parse_history_datetime(at_text)
+    requested_at = parse_history_datetime(at_text)
     stocks = [_resolve_stock_ref(config, symbol) for symbol in symbols] if symbols else None
     items = analyze_historical_point(config, requested_at, stocks=stocks)
     rendered = render_historical_advice(items, mobile=mobile)
@@ -439,8 +449,8 @@ def run_compare_at(
     notify: bool,
 ) -> None:
     config = require_valid_config(config_path)
-    start_at = _parse_history_datetime(from_text)
-    end_at = _parse_history_datetime(to_text)
+    start_at = parse_history_datetime(from_text)
+    end_at = parse_history_datetime(to_text)
     stocks = [_resolve_stock_ref(config, symbol) for symbol in symbols] if symbols else None
     items = compare_historical_points(config, start_at, end_at, stocks=stocks)
     rendered = render_historical_compare(items, mobile=mobile)
@@ -561,18 +571,7 @@ def run_import_snapshot(snapshot_path: str, text: str | None, trade_date_str: st
     print(f"\n已写入 {snap_path}")
 
 
-def _parse_history_datetime(text: str) -> datetime:
-    normalized = text.strip()
-    for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M", "%Y-%m-%dT%H:%M:%S", "%Y-%m-%dT%H:%M"):
-        try:
-            return datetime.strptime(normalized, fmt)
-        except ValueError:
-            continue
-    raise RuntimeError(f"无法解析历史时点: {text}")
-
-
 def _resolve_stock_ref(config, query: str) -> StockRef:
-    normalized = query.strip().lower()
     for stock in config.monitor.stocks:
         if stock.code == query or stock.symbol == normalized:
             return stock
@@ -591,22 +590,6 @@ def _apply_thresholds_to_config(config_path: str, buy_score: int, hold_score: in
     Path(config_path).write_text(text, encoding="utf-8")
 
 
-def _load_market_context(config) -> tuple[Decimal, dict[str, int], list[dict]]:
-    advance_ratio = Decimal("0")
-    rank_map: dict[str, int] = {}
-    sector_boards: list[dict] = []
-    try:
-        snapshot_provider = EastmoneyMarketSnapshotProvider(config.monitor)
-        breadth = snapshot_provider.fetch_market_breadth()
-        total = breadth.get("up_count", 0) + breadth.get("flat_count", 0) + breadth.get("down_count", 0)
-        if total > 0:
-            advance_ratio = Decimal(str(breadth["up_count"])) / Decimal(str(total))
-        top_stocks = snapshot_provider.fetch_top_stocks(limit=50)
-        rank_map = {item["code"]: idx + 1 for idx, item in enumerate(top_stocks)}
-        sector_boards = snapshot_provider.fetch_sector_boards(kind="industry", limit=5) + snapshot_provider.fetch_sector_boards(kind="concept", limit=5)
-    except Exception as exc:
-        logger.warning("Market context load failed error=%s", exc)
-    return advance_ratio, rank_map, sector_boards
 
 
 def _load_portfolio_snapshot(config):
@@ -619,7 +602,7 @@ def _load_benchmark_history(config):
     benchmark = config.monitor.benchmark
     if benchmark is None:
         return None
-    provider = _build_provider(config)
+    provider = build_provider(config)
     if config.monitor.provider == "eastmoney_minute":
         return provider.fetch_recent_window(benchmark, config.monitor.history_size)
     try:
@@ -629,21 +612,8 @@ def _load_benchmark_history(config):
         return None
 
 
-def _build_provider(config):
-    if config.monitor.provider == "eastmoney_minute":
-        return EastmoneyMinuteHistoryProvider(config.monitor)
-    return TencentQuoteProvider(config.monitor)
 
 
-def _load_stock_history(config, conn, provider, stock):
-    if config.monitor.provider == "eastmoney_minute":
-        history = provider.fetch_recent_window(stock, config.monitor.history_size)
-        if history:
-            cache_quotes(conn, history)
-        return history
-    history = load_recent_quotes(conn, stock.symbol, config.monitor.history_size - 1)
-    history.append(provider.fetch_quote(stock))
-    return history
 
 
 def _record_fill_and_render_habit_profile(
@@ -685,6 +655,77 @@ def _record_fill_and_render_habit_profile(
         return render_trading_habit_profile(build_trading_habit_profile(conn), mobile=True)
     finally:
         conn.close()
+
+
+def run_status(config_path: str) -> None:
+    """Print current system status: trading calendar, holdings, triggers."""
+    config = require_valid_config(config_path)
+    from datetime import datetime as dt
+    from .market_hours import MARKET_TZ, is_a_share_trading_time, is_auction_period
+
+    now = dt.now(MARKET_TZ)
+    is_trading = is_a_share_trading_time(now)
+    is_auction = is_auction_period(now)
+    next_sess = next_session_str(now)
+
+    print(f"当前时间：{now.strftime('%Y-%m-%d %H:%M')} {['周一','周二','周三','周四','周五','周六','周日'][now.weekday()]}")
+    print(f"交易时段：{'是' if is_trading else '否'}{'（集合竞价）' if is_auction else ''}")
+    print(f"下次开盘：{next_sess}")
+    print()
+
+    # Holdings summary
+    snapshot_path = config.snapshot_path
+    if snapshot_path.exists():
+        snapshot = load_snapshot(snapshot_path)
+        print(f"总资产：{snapshot.total_assets:.0f}  现金：{snapshot.cash:.0f}（{(snapshot.cash/snapshot.total_assets*100):.0f}%）")
+        print()
+        print("持仓：")
+        for h in snapshot.holdings:
+            if h.quantity <= 0:
+                continue
+            pnl = ((h.current_price - h.cost_price) / h.cost_price * 100) if h.cost_price > 0 else 0
+            mkt_val = h.current_price * h.quantity
+            print(f"  {h.name}({h.code})：{h.quantity}股 | 成本 {h.cost_price} | 现价 {h.current_price} | 盈亏 {pnl:+.1f}% | 市值 {mkt_val:.0f}")
+
+        # Active triggers
+        triggers = load_triggers(config.trading_plan.path)
+        if triggers:
+            active_codes = {h.code for h in snapshot.holdings if h.quantity > 0}
+            active = [t for t in triggers.values() if t.code in active_codes]
+            orphan = [t for t in triggers.values() if t.code not in active_codes]
+            if active:
+                print(f"\n活跃触发单：")
+                for t in active:
+                    print(f"  {t.code} {t.name}：{t.action} {t.quantity}股 @ {t.price_min}-{t.price_max}（回落 {t.fallback_price}）")
+            if orphan:
+                print(f"\n⚠️ 已清仓触发单：")
+                for t in orphan:
+                    print(f"  {t.code} {t.name}：已清仓但触发单仍存在，建议清理")
+    else:
+        print("⚠️ 持仓快照不存在")
+
+    # Daemon status
+    import subprocess
+    try:
+        result = subprocess.run(["pgrep", "-f", "monitor-daemon"], capture_output=True, text=True)
+        if result.stdout.strip():
+            print(f"\n✅ daemon 运行中")
+        else:
+            print(f"\n❌ daemon 未运行")
+    except Exception:
+        print(f"\n⚠️ 无法检测 daemon 状态")
+
+    # Latest pre-market briefing
+    import json
+    briefing_path = Path("data/briefing/latest.json")
+    if briefing_path.exists():
+        b = json.loads(briefing_path.read_text())
+        print(f"\n最近盘前简报：{b['date']}（{b['generated_at'][:16]}）")
+        # Print just the quick verdict lines
+        summary = b.get("summary", "")
+        verdict_start = summary.find("【今日速判】")
+        if verdict_start > 0:
+            print(summary[verdict_start:].split("\n下次开盘")[0])
 
 
 def run_prune_data(config_path: str, retention_days: int) -> None:

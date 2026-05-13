@@ -117,10 +117,17 @@ def build_daily_report(current: PortfolioSnapshot, previous: PortfolioSnapshot |
         lines.append(f"较昨日总资产变化：{_format_signed_money(current.total_assets - previous.total_assets)}")
         lines.append(f"较昨日现金变化：{_format_signed_money(current.cash - previous.cash)}")
 
+    active_holdings = [h for h in current.holdings if h.quantity > 0]
+    closed_holdings = [h for h in current.holdings if h.quantity <= 0]
+
     lines.extend(["", "【持仓明细】"])
-    for holding in current.holdings:
+    for holding in active_holdings:
         lines.append(
             f"- {holding.name}({holding.code})：{holding.quantity}股，成本 {_format_money(holding.cost_price)}，现价 {_format_money(holding.current_price)}，浮盈亏 {_format_percent(_pnl_percent(holding))}"
+        )
+    for holding in closed_holdings:
+        lines.append(
+            f"- {holding.name}({holding.code})：已清仓（成本 {_format_money(holding.cost_price)}，现价 {_format_money(holding.current_price)}）"
         )
 
     if previous is not None:
@@ -129,7 +136,7 @@ def build_daily_report(current: PortfolioSnapshot, previous: PortfolioSnapshot |
             lines.append(f"- {line}")
 
     lines.extend(["", "【执行单】"])
-    advice_items = sorted((_advice_for_holding(h, current) for h in current.holdings), key=lambda x: x.priority)
+    advice_items = sorted((_advice_for_holding(h, current) for h in active_holdings), key=lambda x: x.priority)
     for item in advice_items:
         lines.append(item.title)
         lines.append(item.detail)

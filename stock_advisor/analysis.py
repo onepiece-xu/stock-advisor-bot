@@ -81,6 +81,16 @@ def analyze_quotes(
     if has_daily_change_alert:
         direction = "偏强" if current.change_percent >= 0 else "偏弱"
         observations.append(f"观察：当日涨跌幅 {_format_percent(current.change_percent)}，日内表现{direction}。")
+
+    # Limit up/down detection
+    is_limit_up = current.change_percent >= Decimal("9.5")
+    is_limit_down = current.change_percent <= Decimal("-9.5")
+    if is_limit_up:
+        observations.append("⚠️ 涨停板：无法买入，持有者可等待开板或次日。")
+    if is_limit_down:
+        observations.append("⚠️ 跌停板：无法卖出，成交量可能为零，停止一切操作。")
+
+
     if has_ma15_bias_info:
         direction = "高于" if bias_to_ma15 >= 0 else "低于"
         observations.append(f"观察：现价较 MA15 {direction} {_format_percent(abs(bias_to_ma15))}，短线节奏已偏离均值。")
@@ -335,8 +345,13 @@ def _average_decimal(values: list[Decimal]) -> Decimal:
 
 
 def _safe_ratio(numerator: Decimal, denominator: Decimal) -> Decimal:
+    """Safe division for ratio calculations — returns 0.00 on invalid denominator.
+
+    Returns 0.00 instead of 1.00 to avoid masking data errors as "normal".
+    Callers should check for 0.00 and treat it as "data unavailable".
+    """
     if denominator <= 0:
-        return Decimal("1.00")
+        return Decimal("0.00")
     return (numerator / denominator).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
 
 
@@ -692,15 +707,28 @@ def _build_decision_signal(
             rationale.append(f"现价已高于持仓成本 {_format_percent(holding_return_pct)}，持仓安全垫开始形成")
 
     if portfolio_holding is not None and portfolio_holding.cost_price > 0 and portfolio_holding.quantity > 0:
-        stop_pct = Decimal(str(monitor_config.stop_loss_pct))
-        fixed_stop = (portfolio_holding.cost_price * (1 - stop_pct / Decimal("100"))).quantize(Decimal("0.001"))
-        dist_to_stop = _percent_diff(current.current_price, fixed_stop)
-        if dist_to_stop <= Decimal("0"):
+        from .stop_loss import compute_effective_stop as compute_stop
+        _eff_stop, _label, dist_to_stop = compute_stop(
+            cost_price=portfolio_holding.cost_price,
+            current_price=current.current_price,
+            stop_loss_pct=monitor_config.stop_loss_pct,
+        )
+        if dist_to_stop <= 0:
             score -= Decimal("12")
-            risk_flags.append(f"已触及固定止损价 {_format_price(fixed_stop)}（成本 {_format_price(portfolio_holding.cost_price)} 下 {_format_ratio(stop_pct)}%），建议立即执行止损")
+            risk_flags.append(f"已触及{_label}价 {_eff_stop}（成本 {_format_price(portfolio_holding.cost_price)}），建议立即执行止损")
         elif dist_to_stop <= Decimal("2.50"):
             score -= Decimal("6")
-            risk_flags.append(f"距固定止损价 {_format_price(fixed_stop)} 仅剩 {_format_percent(dist_to_stop)}，收紧风控、做好出手准备")
+            risk_flags.append(f"距{_label}价 {_eff_stop} 仅剩 {_format_percent(dist_to_stop)}，收紧风控、做好出手准备")
+
+    # Limit board detection (computed here from current quote)
+    _is_limit_down = current.change_percent <= Decimal("-9.5")
+    _is_limit_up = current.change_percent >= Decimal("9.5")
+    if _is_limit_down:
+        score -= Decimal("15")
+        risk_flags.append("跌停板：无法卖出，信号不可操作，等待开板后再评估")
+    elif _is_limit_up:
+        score -= Decimal("8")
+        risk_flags.append("涨停板：无法买入，持有者可考虑是否止盈，追涨风险极高")
 
     if is_volatile_period:
         score -= Decimal("5")
@@ -821,6 +849,13 @@ def _build_decision_signal(
         if holding_return_pct <= Decimal("-10") and metrics.breakdown_below_prev30_low_pct >= Decimal("0.20"):
             score -= Decimal("5")
             risk_flags.append("浮亏较深且再破日内结构，减仓信号")
+        # Deep loss guard: when a position is down 30%+, ban all buy/add signals.
+        # For office workers, this prevents "averaging down into a falling knife."
+        if holding_return_pct <= Decimal("-30"):
+            score -= Decimal("15")
+            risk_flags.append(f"⚠️ 深套 {_format_percent(holding_return_pct)}：回本需涨 {_format_percent(abs(Decimal('100') * holding_return_pct / (Decimal('100') + holding_return_pct)))}，禁止补仓摊平")
+            rationale.append("深度套牢：只管理退出，不逆势补仓")
+
 
     # ── ACCOUNT RISK GUARDS (kept as-is, these are position sizing logic) ──
     score = max(Decimal("0"), min(score, Decimal("100")))
@@ -834,6 +869,24 @@ def _build_decision_signal(
     )
     rationale.extend(guard_rationales)
     risk_flags.extend(guard_risk_flags)
+
+    # ── MARKET CRASH GUARD ──
+    # When the broader market is in freefall, all buy/hold signals are suppressed.
+    # For office workers who can't monitor intraday, this prevents buying into crashes.
+    market_crash = (
+        (metrics.benchmark_change_pct <= Decimal("-2.00") and metrics.market_advance_ratio <= Decimal("0.35"))
+        or metrics.benchmark_change_pct <= Decimal("-3.50")
+        or metrics.market_advance_ratio <= Decimal("0.20")
+    )
+    if market_crash and action in ("buy", "hold"):
+        prev_action = action
+        action = "avoid"
+        risk_flags.append(
+            f"⚠️ 大盘暴跌（基准 {_format_percent(metrics.benchmark_change_pct)}，上涨占比 {_format_percent(metrics.market_advance_ratio * 100)}），"
+            f"覆巢之下无完卵，{prev_action} 信号被强制降级为观望"
+        )
+        rationale.append("大盘系统性风险：暴跌日不接飞刀")
+
     trade_advice, trade_size_hint, entry_note = _trade_plan(
         action,
         score,

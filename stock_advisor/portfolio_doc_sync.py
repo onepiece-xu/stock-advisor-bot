@@ -139,7 +139,7 @@ def _should_skip_sync(
 
     if incoming_date == current_date:
         if current_snapshot == incoming_snapshot:
-            return False
+            return True  # identical content — skip (avoid no-op write + notification spam)
         if not allow_equal_date_overwrite:
             return True
 

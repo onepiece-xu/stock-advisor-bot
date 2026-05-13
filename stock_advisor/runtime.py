@@ -4,13 +4,14 @@ import time
 from collections import defaultdict
 from datetime import date, datetime, timedelta
 from decimal import Decimal
+from pathlib import Path
 
 
 from .analysis import analyze_quotes
 from .briefing import format_mobile_signal
 from .config import AppConfig
 from .habit_learning import build_trading_habit_profile
-from .market_hours import MARKET_TZ, is_a_share_trading_time, is_auction_period, is_high_volatility_period
+from .market_hours import MARKET_TZ, is_a_share_trading_time, is_auction_period, is_high_volatility_period, is_opening_grace_period, next_session_str, seconds_until_next_session
 from .models import StockQuote
 from .logging_utils import get_logger
 from .news import fetch_announcements_for_code
@@ -19,8 +20,9 @@ from .portfolio import compute_cash_ratio, compute_position_ratio, find_holding,
 from .portfolio_doc_sync import sync_snapshot_from_doc
 from .providers import EastmoneyMarketSnapshotProvider, EastmoneyMinuteHistoryProvider, TencentQuoteProvider
 from .review import already_sent_close_review, build_close_review, mark_close_review_sent, should_send_close_review_now
+from .stop_loss import compute_effective_stop
 from .storage import cache_quotes, connect_db, load_recent_quotes, persist_observation
-from .trading_plan import detect_trigger_hit, load_snapshot as load_trade_snapshot, load_triggers, render_trade_instruction
+from .trading_plan import build_risk_context, detect_trigger_hit, load_snapshot as load_trade_snapshot, load_triggers, render_trade_instruction
 
 
 logger = get_logger(__name__)
@@ -46,8 +48,11 @@ class MonitorRuntime:
     def run_once(self) -> None:
         self._prune_notifications()
         self._sync_portfolio_snapshot_if_needed()
+        # Pre-market briefing must be checked BEFORE the trading-session guard,
+        # because auction period (9:25-9:30) IS trading time.  Previously it was
+        # only called when NOT trading, so it could never fire.
+        self._maybe_send_pre_market_briefing()
         if self.config.monitor.schedule.restrict_to_trading_session and not is_a_share_trading_time():
-            self._maybe_send_pre_market_briefing()
             self._maybe_send_close_review()
             logger.info("skip: outside A-share trading session")
             return
@@ -75,6 +80,8 @@ class MonitorRuntime:
             quote = bucket[-1]
 
             holding = find_holding(portfolio_snapshot, stock.code)
+            if holding is not None and holding.quantity <= 0:
+                continue
             prev_peak = self.price_high_marks.get(stock.code, quote.current_price)
             if quote.current_price > prev_peak:
                 self.price_high_marks[stock.code] = quote.current_price
@@ -101,7 +108,15 @@ class MonitorRuntime:
 
             trigger_message = self._build_trigger_message(quote)
             if trigger_message:
-                pending_notifications.append((stock.symbol + ':trigger', f"{quote.code} {quote.name} 触发交易区间", trigger_message))
+                # Secondary confirmation: if scoring engine says "avoid",
+                # suppress trigger notification (e.g. crash day, deep loss, etc.)
+                if result.decision.action == "avoid":
+                    logger.warning(
+                        "Trigger hit suppressed by scoring engine: %s %s (score=%s, action=%s)",
+                        quote.code, quote.name, result.decision.score, result.decision.action,
+                    )
+                else:
+                    pending_notifications.append((stock.symbol + ':trigger', f"{quote.code} {quote.name} 触发交易区间", trigger_message))
                 continue
 
             dedup_body = f"{result.decision.action}:{int(result.decision.score) // 10}"
@@ -120,6 +135,19 @@ class MonitorRuntime:
         while True:
             time.sleep(self.config.monitor.schedule.fixed_delay_seconds)
             self._run_guarded_once("loop")
+            # After close review is done, sleep until next trading session
+            try:
+                if not is_a_share_trading_time() and already_sent_close_review(
+                    self.config, datetime.now(MARKET_TZ).date()
+                ):
+                    sleep_sec = seconds_until_next_session()
+                    logger.info(
+                        "Close review sent, sleeping until next session (%s seconds)",
+                        sleep_sec,
+                    )
+                    time.sleep(sleep_sec)
+            except Exception:
+                pass  # Non-critical — don't crash the daemon for missing config
 
     def _run_guarded_once(self, phase: str) -> None:
         try:
@@ -173,10 +201,23 @@ class MonitorRuntime:
         if self.config.monitor.notification.feishu.delivery_mode == "webhook" and not self.config.monitor.notification.feishu.webhook_url:
             return False
         action = result.decision.action
+        # Mute low-confidence neutral zone signals: score 45-55 with low confidence
+        # are noise that distracts office workers without actionable value.
+        confidence = result.decision.confidence
+        score = result.decision.score
+        if confidence == "low" and Decimal("45") <= score <= Decimal("55") and action in ("hold", "avoid"):
+            return False
         if action == "buy":
             return True
         has_position = holding is not None and holding.quantity > 0
-        return action in ("reduce", "avoid") and has_position
+        if action in ("reduce", "avoid") and has_position:
+            # Opening grace period (9:30-9:45): mute all reduce/avoid signals.
+            # Minute-level MA signals are extremely unreliable right after open;
+            # the first 15 minutes are pure noise.  Let the market settle first.
+            if is_opening_grace_period():
+                return False
+            return True
+        return False
 
     def _notify_batch(self, notifications: list[tuple[str, str, str]]) -> None:
         if not notifications:
@@ -311,30 +352,22 @@ class MonitorRuntime:
             key: value for key, value in self.last_notifications.items() if value[1] > cutoff
         }
 
-    def _compute_effective_stop(self, quote: StockQuote, holding) -> tuple[Decimal, str] | None:
+    def _compute_effective_stop(self, quote: StockQuote, holding) -> tuple[Decimal, str, str] | None:
         if holding is None or holding.cost_price <= 0 or holding.quantity <= 0:
             return None
-        stop_pct = Decimal(str(self.config.monitor.stop_loss_pct))
-        fixed_stop = (holding.cost_price * (1 - stop_pct / 100)).quantize(Decimal("0.001"))
         peak = self.price_high_marks.get(quote.code, quote.current_price)
-        float_pct = ((peak - holding.cost_price) / holding.cost_price * 100).quantize(Decimal("0.01"))
-        if float_pct >= Decimal("10"):
-            trailing = (peak * Decimal("0.97")).quantize(Decimal("0.001"))
-            effective_stop = max(fixed_stop, trailing)
-            stop_label = f"尾随止损（峰值 {peak}，回撤 3%）"
-        elif float_pct >= Decimal("5"):
-            effective_stop = max(fixed_stop, holding.cost_price)
-            stop_label = "保本止损（浮盈已超 5%，止损线移至成本）"
-        else:
-            effective_stop = fixed_stop
-            stop_label = f"固定止损 -{stop_pct}%"
-        return effective_stop, stop_label
+        return compute_effective_stop(
+            cost_price=holding.cost_price,
+            current_price=quote.current_price,
+            peak_price=peak,
+            stop_loss_pct=self.config.monitor.stop_loss_pct,
+        )
 
     def _check_stop_loss(self, quote: StockQuote, holding) -> str | None:
         computed = self._compute_effective_stop(quote, holding)
         if computed is None:
             return None
-        effective_stop, stop_label = computed
+        effective_stop, stop_label, _distance = computed
         if quote.current_price > effective_stop:
             return None
         pnl_pct = ((quote.current_price - holding.cost_price) / holding.cost_price * 100).quantize(Decimal("0.01"))
@@ -349,11 +382,8 @@ class MonitorRuntime:
         computed = self._compute_effective_stop(quote, holding)
         if computed is None:
             return None
-        effective_stop, stop_label = computed
-        if quote.current_price <= effective_stop:
-            return None
-        distance_pct = ((quote.current_price - effective_stop) / effective_stop * 100).quantize(Decimal("0.01"))
-        if distance_pct > Decimal("2"):
+        effective_stop, stop_label, distance_pct = computed
+        if distance_pct <= 0 or distance_pct > Decimal("2"):
             return None
         pnl_pct = ((quote.current_price - holding.cost_price) / holding.cost_price * 100).quantize(Decimal("0.01"))
         return (
@@ -367,7 +397,8 @@ class MonitorRuntime:
         if not self.config.snapshot_path.exists():
             return None
         snapshot = load_trade_snapshot(self.config.snapshot_path)
-        hit = detect_trigger_hit(quote, snapshot, self.trade_triggers)
+        risk = build_risk_context(quote)
+        hit = detect_trigger_hit(quote, snapshot, self.trade_triggers, risk=risk)
         if hit is None:
             return None
         return render_trade_instruction(hit, snapshot)
@@ -403,18 +434,88 @@ class MonitorRuntime:
         if today in self._pre_market_sent_dates:
             return
         lines = [f"【盘前简报】{today.strftime('%Y-%m-%d')} 集合竞价（09:25-09:30）"]
+        snapshot = self._load_portfolio_snapshot()
+
+        # ── 1. 大盘风向 ──
+        try:
+            benchmark = self.config.monitor.benchmark
+            if benchmark:
+                tencent = TencentQuoteProvider(self.config.monitor)
+                bq = tencent.fetch_quote(benchmark)
+                direction = "偏强" if bq.change_percent >= 0 else "偏弱"
+                lines.append(f"\n大盘风向：{bq.name} {bq.current_price}（{bq.change_percent:+.2f}%）{direction}")
+        except Exception as exc:
+            logger.warning("Pre-market benchmark fetch failed error=%s", exc)
+
+        # ── 2. 持仓个股竞价数据 + 今日关键价位 ──
+        if snapshot:
+            lines.append("\n【持仓竞价】")
+            tencent = TencentQuoteProvider(self.config.monitor)
+            stop_pct = self.config.monitor.stop_loss_pct
+            for holding in snapshot.holdings:
+                if holding.quantity <= 0:
+                    continue
+                try:
+                    stock_ref = next(
+                        (s for s in self.config.monitor.stocks if s.code == holding.code), None
+                    )
+                    if stock_ref is None:
+                        continue
+                    q = tencent.fetch_quote(stock_ref)
+                    pnl = ((q.current_price - holding.cost_price) / holding.cost_price * 100) if holding.cost_price > 0 else 0
+                    pnl_str = f"{pnl:+.1f}%"
+                    market_val = q.current_price * holding.quantity
+                    lines.append(
+                        f"- {q.name}({holding.code})：竞价 {q.current_price}（{q.change_percent:+.2f}%）"
+                        f" | 市值 {market_val:.0f}"
+                        f" | 持仓盈亏 {pnl_str}"
+                    )
+                    # Key levels
+                    eff_stop, stop_label, _ = compute_effective_stop(
+                        cost_price=holding.cost_price,
+                        current_price=q.current_price,
+                        stop_loss_pct=stop_pct,
+                    )
+                    cost_to_now = ((q.current_price - holding.cost_price) / holding.cost_price * 100) if holding.cost_price > 0 else 0
+                    if cost_to_now >= 5:
+                        lines.append(f"  > 浮盈 {pnl_str}，关注止盈位 {(holding.cost_price * Decimal('1.15')).quantize(Decimal('0.01'))}")
+                    elif cost_to_now <= -5:
+                        lines.append(f"  > 浮亏 {pnl_str}，成本线 {holding.cost_price} 为减仓参考")
+                    lines.append(f"  > {stop_label}：{eff_stop}")
+                except Exception as exc:
+                    logger.warning("Pre-market quote fetch failed code=%s error=%s", holding.code, exc)
+
+        # ── 3. 今日触发单状态 ──
+        try:
+            triggers = self.trade_triggers if self.trade_triggers else []
+            if triggers and snapshot:
+                active_codes = {h.code for h in snapshot.holdings if h.quantity > 0}
+                active_triggers = [t for t in triggers if t.code in active_codes]
+                if active_triggers:
+                    lines.append("\n【今日触发单】")
+                    for t in active_triggers:
+                        lines.append(
+                            f"- {t.name}：{t.action} {t.quantity}股 "
+                            f"@ {t.price_min}-{t.price_max}"
+                            f"（回落 {t.fallback_price}）"
+                        )
+        except Exception:
+            pass
+
+        # ── 4. 热点板块 ──
         try:
             industry_boards = self.market_snapshot.fetch_sector_boards(kind="industry", limit=3)
             concept_boards = self.market_snapshot.fetch_sector_boards(kind="concept", limit=3)
             all_boards = industry_boards + concept_boards
             if all_boards:
-                lines.append("")
-                lines.append("热点板块:")
+                lines.append("\n【热点板块】")
                 for board in all_boards:
                     leader_part = f" 龙头: {board['leader_name']}({board['leader_code']}) {board['leader_change_percent']:+.2f}%" if board.get("leader_name") else ""
                     lines.append(f"- {board['name']} {board.get('change_percent', 0):+.2f}%{leader_part}")
-        except Exception as exc:  # noqa: BLE001
+        except Exception as exc:
             logger.warning("Pre-market sector boards fetch failed error=%s", exc)
+
+        # ── 5. 近期公告 ──
         try:
             ann_lines: list[str] = []
             for stock in self.config.monitor.stocks:
@@ -422,13 +523,97 @@ class MonitorRuntime:
                 for ann in anns:
                     ann_lines.append(f"- [{stock.code}] {ann.title} | {ann.published_at}")
             if ann_lines:
-                lines.append("")
-                lines.append("近期公告:")
+                lines.append("\n【近期公告】")
                 lines.extend(ann_lines)
-        except Exception as exc:  # noqa: BLE001
+        except Exception as exc:
             logger.warning("Pre-market announcements fetch failed error=%s", exc)
-        lines.append("")
-        lines.append("仅供参考，不构成投资建议")
+
+        # ── 6. 现金仓位提示 ＋ 今日速判 ──
+        if snapshot and snapshot.total_assets > 0:
+            cash_pct = (snapshot.cash / snapshot.total_assets * 100)
+            lines.append(f"\n【账户总览】")
+            lines.append(f"总资产 {snapshot.total_assets:.0f} | 现金 {snapshot.cash:.0f}（{cash_pct:.0f}%）")
+            if cash_pct > 70:
+                lines.append("⚠️ 现金占比偏高，可关注今日是否出现入场机会（但需满足大盘不暴跌+个股评分到位）")
+
+        # ── 7. 今日速判（一句话操作建议）──
+        quick_verdicts: list[str] = []
+        if snapshot:
+            try:
+                for holding in snapshot.holdings:
+                    if holding.quantity <= 0:
+                        continue
+                    pnl = ((holding.current_price - holding.cost_price) / holding.cost_price * 100) if holding.cost_price > 0 else 0
+                    # Check if price is near any trigger range
+                    trigger_near = False
+                    for t in self.trade_triggers.values():
+                        if t.code == holding.code:
+                            dist = min(
+                                abs(holding.current_price - t.price_min),
+                                abs(holding.current_price - t.price_max),
+                            )
+                            if dist <= (t.price_max - t.price_min) * Decimal("2"):
+                                trigger_near = True
+                            break
+                    if pnl <= -30:
+                        verdict = "❌ 深套，只减不补"
+                    elif trigger_near:
+                        verdict = "⚡ 接近触发单，关注"
+                    elif pnl >= 8:
+                        verdict = "🟢 浮盈充足，可持有或止盈"
+                    elif pnl >= 0:
+                        verdict = "🟡 小幅浮盈，持有观望"
+                    else:
+                        verdict = "🟡 浮亏中，等反弹减仓"
+                    quick_verdicts.append(f"- {holding.name}：{verdict}")
+                if quick_verdicts:
+                    lines.append("\n【今日速判】")
+                    lines.extend(quick_verdicts)
+            except Exception:
+                pass
+
+        # ── 8. LLM 决策解读（AI 浓缩）──
+        try:
+            from .llm_analyst import generate_briefing_verdict
+            llm_data: list[dict] = []
+            if snapshot:
+                for h in snapshot.holdings:
+                    if h.quantity <= 0:
+                        continue
+                    eff_stop, stop_label, _ = compute_effective_stop(
+                        cost_price=h.cost_price,
+                        current_price=h.current_price,
+                        stop_loss_pct=self.config.monitor.stop_loss_pct,
+                    )
+                    trigger_note = ""
+                    for t in self.trade_triggers.values():
+                        if t.code == h.code:
+                            trigger_note = f"触发单：{t.action}@{t.price_min}-{t.price_max}"
+                            break
+                    llm_data.append({
+                        "name": h.name, "code": h.code, "quantity": h.quantity,
+                        "cost_price": float(h.cost_price), "current_price": float(h.current_price),
+                        "pnl_pct": float((h.current_price - h.cost_price) / h.cost_price * 100) if h.cost_price > 0 else 0,
+                        "stop_price": str(eff_stop), "trigger_note": trigger_note,
+                    })
+            if llm_data:
+                cash_ratio = float(snapshot.cash / snapshot.total_assets * 100) if snapshot and snapshot.total_assets > 0 else 0
+                verdict = generate_briefing_verdict(
+                    llm_data, market_wind="", cash_pct=cash_ratio, today=today.isoformat(),
+                )
+                if verdict:
+                    lines.append("\n【AI 决策解读】")
+                    lines.append(verdict)
+        except Exception:
+            pass
+
+        # Save briefing data for status command
+        try:
+            _save_pre_market_state(Path("data"), today, lines, snapshot)
+        except Exception:
+            pass
+
+        lines.append(f"\n下次开盘：{next_session_str()}")
         self._pre_market_sent_dates.add(today)
         if self.config.monitor.notification.feishu.enabled:
             try:
@@ -476,3 +661,28 @@ class MonitorRuntime:
         if self.config.monitor.provider == "eastmoney_minute":
             return EastmoneyMinuteHistoryProvider(self.config.monitor)
         return TencentQuoteProvider(self.config.monitor)
+
+
+def _save_pre_market_state(data_dir: Path, today: date, lines: list[str], snapshot) -> None:
+    """Save the pre-market briefing as JSON for Hermes to query."""
+    import json as _json
+    state_dir = data_dir / "briefing"
+    state_dir.mkdir(parents=True, exist_ok=True)
+    state = {
+        "date": today.isoformat(),
+        "generated_at": datetime.now(MARKET_TZ).isoformat(),
+        "summary": "\n".join(lines),
+    }
+    if snapshot:
+        state["holdings"] = [
+            {
+                "name": h.name,
+                "code": h.code,
+                "quantity": h.quantity,
+                "cost_price": float(h.cost_price),
+                "current_price": float(h.current_price),
+                "pnl_pct": float(((h.current_price - h.cost_price) / h.cost_price * 100) if h.cost_price > 0 else 0),
+            }
+            for h in snapshot.holdings if h.quantity > 0
+        ]
+    (state_dir / "latest.json").write_text(_json.dumps(state, ensure_ascii=False, indent=2))

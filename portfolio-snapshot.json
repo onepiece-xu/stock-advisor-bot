@@ -1,28 +1,28 @@
 {
-  "tradeDate": "2026-05-08",
-  "totalAssets": 47168.43,
-  "cash": 30850.43,
+  "tradeDate": "2026-05-12",
+  "totalAssets": 47311.76,
+  "cash": 34084.76,
   "holdings": [
     {
       "name": "中国卫通",
       "code": "601698",
       "quantity": 200,
-      "costPrice": 36.703,
-      "currentPrice": 38.0
+      "costPrice": 36.783,
+      "currentPrice": 38.90
     },
     {
-      "name": "洛阳钼业",
-      "code": "603993",
-      "quantity": 200,
-      "costPrice": 26.79,
-      "currentPrice": 19.68
+      "name": "中兴通讯",
+      "code": "000063",
+      "quantity": 100,
+      "costPrice": 39.039,
+      "currentPrice": 38.75
     },
     {
       "name": "南网能源",
       "code": "003035",
-      "quantity": 600,
-      "costPrice": 10.798,
-      "currentPrice": 7.97
+      "quantity": 200,
+      "costPrice": 16.735,
+      "currentPrice": 7.86
     }
   ]
 }

@@ -6,10 +6,17 @@ from pathlib import Path
 
 
 OUTBOX_PATH = Path(__file__).resolve().parent.parent / "data" / "codex_outbox.jsonl"
+MAX_MESSAGE_LENGTH = 8000  # Feishu text limit ~20KB; keep well under with headroom
 
 
 def queue_codex_notification(title: str, message: str) -> None:
     OUTBOX_PATH.parent.mkdir(parents=True, exist_ok=True)
+    if len(message) > MAX_MESSAGE_LENGTH:
+        message = message[:MAX_MESSAGE_LENGTH]
+        last_nl = message.rfind("\n", MAX_MESSAGE_LENGTH - 500)
+        if last_nl > MAX_MESSAGE_LENGTH // 2:
+            message = message[:last_nl]
+        message += "\n\n[消息过长已截断，完整内容见 daemon 日志]"
     payload = {
         "created_at": datetime.now().isoformat(timespec="seconds"),
         "title": title,

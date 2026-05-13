@@ -317,12 +317,21 @@ class EastmoneyMinuteHistoryProvider:
                 day_low = low_price
                 day_volume = Decimal("0")
                 day_turnover = Decimal("0")
+                prev_close = day_open  # trends API lacks prev close; use open as approximation
             else:
                 day_high = max(day_high, high_price)
                 day_low = min(day_low, low_price)
 
             day_volume += minute_volume_shares
             day_turnover += minute_turnover
+
+            # Compute change from approximated previous close
+            if prev_close > 0:
+                change_amount = current_price - prev_close
+                change_pct = ((change_amount / prev_close) * Decimal("100")).quantize(Decimal("0.01"))
+            else:
+                change_amount = Decimal("0")
+                change_pct = Decimal("0")
 
             quotes.append(
                 StockQuote(
@@ -332,11 +341,11 @@ class EastmoneyMinuteHistoryProvider:
                     name=name,
                     current_price=current_price,
                     open_price=day_open,
-                    previous_close=current_price,
+                    previous_close=prev_close,
                     high_price=day_high,
                     low_price=day_low,
-                    change_amount=Decimal("0"),
-                    change_percent=Decimal("0"),
+                    change_amount=change_amount,
+                    change_percent=change_pct,
                     volume_shares=day_volume.quantize(Decimal("1"), rounding=ROUND_HALF_UP),
                     turnover_yuan=day_turnover.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP),
                     quote_time=quote_time,
@@ -359,6 +368,14 @@ class EastmoneyMarketSnapshotProvider:
             }
         )
 
+    @staticmethod
+    def _safe_float(value) -> float:
+        """Convert a value to float, treating '-' and other non-numeric strings as 0."""
+        try:
+            return float(value)
+        except (ValueError, TypeError):
+            return 0.0
+
     def fetch_market_breadth(self) -> dict:
         rows = self._fetch_clist_all(
             fs="m:0+t:6,m:0+t:13,m:1+t:2,m:1+t:23",
@@ -367,9 +384,9 @@ class EastmoneyMarketSnapshotProvider:
             sort_field="f12",
             descending=False,
         )
-        up_count = sum(1 for item in rows if item.get("f3") is not None and float(item["f3"]) > 0)
-        flat_count = sum(1 for item in rows if item.get("f3") is not None and float(item["f3"]) == 0)
-        down_count = sum(1 for item in rows if item.get("f3") is not None and float(item["f3"]) < 0)
+        up_count = sum(1 for item in rows if item.get("f3") is not None and self._safe_float(item["f3"]) > 0)
+        flat_count = sum(1 for item in rows if item.get("f3") is not None and self._safe_float(item["f3"]) == 0)
+        down_count = sum(1 for item in rows if item.get("f3") is not None and self._safe_float(item["f3"]) < 0)
         return {
             "generated_at": datetime.now().strftime("%Y-%m-%d %H:%M"),
             "up_count": up_count,
@@ -389,9 +406,9 @@ class EastmoneyMarketSnapshotProvider:
             {
                 "code": str(item.get("f12", "")),
                 "name": str(item.get("f14", "")),
-                "current_price": float(item.get("f2", 0) or 0),
-                "change_percent": float(item.get("f3", 0) or 0),
-                "turnover_yi": float(item.get("f6", 0) or 0) / 100000000,
+                "current_price": self._safe_float(item.get("f2", 0)),
+                "change_percent": self._safe_float(item.get("f3", 0)),
+                "turnover_yi": self._safe_float(item.get("f6", 0)) / 100000000,
                 "industry_name": str(item.get("f100", "") or ""),
                 "concept_name": str(item.get("f102", "") or ""),
             }
@@ -417,13 +434,13 @@ class EastmoneyMarketSnapshotProvider:
             {
                 "code": str(item.get("f12", "")),
                 "name": str(item.get("f14", "")),
-                "change_percent": float(item.get("f3", 0) or 0),
-                "turnover_yi": float(item.get("f6", 0) or 0) / 100000000,
+                "change_percent": self._safe_float(item.get("f3", 0)),
+                "turnover_yi": self._safe_float(item.get("f6", 0)) / 100000000,
                 "up_count": int(item.get("f104", 0) or 0),
                 "down_count": int(item.get("f105", 0) or 0),
                 "leader_name": str(item.get("f128", "") or ""),
                 "leader_code": str(item.get("f140", "") or ""),
-                "leader_change_percent": float(item.get("f136", 0) or 0),
+                "leader_change_percent": self._safe_float(item.get("f136", 0)),
             }
             for item in rows
         ]

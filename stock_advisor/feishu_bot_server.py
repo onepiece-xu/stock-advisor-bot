@@ -32,6 +32,7 @@ from .logging_utils import get_logger
 from .market_hours import is_high_volatility_period
 from .market_overview import build_market_overview, render_market_overview
 from .models import StockQuote, StockRef
+from .shared_helpers import build_provider, load_market_context, load_stock_history, parse_history_datetime
 from .portfolio import compute_cash_ratio, compute_position_ratio, find_holding, load_snapshot as load_portfolio_snapshot
 from .providers import EastmoneyMarketSnapshotProvider, EastmoneyMinuteHistoryProvider, TencentQuoteProvider
 from .review import build_close_review
@@ -271,12 +272,12 @@ def _render_latest_quote(items: list[dict], query: str) -> str:
 
 def _scan_live_symbol(config: AppConfig, query: str) -> str:
     stock = _resolve_stock_ref(config, query)
-    provider = _build_provider(config)
+    provider = build_provider(config)
     conn = connect_db(config.storage.sqlite_path)
-    history = _load_stock_history(config, conn, provider, stock)
+    history = load_stock_history(config, conn, provider, stock)
     if not history:
         raise RuntimeError(f"未拉到 {stock.code} 的实时窗口数据")
-    advance_ratio, rank_map, sector_boards = _fetch_market_context(config)
+    advance_ratio, rank_map, sector_boards = load_market_context(config)
     portfolio_snapshot = _load_portfolio_snapshot(config)
     holding = find_holding(portfolio_snapshot, stock.code)
     result = analyze_quotes(
@@ -426,14 +427,6 @@ def _chunk_text(text: str, limit: int = 1800) -> list[str]:
     return chunks or [text]
 
 
-def _parse_history_datetime(text: str) -> datetime:
-    normalized = text.strip()
-    for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M", "%Y-%m-%dT%H:%M:%S", "%Y-%m-%dT%H:%M"):
-        try:
-            return datetime.strptime(normalized, fmt)
-        except ValueError:
-            continue
-    raise RuntimeError(f"无法解析历史时点: {text}")
 
 
 def _extract_history_datetimes(args: list[str]) -> tuple[list[datetime], list[str]]:
@@ -441,13 +434,13 @@ def _extract_history_datetimes(args: list[str]) -> tuple[list[datetime], list[st
     remaining: list[str] = []
     index = 0
     while index < len(args):
-        one_token = _try_parse_history_datetime(args[index])
+        one_token = _tryparse_history_datetime(args[index])
         if one_token is not None:
             datetimes.append(one_token)
             index += 1
             continue
         if index + 1 < len(args):
-            two_tokens = _try_parse_history_datetime(f"{args[index]} {args[index + 1]}")
+            two_tokens = _tryparse_history_datetime(f"{args[index]} {args[index + 1]}")
             if two_tokens is not None:
                 datetimes.append(two_tokens)
                 index += 2
@@ -457,9 +450,9 @@ def _extract_history_datetimes(args: list[str]) -> tuple[list[datetime], list[st
     return datetimes, remaining
 
 
-def _try_parse_history_datetime(text: str) -> datetime | None:
+def _tryparse_history_datetime(text: str) -> datetime | None:
     try:
-        return _parse_history_datetime(text)
+        return parse_history_datetime(text)
     except RuntimeError:
         return None
 
@@ -475,22 +468,6 @@ def _parse_backtest_args(args: list[str]) -> tuple[int, list[str]]:
     return days, remaining
 
 
-def _fetch_market_context(config: AppConfig) -> tuple[Decimal, dict[str, int], list[dict]]:
-    advance_ratio = Decimal("0")
-    rank_map: dict[str, int] = {}
-    sector_boards: list[dict] = []
-    try:
-        provider = EastmoneyMarketSnapshotProvider(config.monitor)
-        breadth = provider.fetch_market_breadth()
-        total = breadth.get("up_count", 0) + breadth.get("flat_count", 0) + breadth.get("down_count", 0)
-        if total > 0:
-            advance_ratio = Decimal(str(breadth["up_count"])) / Decimal(str(total))
-        top_stocks = provider.fetch_top_stocks(limit=50)
-        rank_map = {item["code"]: idx + 1 for idx, item in enumerate(top_stocks)}
-        sector_boards = provider.fetch_sector_boards(kind="industry", limit=5) + provider.fetch_sector_boards(kind="concept", limit=5)
-    except Exception as exc:
-        logger.warning("_fetch_market_context failed error=%s", exc)
-    return advance_ratio, rank_map, sector_boards
 
 
 def _load_portfolio_snapshot(config: AppConfig):
@@ -503,7 +480,7 @@ def _load_benchmark_history(config: AppConfig) -> list[StockQuote] | None:
     benchmark = config.monitor.benchmark
     if benchmark is None:
         return None
-    provider = _build_provider(config)
+    provider = build_provider(config)
     if config.monitor.provider == "eastmoney_minute":
         return provider.fetch_recent_window(benchmark, config.monitor.history_size)
     try:
@@ -513,18 +490,5 @@ def _load_benchmark_history(config: AppConfig) -> list[StockQuote] | None:
         return None
 
 
-def _build_provider(config: AppConfig):
-    if config.monitor.provider == "eastmoney_minute":
-        return EastmoneyMinuteHistoryProvider(config.monitor)
-    return TencentQuoteProvider(config.monitor)
 
 
-def _load_stock_history(config: AppConfig, conn, provider, stock: StockRef) -> list[StockQuote]:
-    if config.monitor.provider == "eastmoney_minute":
-        history = provider.fetch_recent_window(stock, config.monitor.history_size)
-        if history:
-            cache_quotes(conn, history)
-        return history
-    history = load_recent_quotes(conn, stock.symbol, config.monitor.history_size - 1)
-    history.append(provider.fetch_quote(stock))
-    return history

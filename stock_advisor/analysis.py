@@ -974,24 +974,37 @@ def _build_decision_signal(
             risk_flags.append(f"⚠️ 深套 {_format_percent(holding_return_pct)}：回本需涨 {_format_percent(abs(Decimal('100') * holding_return_pct / (Decimal('100') + holding_return_pct)))}，禁止补仓摊平")
             rationale.append("深度套牢：只管理退出，不逆势补仓")
 
-    # ── 止盈检测 ──
+    # ── 止盈检测（强制降级） ──
+    # When a take-profit tier triggers, force the action downward.
+    # A half-point score adjustment is not enough — bullish daily signals
+    # (e.g., +24 for daily MA bull) can overwhelm -2/-5.  Force "reduce".
     if has_position and holding_return_pct is not None and monitor_config.take_profit_tiers:
         for tier in monitor_config.take_profit_tiers:
             if holding_return_pct >= Decimal(str(tier.profit_pct)):
-                sell_qty = int(portfolio_holding.quantity * Decimal(str(tier.sell_ratio)))
-                sell_qty = (sell_qty // 100) * 100 if sell_qty >= 100 else portfolio_holding.quantity
-                if tier.sell_ratio >= Decimal("1.0") or sell_qty >= portfolio_holding.quantity:
+                tier_sell_ratio = Decimal(str(tier.sell_ratio))
+                if tier_sell_ratio <= 0:
+                    # Warning tier only — no forced sell
+                    risk_flags.append(
+                        f"📢 {tier.label}：浮盈 {_format_percent(holding_return_pct)}≥{tier.profit_pct}%，"
+                        f"接近止盈区间，做好准备"
+                    )
+                    break
+                sell_qty = int(portfolio_holding.quantity * tier_sell_ratio)
+                sell_qty = (sell_qty // 100) * 100 if sell_qty >= 100 else max(sell_qty, 100)
+                if tier_sell_ratio >= Decimal("1.0") or sell_qty >= portfolio_holding.quantity:
                     risk_flags.append(
                         f"🎯 {tier.label}触发：浮盈 {_format_percent(holding_return_pct)}≥{tier.profit_pct}%，"
-                        f"建议全部清仓止盈，锁定利润"
+                        f"强制清仓止盈，锁定全部利润"
                     )
-                    score -= Decimal("5")  # Slightly reduce score to encourage selling
+                    score -= Decimal("20")  # Force score below buy/hold territory
+                    rationale.append(f"止盈纪律：{tier.label}触发，不贪最后一个铜板")
                 else:
                     risk_flags.append(
                         f"🎯 {tier.label}触发：浮盈 {_format_percent(holding_return_pct)}≥{tier.profit_pct}%，"
-                        f"建议卖出 {sell_qty} 股（{tier.sell_ratio*100:.0f}%）锁定部分利润"
+                        f"强制卖出 {sell_qty} 股（{tier.sell_ratio*100:.0f}%）锁定利润"
                     )
-                    score -= Decimal("2")
+                    score -= Decimal("12")
+                    rationale.append(f"止盈纪律：{tier.label}触发，先锁定 {tier.sell_ratio*100:.0f}% 利润落袋")
                 break  # Only trigger the highest tier
 
 
@@ -1037,6 +1050,22 @@ def _build_decision_signal(
             f"{prev_action} 信号被强制降级为观望，必须等缩量回踩MA10后再评估"
         )
         rationale.append("不追高纪律：涨超3%坚决不入场，等确认回踩支撑")
+
+    # ── STOP-PROFIT GUARD ──
+    # When a take-profit tier has been triggered (risk_flags already contain
+    # the tier message from scoring phase), force the action to "reduce".
+    # Score-based adjustment (-12/-20) is not enough — daily bull signals
+    # can push score back above buy threshold.
+    take_profit_triggered = any("🎯" in flag for flag in risk_flags)
+    if take_profit_triggered and action in ("buy", "hold", "avoid"):
+        is_full_sell = any("清仓" in flag for flag in risk_flags)
+        prev_action = action
+        if is_full_sell:
+            action = "reduce"  # reduce → sell all in _trade_plan context
+            rationale.append("止盈纪律强制：全仓止盈信号，不因日线多头而贪心")
+        else:
+            action = "reduce"
+            rationale.append("止盈纪律强制：分批止盈信号，先落袋为安")
 
     trade_advice, trade_size_hint, entry_note = _trade_plan(
         action,

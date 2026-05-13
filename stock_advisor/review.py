@@ -192,6 +192,8 @@ def _render_review_body(config: AppConfig, trade_date: date, items: list[dict], 
                 lines.append(f"- {t.code} {t.name}：{t.action} {t.quantity}股，区间 {t.price_min}-{t.price_max}，回落 {t.fallback_price}")
         lines.append("")
         lines.append("以上为辅助参考，不构成投资建议。请根据明日盘前实际情况做出决策。")
+        # Save structured plan record for next-day comparison
+        _save_plan_record(config.review.data_dir, trade_date, snapshot, triggers, item_map, config)
     except Exception:
         pass  # Non-critical
 
@@ -318,6 +320,95 @@ def _save_review(data_dir: Path, trade_date: date, body: str) -> Path:
     path = data_dir / f"{trade_date.isoformat()}-close-review.txt"
     path.write_text(body, encoding="utf-8")
     return path
+
+
+def _plan_record_path(data_dir: Path, trade_date: date) -> Path:
+    return data_dir / "portfolio" / f"plan-record-{trade_date.isoformat()}.json"
+
+
+def _save_plan_record(data_dir: Path, trade_date: date, snapshot, triggers, item_map, config) -> None:
+    """Save structured plan record for next-day comparison in pre-market briefing."""
+    from .trading_plan import TriggerInstruction
+
+    record_dir = data_dir / "portfolio"
+    record_dir.mkdir(parents=True, exist_ok=True)
+    holdings_data = []
+    for holding in snapshot.holdings:
+        if holding.quantity <= 0:
+            continue
+        item = item_map.get(holding.code, {})
+        current_price = Decimal(str(item.get("current_price", holding.current_price)))
+        pnl = _pnl_pct(holding.cost_price, current_price)
+        holdings_data.append({
+            "code": holding.code,
+            "name": holding.name,
+            "quantity": holding.quantity,
+            "cost_price": float(holding.cost_price),
+            "current_price": float(current_price),
+            "pnl_pct": float(pnl),
+            "planned_action": item.get("action", "hold"),
+            "planned_score": item.get("score"),
+        })
+    active_codes = {h["code"] for h in holdings_data}
+    triggers_data = []
+    for t in triggers:
+        if isinstance(t, TriggerInstruction):
+            triggers_data.append({
+                "code": t.code,
+                "name": getattr(t, "name", ""),
+                "action": t.action,
+                "quantity": t.quantity,
+                "price_min": float(t.price_min) if isinstance(t.price_min, Decimal) else t.price_min,
+                "price_max": float(t.price_max) if isinstance(t.price_max, Decimal) else t.price_max,
+                "fallback_price": float(t.fallback_price) if isinstance(t.fallback_price, Decimal) else t.fallback_price,
+                "is_orphan": t.code not in active_codes,
+            })
+        else:
+            code = getattr(t, "code", "unknown")
+            triggers_data.append({
+                "code": code,
+                "name": getattr(t, "name", ""),
+                "action": getattr(t, "action", ""),
+                "quantity": getattr(t, "quantity", 0),
+                "price_min": float(getattr(t, "price_min", 0)),
+                "price_max": float(getattr(t, "price_max", 0)),
+                "fallback_price": float(getattr(t, "fallback_price", 0)),
+                "is_orphan": code not in active_codes,
+            })
+    record = {
+        "plan_date": trade_date.isoformat(),
+        "generated_at": datetime.now(MARKET_TZ).isoformat(timespec="seconds"),
+        "holdings": holdings_data,
+        "triggers": triggers_data,
+    }
+    path = _plan_record_path(data_dir, trade_date)
+    path.write_text(json.dumps(record, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def load_plan_record(data_dir: Path, trade_date: date) -> dict | None:
+    """Load plan record for a given trade date. Returns None if not found."""
+    path = _plan_record_path(data_dir, trade_date)
+    if not path.exists():
+        return None
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except Exception as exc:
+        logger.warning("Failed to load plan record error=%s", exc)
+        return None
+
+
+def find_latest_plan_record(data_dir: Path) -> dict | None:
+    """Find the most recent plan record file."""
+    record_dir = data_dir / "portfolio"
+    if not record_dir.exists():
+        return None
+    files = sorted(record_dir.glob("plan-record-*.json"), reverse=True)
+    for f in files:
+        try:
+            return json.loads(f.read_text(encoding="utf-8"))
+        except Exception as exc:
+            logger.warning("Failed to load plan record %s error=%s", f.name, exc)
+    return None
 
 
 def _review_state_path(data_dir: Path) -> Path:

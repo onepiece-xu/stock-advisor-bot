@@ -14,12 +14,12 @@ from .habit_learning import build_trading_habit_profile
 from .market_hours import MARKET_TZ, is_a_share_trading_time, is_auction_period, is_high_volatility_period, is_opening_grace_period, next_session_str, seconds_until_next_session
 from .models import StockQuote
 from .logging_utils import get_logger
-from .news import fetch_announcements_for_code
+from .news import fetch_announcements_for_code, filter_new_announcements, format_announcement_line
 from .notify import deliver_feishu_message
 from .portfolio import compute_cash_ratio, compute_position_ratio, find_holding, generate_portfolio_report, load_snapshot as load_portfolio_snapshot
 from .portfolio_doc_sync import sync_snapshot_from_doc
 from .providers import EastmoneyMarketSnapshotProvider, EastmoneyMinuteHistoryProvider, TencentQuoteProvider
-from .review import already_sent_close_review, build_close_review, mark_close_review_sent, should_send_close_review_now
+from .review import already_sent_close_review, build_close_review, find_latest_plan_record, mark_close_review_sent, should_send_close_review_now
 from .stop_loss import compute_effective_stop
 from .storage import cache_quotes, connect_db, load_recent_quotes, persist_observation
 from .trading_plan import build_risk_context, detect_trigger_hit, load_snapshot as load_trade_snapshot, load_triggers, render_trade_instruction
@@ -453,6 +453,62 @@ class MonitorRuntime:
         except Exception as exc:
             logger.warning("Pre-market benchmark fetch failed error=%s", exc)
 
+        # ── 1.5 昨日计划对照 ──
+        try:
+            plan = find_latest_plan_record(self.config.review.data_dir)
+            if plan and plan.get("holdings"):
+                plan_date = plan.get("plan_date", "?")
+                lines.append(f"\n【昨日计划对照】{plan_date}")
+                # Build a quick lookup: code -> current auction price
+                current_prices: dict[str, Decimal] = {}
+                if snapshot:
+                    tencent = TencentQuoteProvider(self.config.monitor)
+                    for holding in snapshot.holdings:
+                        if holding.quantity <= 0:
+                            continue
+                        try:
+                            stock_ref = next(
+                                (s for s in self.config.monitor.stocks if s.code == holding.code), None
+                            )
+                            if stock_ref:
+                                q = tencent.fetch_quote(stock_ref)
+                                current_prices[holding.code] = q.current_price
+                        except Exception:
+                            pass
+                for h in plan["holdings"]:
+                    code = h.get("code", "")
+                    name = h.get("name", "")
+                    planned_action = h.get("planned_action", "hold")
+                    yesterday_price = h.get("current_price", 0)
+                    today_price = current_prices.get(code)
+                    planned_pnl = h.get("pnl_pct", 0)
+                    if today_price and yesterday_price > 0:
+                        overnight_chg = (float(today_price) - yesterday_price) / yesterday_price * 100
+                        chg_str = f"{overnight_chg:+.2f}%"
+                    else:
+                        chg_str = "N/A"
+                    # Determine if action was followed through
+                    price_str = f"{today_price}" if today_price else "?"
+                    # Map planned action to status emoji
+                    action_emoji = {"buy": "🟢", "hold": "🟡", "reduce": "🔴", "avoid": "⛔"}.get(planned_action, "⚪")
+                    lines.append(
+                        f"  {action_emoji} {name}({code})："
+                        f"昨收 {yesterday_price:.2f} | 今竞价 {price_str}（{chg_str}）"
+                        f" | 昨建议 {planned_action}"
+                    )
+                    # Show trigger check for this stock
+                    for t in plan.get("triggers", []):
+                        if t.get("code") == code and not t.get("is_orphan"):
+                            t_min = t.get("price_min", 0)
+                            t_max = t.get("price_max", 0)
+                            if today_price and t_min and t_max:
+                                if t_min <= float(today_price) <= t_max:
+                                    lines.append(f"    ⚡ 昨触发单区间 {t_min}-{t_max}，今竞价 {today_price} 已进入触发区！")
+                                elif abs(float(today_price) - t_min) <= abs(t_min * 0.05):
+                                    lines.append(f"    👀 昨触发单区间 {t_min}-{t_max}，今竞价 {today_price} 接近触发区")
+        except Exception as exc:
+            logger.warning("Plan comparison section failed error=%s", exc)
+
         # ── 2. 持仓个股竞价数据 + 今日关键价位 ──
         if snapshot:
             lines.append("\n【持仓竞价】")
@@ -531,13 +587,14 @@ class MonitorRuntime:
         except Exception as exc:
             logger.warning("Pre-market sector boards fetch failed error=%s", exc)
 
-        # ── 5. 近期公告 ──
+        # ── 5. 近期公告（仅显示新公告，重要公告标 ⚠️）──
         try:
             ann_lines: list[str] = []
             for stock in self.config.monitor.stocks:
-                anns = fetch_announcements_for_code(stock.code, limit=2)
+                anns = fetch_announcements_for_code(stock.code, limit=3)
+                anns = filter_new_announcements(anns)
                 for ann in anns:
-                    ann_lines.append(f"- [{stock.code}] {ann.title} | {ann.published_at}")
+                    ann_lines.append(f"[{stock.code}] {format_announcement_line(ann)}")
             if ann_lines:
                 lines.append("\n【近期公告】")
                 lines.extend(ann_lines)

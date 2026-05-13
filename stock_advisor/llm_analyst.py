@@ -20,7 +20,7 @@ logger = logging.getLogger(__name__)
 
 DEEPSEEK_API_KEY = "sk-6071217d15f44505b3db5f13d635ce42"
 DEEPSEEK_BASE_URL = "https://api.deepseek.com"
-DEEPSEEK_MODEL = "deepseek-chat"
+DEEPSEEK_MODEL = "deepseek-v4-flash"
 REQUEST_TIMEOUT = 15
 
 STRATEGIES_DIR = Path(__file__).parent.parent / "strategies"

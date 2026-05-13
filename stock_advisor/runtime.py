@@ -439,7 +439,7 @@ class MonitorRuntime:
         today = datetime.now(MARKET_TZ).date()
         if today in self._pre_market_sent_dates:
             return
-        lines = [f"【盘前简报】{today.strftime('%Y-%m-%d')} 集合竞价（09:25-09:30）"]
+        lines = [f"📊 {today.strftime('%m/%d')} 盘前"]
         snapshot = self._load_portfolio_snapshot()
 
         # ── 1. 大盘风向 ──
@@ -526,24 +526,15 @@ class MonitorRuntime:
                     q = tencent.fetch_quote(stock_ref)
                     pnl = ((q.current_price - holding.cost_price) / holding.cost_price * 100) if holding.cost_price > 0 else 0
                     pnl_str = f"{pnl:+.1f}%"
-                    market_val = q.current_price * holding.quantity
-                    lines.append(
-                        f"- {q.name}({holding.code})：竞价 {q.current_price}（{q.change_percent:+.2f}%）"
-                        f" | 市值 {market_val:.0f}"
-                        f" | 持仓盈亏 {pnl_str}"
-                    )
-                    # Key levels
                     eff_stop, stop_label, _ = compute_effective_stop(
                         cost_price=holding.cost_price,
                         current_price=q.current_price,
                         stop_loss_pct=stop_pct,
                     )
-                    cost_to_now = ((q.current_price - holding.cost_price) / holding.cost_price * 100) if holding.cost_price > 0 else 0
-                    if cost_to_now >= 5:
-                        lines.append(f"  > 浮盈 {pnl_str}，关注止盈位 {(holding.cost_price * Decimal('1.15')).quantize(Decimal('0.01'))}")
-                    elif cost_to_now <= -5:
-                        lines.append(f"  > 浮亏 {pnl_str}，成本线 {holding.cost_price} 为减仓参考")
-                    lines.append(f"  > {stop_label}：{eff_stop}")
+                    lines.append(
+                        f"- {q.name} {q.current_price}（{q.change_percent:+.2f}%）"
+                        f" | 盈亏{pnl_str} | {stop_label}{eff_stop}"
+                    )
                 except Exception as exc:
                     logger.warning("Pre-market quote fetch failed code=%s error=%s", holding.code, exc)
 
@@ -564,30 +555,8 @@ class MonitorRuntime:
         except Exception:
             pass
 
-        # ── 4. 板块轮动热力图 ──
-        try:
-            industry_boards = self.market_snapshot.fetch_sector_boards(kind="industry", limit=5)
-            concept_boards = self.market_snapshot.fetch_sector_boards(kind="concept", limit=5)
-            all_boards = sorted(
-                industry_boards + concept_boards,
-                key=lambda b: abs(b.get("change_percent", 0)),
-                reverse=True,
-            )
-            if all_boards:
-                lines.append("\n【板块轮动热力图】")
-                # Rank by absolute change (hottest/coldest first)
-                for i, board in enumerate(all_boards[:8], 1):
-                    chg = board.get("change_percent", 0)
-                    heat = "🔥" if chg >= 2 else "🟢" if chg >= 0.5 else "🟡" if chg >= -0.5 else "🔴"
-                    leader_part = (
-                        f" 龙头:{board['leader_name']}({board['leader_code']}){board.get('leader_change_percent', 0):+.1f}%"
-                        if board.get("leader_name") else ""
-                    )
-                    lines.append(f"{heat} {board['name']} {chg:+.2f}%{leader_part}")
-        except Exception as exc:
-            logger.warning("Pre-market sector boards fetch failed error=%s", exc)
-
-        # ── 5. 近期公告（仅显示新公告，重要公告标 ⚠️）──
+        # ── 4. 板块轮动热力图 ── (REMOVED — office worker doesn't need sector heatmap)
+        # ── 5. 近期公告 ──
         try:
             ann_lines: list[str] = []
             for stock in self.config.monitor.stocks:
@@ -606,8 +575,36 @@ class MonitorRuntime:
             cash_pct = (snapshot.cash / snapshot.total_assets * 100)
             lines.append(f"\n【账户总览】")
             lines.append(f"总资产 {snapshot.total_assets:.0f} | 现金 {snapshot.cash:.0f}（{cash_pct:.0f}%）")
-            if cash_pct > 70:
-                lines.append("⚠️ 现金占比偏高，可关注今日是否出现入场机会（但需满足大盘不暴跌+个股评分到位）")
+            if cash_pct > 60:
+                # ── 现金部署评估 ──
+                can_deploy = True
+                deploy_blockers: list[str] = []
+                benchmark_ok = True
+                try:
+                    benchmark = self.config.monitor.benchmark
+                    if benchmark:
+                        tencent = TencentQuoteProvider(self.config.monitor)
+                        bq = tencent.fetch_quote(benchmark)
+                        if bq.change_percent <= -1.5:
+                            can_deploy = False
+                            benchmark_ok = False
+                            deploy_blockers.append(f"大盘 {bq.change_percent:+.2f}% 偏弱，不急于入场")
+                        elif bq.change_percent <= -0.5:
+                            deploy_blockers.append(f"大盘 {bq.change_percent:+.2f}% 略弱，仓位不宜过重")
+                    snapshot_ratio = (snapshot.cash / snapshot.total_assets * 100)
+                except Exception:
+                    deploy_blockers.append("大盘数据获取失败")
+                    benchmark_ok = False
+
+                lines.append(f"\\n【现金部署评估】现金 {snapshot.cash:.0f}（{cash_pct:.0f}%）")
+                if can_deploy:
+                    lines.append("✅ 大盘环境尚可，现金充裕，可关注今日入场机会")
+                    lines.append("  首选：现有浮盈持仓加仓 > 已清仓旧标的接回 > 全新标的试仓")
+                    lines.append("  纪律：单次不超过总资产 10%，涨超 3% 不追，等回踩 MA10")
+                else:
+                    lines.append(f"🚫 暂不建议入场：{'；'.join(deploy_blockers)}")
+                if deploy_blockers:
+                    lines.append(f"  {'；'.join(deploy_blockers)}")
 
         # ── 7. 今日速判（一句话操作建议）──
         quick_verdicts: list[str] = []

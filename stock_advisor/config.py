@@ -88,6 +88,14 @@ class TakeProfitTier:
 
 
 @dataclass(slots=True)
+class PositionTierConfig:
+    """仓位分级：试探仓/标准仓/确信仓"""
+    score_min: float
+    pct_of_assets: float
+    label: str
+
+
+@dataclass(slots=True)
 class MonitorConfig:
     provider: str
     stocks: list[StockRef]
@@ -102,6 +110,7 @@ class MonitorConfig:
     stop_loss_pct: float
     position_pct_per_trade: float
     take_profit_tiers: list[TakeProfitTier]
+    position_tiers: list[PositionTierConfig]
 
 
 @dataclass(slots=True)
@@ -219,6 +228,7 @@ def load_config(path: str | Path) -> AppConfig:
                 )
                 for t in monitor_raw.get("signal", {}).get("take_profit_tiers", [])
             ],
+            position_tiers=_parse_position_tiers(monitor_raw.get("signal", {}).get("position_tiers", {})),
             notification=NotificationConfig(
                 notify_on_neutral=bool(notification_raw.get("notify_on_neutral", False)),
                 dedup=DedupConfig(
@@ -259,6 +269,25 @@ def load_config(path: str | Path) -> AppConfig:
             allowed_chat_ids=[str(item) for item in bot_raw.get("allowed_chat_ids", [])],
         ),
     )
+
+
+def _parse_position_tiers(raw: dict) -> list[PositionTierConfig]:
+    """Parse position_tiers from config dict. Defaults to safe 3-tier."""
+    if not raw:
+        return [
+            PositionTierConfig(score_min=78.0, pct_of_assets=0.03, label="试探仓"),
+            PositionTierConfig(score_min=84.0, pct_of_assets=0.05, label="标准仓"),
+            PositionTierConfig(score_min=90.0, pct_of_assets=0.08, label="确信仓"),
+        ]
+    tiers = []
+    for label, cfg in raw.items():
+        tiers.append(PositionTierConfig(
+            score_min=float(cfg.get("score_min", 84)),
+            pct_of_assets=float(cfg.get("pct_of_assets", 0.05)),
+            label=str(label) if label else str(cfg.get("label", "标准仓")),
+        ))
+    tiers.sort(key=lambda t: t.score_min)
+    return tiers
 
 
 def validate_config(path: str | Path) -> list[str]:

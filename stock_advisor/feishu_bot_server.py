@@ -197,7 +197,9 @@ def run_feishu_command(config: AppConfig, command_text: str) -> str:
         return _help_text()
     if command.name == "brief":
         conn = connect_db(config.storage.sqlite_path)
-        return format_mobile_digest(fetch_latest_briefing(conn))
+        from .cli import _load_positions_for_briefing
+        positions = _load_positions_for_briefing(config)
+        return format_mobile_digest(fetch_latest_briefing(conn), positions=positions)
     if command.name == "review":
         artifact = build_close_review(config)
         return artifact.body

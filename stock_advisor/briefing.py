@@ -37,39 +37,33 @@ def format_mobile_signal(title: str, message: str, *, include_title: bool = True
     return "\n".join(brief_lines[:5])
 
 
-def format_mobile_digest(items: list[dict]) -> str:
-    now_text = datetime.now().strftime("%Y-%m-%d %H:%M")
-    lines = [f"【AI股票决策简报】{now_text}"]
+def format_mobile_digest(items: list[dict], positions: dict[str, int] | None = None) -> str:
+    now_text = datetime.now().strftime("%H:%M")
+    lines = [f"📊 {now_text}"]
     if not items:
-        lines.append("暂无已落库的行情决策数据")
-        return "\n".join(lines)
+        return f"📊 {now_text}\n暂无信号"
 
     top_items = items[:6]
-    for index, item in enumerate(top_items, start=1):
-        score = "-" if item["score"] is None else f"{item['score']:.0f}"
+    for item in top_items:
         change = _signed(item["change_percent"])
-        lines.append(
-            f"{index}. {item['code']} {item['name']} | {item['action']} | {score}分 | {change}%"
-        )
-        lines.append(
-            f"   状态:{item['regime']} 置信度:{item['confidence']} 信号:{item['signal_level']}"
-        )
-        reason = "；".join(item["rationale"][:2]) if item["rationale"] else "暂无明显理由"
-        lines.append(f"   理由:{reason}")
-        if item["trade_advice"]:
-            lines.append(f"   动作:{item['trade_advice']}")
-        if item["trade_size_hint"]:
-            lines.append(f"   仓位:{item['trade_size_hint']}")
-        if item["risk_flags"]:
-            lines.append(f"   风险:{'；'.join(item['risk_flags'][:2])}")
+        action_icon = {"buy": "🟢", "hold": "🟡", "reduce": "🔴", "avoid": "⛔"}.get(item["action"], "")
+        qty = item.get("current_position_qty", 0)
+        if qty <= 0 and positions:
+            qty = positions.get(item.get("code", ""), 0)
+        qty_str = f"[{qty}股]" if qty > 0 else ""
+        # One line: icon name action change [qty]
+        lines.append(f"{action_icon} {item['name']} {item['action']} {change}% {qty_str}")
+        # Show concrete trade instruction
+        advice = item.get("trade_advice", "")
+        if advice and advice not in ("持有", "空仓观望", "空仓等待"):
+            lines.append(f"  → {advice}")
+        # Critical risks only
+        risks = item.get("risk_flags", [])
+        critical = [r for r in risks if any(kw in r for kw in ("⚠️", "🎯", "止损", "除权", "暴跌"))]
+        if critical:
+            lines.append(f"  ⚠️ {'; '.join(critical[:2])}")
 
-    hot = [item["code"] for item in items if item["score"] is not None and item["score"] >= 68]
-    cold = [item["code"] for item in items if item["score"] is not None and item["score"] < 40]
-    if hot:
-        lines.append(f"关注偏强: {', '.join(hot[:5])}")
-    if cold:
-        lines.append(f"注意偏弱: {', '.join(cold[:5])}")
-    lines.append("仅供参考，不构成投资建议")
+    lines.append("—" * 10)
     return "\n".join(lines)
 
 

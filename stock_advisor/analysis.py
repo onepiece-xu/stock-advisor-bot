@@ -1229,12 +1229,21 @@ def _trade_plan(
 ) -> tuple[str, str, str]:
     habit_note = _habit_note(trading_habit_profile)
     if action == "buy":
-        position_pct = monitor_config.position_pct_per_trade if monitor_config is not None else 0.05
-        buy_qty = _recommended_buy_quantity(score, portfolio_holding, trading_habit_profile, total_assets=total_assets, current_price=current.current_price, position_pct=position_pct)
+        tier_label, buy_qty, tier_pct = _recommended_buy_quantity(
+            score, portfolio_holding, trading_habit_profile,
+            total_assets=total_assets, current_price=current.current_price,
+            position_tiers=monitor_config.position_tiers if monitor_config else None,
+        )
+        # Compute entry price zone: don't chase above MA15, floor at MA60
+        entry_ceiling = min(current.current_price, metrics.ma15) if metrics.ma15 > 0 else current.current_price
+        entry_floor = max(metrics.ma60 * Decimal("0.98"), current.current_price * Decimal("0.97")) if metrics.ma60 > 0 else current.current_price * Decimal("0.98")
+        entry_floor = min(entry_floor, entry_ceiling * Decimal("0.98"))  # always some spread
+        stop_level = entry_floor * Decimal("0.93")  # -7% stop from entry floor
+        tier_tag = f"[{tier_label}] " if tier_label else ""
         return (
-            f"买入 {buy_qty} 股{habit_note}",
-            f"目标仓位约 {position_pct * 100:.1f}%（{buy_qty} 股）",
-            f"仅在现价不高于 MA15 {_format_price(metrics.ma15)} 且量能继续放大时执行；跌回 MA60 {_format_price(metrics.ma60)} 下方取消",
+            f"{tier_tag}挂单 {_format_price(entry_floor)}-{_format_price(entry_ceiling)} 买入 {buy_qty} 股{habit_note}",
+            f"{tier_tag}入场区间 {_format_price(entry_floor)}-{_format_price(entry_ceiling)}，{buy_qty} 股",
+            f"止损 {_format_price(stop_level)}（-7%），不追高 MA15 {_format_price(metrics.ma15)} 上方",
         )
     if action == "hold":
         hold_qty = portfolio_holding.quantity if portfolio_holding is not None and portfolio_holding.quantity > 0 else 0
@@ -1267,20 +1276,84 @@ def _recommended_buy_quantity(
     *,
     total_assets: Decimal | None = None,
     current_price: Decimal | None = None,
-    position_pct: float = 0.05,
-) -> int:
+    position_tiers: list | None = None,
+) -> tuple[str, int, Decimal]:
+    """
+    Return (tier_label, quantity, tier_pct).
+
+    Position sizing uses 3 tiers from config (default: 试探仓/标准仓/确信仓).
+    Risk adjustments:
+      - Adding to winning position (pnl >= 5%): bump up one tier
+      - Deep loss position (pnl <= -20%): force lowest tier
+      - New position (no holding): cap at standard tier (no conviction for untested)
+      - Market crash context: caller must pass reduced action before calling here
+    """
+    # Default tiers if none provided (fallback for tests/cli without config)
+    if not position_tiers:
+        from stock_advisor.config import PositionTierConfig
+        position_tiers = [
+            PositionTierConfig(score_min=78.0, pct_of_assets=0.03, label="试探仓"),
+            PositionTierConfig(score_min=84.0, pct_of_assets=0.05, label="标准仓"),
+            PositionTierConfig(score_min=90.0, pct_of_assets=0.08, label="确信仓"),
+        ]
+
+    # Determine base tier by score
+    selected_tier = position_tiers[0]  # lowest tier (试探仓)
+    for tier in position_tiers:
+        if float(score) >= tier.score_min:
+            selected_tier = tier
+
+    # Risk adjustments
+    has_position = portfolio_holding is not None and portfolio_holding.quantity > 0
+    is_new_position = not has_position
+
+    if has_position and portfolio_holding is not None:
+        pnl_pct = _safe_pnl_pct(portfolio_holding)
+        # Deep loss: force probe tier
+        if pnl_pct is not None and pnl_pct <= Decimal("-20"):
+            selected_tier = position_tiers[0]  # 试探仓 only
+        # Winning position: bump up one tier (add more confidence)
+        elif pnl_pct is not None and pnl_pct >= Decimal("5"):
+            current_idx = position_tiers.index(selected_tier)
+            if current_idx < len(position_tiers) - 1:
+                selected_tier = position_tiers[current_idx + 1]
+
+    # New position: cap at standard tier
+    if is_new_position:
+        standard_idx = min(1, len(position_tiers) - 1)  # index 1 = standard
+        if position_tiers.index(selected_tier) > standard_idx:
+            selected_tier = position_tiers[standard_idx]
+
+    # Trading habit override (if enough history)
+    if trading_habit_profile is not None and trading_habit_profile.sample_count >= 3:
+        if has_position:
+            habit_qty = trading_habit_profile.preferred_add_lot
+        else:
+            habit_qty = trading_habit_profile.preferred_buy_lot
+        if habit_qty > 0:
+            return (selected_tier.label, habit_qty, Decimal(str(selected_tier.pct_of_assets)))
+
+    # Compute quantity from tier pct * total_assets
     if total_assets is not None and total_assets > 0 and current_price is not None and current_price > 0:
-        target_value = total_assets * Decimal(str(position_pct))
+        tier_pct = Decimal(str(selected_tier.pct_of_assets))
+        target_value = total_assets * tier_pct
         qty = int(target_value / current_price)
         qty = (qty // 100) * 100
-        return max(100, qty)
-    if trading_habit_profile is not None and trading_habit_profile.sample_count >= 3:
-        if portfolio_holding is not None and portfolio_holding.quantity > 0:
-            return trading_habit_profile.preferred_add_lot
-        return trading_habit_profile.preferred_buy_lot
-    if portfolio_holding is not None and portfolio_holding.quantity > 0:
-        return 100
-    return 200 if score >= Decimal("88") else 100
+        return (selected_tier.label, max(100, qty), tier_pct)
+
+    # Absolute fallback (no total_assets available)
+    if score >= Decimal("90"):
+        return (selected_tier.label, 300, Decimal(str(selected_tier.pct_of_assets)))
+    if score >= Decimal("84"):
+        return (selected_tier.label, 200, Decimal(str(selected_tier.pct_of_assets)))
+    return (selected_tier.label, 100, Decimal(str(selected_tier.pct_of_assets)))
+
+
+def _safe_pnl_pct(holding: PortfolioHolding) -> Decimal | None:
+    """Compute pnl_pct safely, returning None if cost_price is zero."""
+    if holding.cost_price is None or holding.cost_price == Decimal("0"):
+        return None
+    return (holding.current_price - holding.cost_price) / holding.cost_price * Decimal("100")
 
 
 def _recommended_reduce_quantity(

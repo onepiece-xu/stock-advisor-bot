@@ -342,10 +342,21 @@ def run_replay_signals(
         )
 
 
+def _load_positions_for_briefing(config) -> dict[str, int]:
+    """Load current position quantities from portfolio snapshot for briefing display."""
+    try:
+        from .portfolio import load_portfolio_snapshot
+        snap = load_portfolio_snapshot(config.snapshot_path)
+        return {h.code: h.quantity for h in snap.holdings if h.quantity > 0}
+    except Exception:
+        return {}
+
+
 def run_mobile_brief(config_path: str, notify: bool) -> None:
     config = require_valid_config(config_path)
     conn = connect_db(config.storage.sqlite_path)
-    rendered = format_mobile_digest(fetch_latest_briefing(conn))
+    positions = _load_positions_for_briefing(config)
+    rendered = format_mobile_digest(fetch_latest_briefing(conn), positions=positions)
     print(rendered)
     if notify and config.monitor.notification.feishu.enabled:
         deliver_feishu_message(

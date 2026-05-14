@@ -481,6 +481,30 @@ def _percent_diff(current: Decimal, base: Decimal) -> Decimal:
     return (((current - base) / base) * Decimal("100")).quantize(Decimal("0.01"))
 
 
+def _market_regime(current: StockQuote, metrics: ObservationMetrics) -> str:
+    """Detect intraday volume-price regime.
+    
+    Returns:
+        "distribution" — volume-price divergence (量价背离)
+        "recovery" — oversold bounce (超卖反弹)
+        "neutral" — no clear regime
+    """
+    change = current.change_percent
+    vol_ratio = metrics.volume_ratio
+    rsi = metrics.rsi14
+    
+    # Distribution: price up but volume very low (涨不动), or price down with high volume (放量下跌)
+    if (change > Decimal("0.5") and vol_ratio < Decimal("0.6")) or \
+       (change < Decimal("-1.0") and vol_ratio > Decimal("1.5")):
+        return "distribution"
+    
+    # Recovery: price up with decent volume from oversold RSI
+    if change > Decimal("1.0") and rsi < Decimal("40") and vol_ratio > Decimal("0.8"):
+        return "recovery"
+    
+    return "neutral"
+
+
 def _build_decision_signal(
     current: StockQuote,
     metrics: ObservationMetrics,

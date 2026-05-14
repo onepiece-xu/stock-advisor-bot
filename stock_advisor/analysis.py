@@ -500,323 +500,269 @@ def _build_decision_signal(
     recent_ex_dividend: bool = False,
     portfolio_total_assets: Decimal | None = None,
 ) -> DecisionSignal:
+    """Two-tier scoring: daily regime → position context → minute fine-tuning.
+
+    Tier 1 — Daily Regime (sets scoring gravity):
+      - Bull: price > MA20 > MA60 → floor raised, sell suppressed
+      - Bear: price < MA20 < MA60 → ceiling lowered, buy suppressed
+      - Neutral: standard scoring
+
+    Tier 2 — Position Context (modulates penalties):
+      - Winner (>+5%): penalties halved, hold is default
+      - Normal (-5% to +5%): standard
+      - Loser (-5% to -20%): buy penalties increased
+      - Deep loss (<-20%): buy banned, only reduce
+
+    Tier 3 — Minute Signals (fine-tuning, only in neutral regime):
+      - Ignored when daily regime is Bull or Bear
+    """
+    # ═══════════════════════════════════════════════════════════
+    # PHASE 0: Regime & Context
+    # ═══════════════════════════════════════════════════════════
+    has_position = portfolio_holding is not None and portfolio_holding.quantity > 0
+    holding_return_pct = _holding_return_percent(current, portfolio_holding)
+
+    # ── Daily Regime ──
+    if daily_ma20 is not None and daily_ma60 is not None and daily_ma20 > 0 and daily_ma60 > 0:
+        if current.current_price > daily_ma20 > daily_ma60:
+            daily_regime = "bull"
+        elif current.current_price < daily_ma20 < daily_ma60:
+            daily_regime = "bear"
+        else:
+            daily_regime = "neutral"
+    else:
+        daily_regime = "neutral"
+
+    # ── Position Context ──
+    if holding_return_pct is None:
+        position_ctx = "no_position"
+    elif holding_return_pct >= Decimal("5"):
+        position_ctx = "winner"
+    elif holding_return_pct >= Decimal("-5"):
+        position_ctx = "normal"
+    elif holding_return_pct >= Decimal("-20"):
+        position_ctx = "loser"
+    else:
+        position_ctx = "deep_loss"
+
+    # ═══════════════════════════════════════════════════════════
+    # PHASE 1: Daily Regime Scoring (foundation)
+    # ═══════════════════════════════════════════════════════════
     score = Decimal("50")
     rationale: list[str] = []
     risk_flags: list[str] = []
-    holding_return_pct = _holding_return_percent(current, portfolio_holding)
 
-    # ── 日线级别评分（3x权重 vs 分钟线） ──
-    # 上班族看日线比分钟线重要3倍。日线判断大势方向，分钟线只做择时。
-    DAILY_WEIGHT = Decimal("3")  # 日线信号权重是分钟线的3倍
-    if daily_ma20 is not None and daily_ma60 is not None and daily_ma20 > 0 and daily_ma60 > 0:
-        if current.current_price > daily_ma20 > daily_ma60:
-            score += Decimal("24")  # 3x the old +8
-            rationale.append("日线多头排列（3x权重）：现价>MA20>MA60，大趋势向上，分钟线回调是买点")
-        elif current.current_price > daily_ma20 and daily_ma60 > daily_ma20:
-            score += Decimal("12")
-            rationale.append("日线偏多：现价站上MA20但MA60尚未跟上，趋势在转好")
-        elif current.current_price < daily_ma20 < daily_ma60:
-            score -= Decimal("30")  # 3x the old -10
-            risk_flags.append("日线空头排列（3x权重）：现价<MA20<MA60，大趋势偏弱，买入信号被强力压制")
-        elif current.current_price < daily_ma60:
-            score -= Decimal("15")  # 3x the old -5
-            risk_flags.append(f"日线跌破MA60（3x权重）：现价<日线MA60（{_format_price(daily_ma60)}），中线趋势转弱")
-        # Daily MA20 bias: how far is price from daily MA20
-        daily_ma20_bias = _percent_diff(current.current_price, daily_ma20) if daily_ma20 > 0 else Decimal("0")
+    # 1.1 Daily MA Structure (dominant signal)
+    if daily_regime == "bull":
+        score += Decimal("24")
+        rationale.append("日线多头排列：现价>MA20>MA60，大趋势向上")
+    elif daily_regime == "bear":
+        score -= Decimal("30")
+        risk_flags.append("日线空头排列：现价<MA20<MA60，大趋势偏弱")
+
+    # 1.2 Daily MA20 Bias (penalized only outside bull regime)
+    if daily_ma20 is not None and daily_ma20 > 0:
+        daily_ma20_bias = _percent_diff(current.current_price, daily_ma20)
         if daily_ma20_bias <= Decimal("-5.00"):
-            score += Decimal("15")  # Deep below daily MA20 → reversion
-            rationale.append(f"日线深度偏离MA20 {_format_percent(daily_ma20_bias)}（3x权重），均值回归概率高")
+            score += Decimal("15")
+            rationale.append(f"日线深度低于MA20 {_format_percent(daily_ma20_bias)}，均值回归")
         elif daily_ma20_bias <= Decimal("-2.00"):
             score += Decimal("6")
-            rationale.append(f"日线偏离MA20 {_format_percent(daily_ma20_bias)}，存在修复窗口")
-        elif daily_ma20_bias >= Decimal("5.00"):
+            rationale.append(f"日线低于MA20 {_format_percent(daily_ma20_bias)}，修复窗口")
+        elif daily_ma20_bias >= Decimal("5.00") and daily_regime != "bull":
             score -= Decimal("18")
-            risk_flags.append(f"日线远高于MA20 {_format_percent(daily_ma20_bias)}（3x权重），追高风险极大")
-        elif daily_ma20_bias >= Decimal("3.00"):
+            risk_flags.append(f"日线远高于MA20 {_format_percent(daily_ma20_bias)}，追高风险")
+        elif daily_ma20_bias >= Decimal("3.00") and daily_regime != "bull":
             score -= Decimal("9")
-            risk_flags.append(f"日线偏离MA20偏高 {_format_percent(daily_ma20_bias)}，等回踩再评估")
+            risk_flags.append(f"日线偏离MA20偏高 {_format_percent(daily_ma20_bias)}，等回踩")
 
-    # ── 日线 RSI14（3x权重 vs 分钟RSI） ──
+    # 1.3 Daily RSI14
     if daily_rsi14 is not None:
         if daily_rsi14 <= Decimal("25"):
-            score += Decimal("24")  # 3x the minute RSI bonus
-            rationale.append(f"日线RSI深度超卖 {_format_ratio(daily_rsi14)}（3x权重），历史上此类超卖后反弹概率>70%")
+            score += Decimal("24")
+            rationale.append(f"日线RSI深度超卖 {_format_ratio(daily_rsi14)}，反弹概率>70%")
         elif daily_rsi14 <= Decimal("32"):
             score += Decimal("12")
-            rationale.append(f"日线RSI超卖区 {_format_ratio(daily_rsi14)}（3x权重），中线修复窗口打开")
-        elif daily_rsi14 <= Decimal("40"):
-            score += Decimal("6")
-            rationale.append(f"日线RSI偏低位 {_format_ratio(daily_rsi14)}，逐步进入安全区")
+            rationale.append(f"日线RSI超卖区 {_format_ratio(daily_rsi14)}")
         elif daily_rsi14 >= Decimal("80"):
-            score -= Decimal("30")  # 3x weight
-            risk_flags.append(f"日线RSI极度超买 {_format_ratio(daily_rsi14)}（3x权重），历史高位追涨胜率<30%")
+            score -= Decimal("30")
+            risk_flags.append(f"日线RSI极度超买 {_format_ratio(daily_rsi14)}，追涨胜率<30%")
         elif daily_rsi14 >= Decimal("70"):
             score -= Decimal("15")
-            risk_flags.append(f"日线RSI超买区 {_format_ratio(daily_rsi14)}（3x权重），入场性价比低")
+            risk_flags.append(f"日线RSI超买区 {_format_ratio(daily_rsi14)}")
 
-    # ── 日线量价关系（3x权重 vs 分钟量比） ──
+    # 1.4 Daily Volume Ratio
     if daily_vol_ratio is not None:
         if daily_vol_ratio >= Decimal("2.00") and current.change_percent >= 0:
-            score += Decimal("18")  # 3x weight
-            rationale.append(f"日线放量上涨（量比 {_format_ratio(daily_vol_ratio)}，3x权重），主力资金积极参与")
+            score += Decimal("18")
+            rationale.append(f"日线放量上涨（量比 {_format_ratio(daily_vol_ratio)}）")
         elif daily_vol_ratio >= Decimal("2.00") and current.change_percent < 0:
             score -= Decimal("24")
-            risk_flags.append(f"日线放量下跌（量比 {_format_ratio(daily_vol_ratio)}，3x权重），主力出货信号")
-        elif daily_vol_ratio >= Decimal("1.50") and current.change_percent >= 0:
-            score += Decimal("9")
-            rationale.append(f"日线温和放量上涨（量比 {_format_ratio(daily_vol_ratio)}），量价配合良好")
-        elif daily_vol_ratio <= Decimal("0.50") and current.change_percent >= 0:
+            risk_flags.append(f"日线放量下跌（量比 {_format_ratio(daily_vol_ratio)}），出货信号")
+        elif daily_vol_ratio <= Decimal("0.50") and current.change_percent >= 0 and daily_regime != "bull":
             score -= Decimal("12")
-            risk_flags.append(f"日线缩量上涨（量比 {_format_ratio(daily_vol_ratio)}，3x权重），上涨动能不足")
+            risk_flags.append(f"日线缩量上涨（量比 {_format_ratio(daily_vol_ratio)}），动能不足")
         elif daily_vol_ratio <= Decimal("0.50") and current.change_percent < 0:
             score += Decimal("6")
-            rationale.append(f"日线缩量下跌（量比 {_format_ratio(daily_vol_ratio)}），抛压减轻，可能是底部缩量")
+            rationale.append(f"日线缩量下跌（量比 {_format_ratio(daily_vol_ratio)}），抛压减轻")
 
-    # ── Mean-reversion oriented: don't chase highs, don't panic at lows ──
-    if current.change_percent >= Decimal("5.00"):
-        score -= Decimal("8")
-        risk_flags.append(f"当日涨幅 {_format_percent(current.change_percent)} 过大，坚决不追高，必须等缩量回踩MA10")
-    elif current.change_percent >= Decimal("3.00"):
-        score -= Decimal("4")
-        risk_flags.append(f"当日涨幅 {_format_percent(current.change_percent)} 偏大，等回踩MA10再评估入场")
-    elif current.change_percent >= Decimal("2.00"):
-        score -= Decimal("1")
-        risk_flags.append("当日已有一定涨幅，不要追高")
-    elif current.change_percent <= Decimal("-5.00"):
-        score += Decimal("6")
-        rationale.append(f"当日跌幅 {_format_percent(current.change_percent)} 过深，恐慌抛售可能过度，关注止跌反弹信号")
-    elif current.change_percent <= Decimal("-3.00"):
-        score += Decimal("3")
-        rationale.append(f"当日跌幅 {_format_percent(current.change_percent)} 较大，存在超跌修复窗口")
-    elif current.change_percent <= Decimal("-2.00"):
-        score -= Decimal("5")
-        rationale.append("当日回撤明显，但幅度仍在正常范围，关注能否企稳")
+    # ═══════════════════════════════════════════════════════════
+    # PHASE 2: Minute Signals (neutral regime only)
+    # ═══════════════════════════════════════════════════════════
+    if daily_regime == "neutral":
+        # MA biases
+        if metrics.bias_to_ma15 >= Decimal("0.60"):
+            score += Decimal("8"); rationale.append("站上MA15")
+        elif metrics.bias_to_ma15 <= Decimal("-0.80"):
+            score -= Decimal("10"); rationale.append("跌破MA15")
+        if metrics.bias_to_ma60 >= Decimal("1.20"):
+            score += Decimal("12"); rationale.append("高于MA60")
+        elif metrics.bias_to_ma60 <= Decimal("-1.20"):
+            score -= Decimal("12"); rationale.append("低于MA60")
 
-    if metrics.bias_to_ma15 >= Decimal("0.60"):
-        score += Decimal("8")
-        rationale.append("现价站上 MA15，短线趋势偏强")
-    elif metrics.bias_to_ma15 <= Decimal("-0.80"):
-        score -= Decimal("10")
-        rationale.append("现价跌破 MA15，短线修复不足")
+        # MA alignment
+        ma_align = _ma_alignment_score(current.current_price, metrics.ma5, metrics.ma15, metrics.ma60, metrics.ma240)
+        daily_is_bullish = (daily_ma20 is not None and daily_ma60 is not None and current.current_price > daily_ma20 > daily_ma60)
+        if ma_align >= 4:
+            score += Decimal("4"); rationale.append("均线多头排列")
+        elif ma_align == 3:
+            score += Decimal("2")
+        elif ma_align <= -4:
+            if not daily_is_bullish:
+                score -= Decimal("4"); risk_flags.append("均线空头排列")
+        elif ma_align == -3:
+            if not daily_is_bullish:
+                score -= Decimal("2"); risk_flags.append("均线偏空")
 
-    if metrics.bias_to_ma60 >= Decimal("1.20"):
-        score += Decimal("12")
-        rationale.append("现价高于 MA60，小时级别趋势占优")
-    elif metrics.bias_to_ma60 <= Decimal("-1.20"):
-        score -= Decimal("12")
-        rationale.append("现价低于 MA60，小时级别仍偏弱")
+        # Volume ratio
+        if metrics.volume_ratio >= Decimal("5.00"):
+            if current.change_percent >= Decimal("0.30"):
+                score += Decimal("12")
+            elif current.change_percent <= Decimal("-0.30"):
+                score -= Decimal("12"); risk_flags.append("量能突刺下行")
+        elif metrics.volume_ratio >= Decimal("2.00") and current.change_percent >= Decimal("0.30"):
+            score += Decimal("10"); rationale.append("放量上行")
+        elif metrics.volume_ratio <= Decimal("0.80") and current.change_percent > 0:
+            if current.change_percent >= Decimal("0.50"):
+                score -= Decimal("8"); risk_flags.append("上涨缩量")
+            elif current.change_percent >= Decimal("0.20"):
+                score -= Decimal("3")
 
-    # ── Mean-reversion: extreme deviations below MA → bounce potential ──
-    if metrics.bias_to_ma15 <= Decimal("-3.00"):
-        score += Decimal("6")
-        rationale.append(f"现价大幅低于MA15（{_format_percent(metrics.bias_to_ma15)}），均值回归概率上升，关注止跌信号")
-    elif metrics.bias_to_ma15 <= Decimal("-2.00"):
-        score += Decimal("3")
-        rationale.append(f"现价偏离MA15较多（{_format_percent(metrics.bias_to_ma15)}），存在超跌修复窗口")
-    if metrics.bias_to_ma60 <= Decimal("-5.00"):
-        score += Decimal("5")
-        rationale.append(f"现价深度低于MA60（{_format_percent(metrics.bias_to_ma60)}），中长线均值回归可期")
+        # Volume trend
+        if metrics.volume_trend_ratio <= Decimal("0.80") and current.change_percent > 0:
+            score -= Decimal("6"); risk_flags.append("近5分钟量能弱")
 
-    if metrics.ma240 > 0 and current.current_price >= metrics.ma240:
-        score += Decimal("4")
-        rationale.append("现价维持在 MA240 上方，全天结构尚可")
-    elif metrics.ma240 > 0 and current.current_price < metrics.ma240:
-        score -= Decimal("4")
-        rationale.append("现价跌回 MA240 下方，全天结构偏弱")
+        # Breakout/breakdown
+        if metrics.breakout_above_prev30_high_pct >= Decimal("0.20"):
+            if metrics.volume_ratio_30 >= Decimal("1.50"):
+                score += Decimal("12"); rationale.append("放量突破前高")
+            elif metrics.volume_ratio_30 >= Decimal("1.15"):
+                score += Decimal("5")
+            else:
+                score -= Decimal("8"); risk_flags.append("缩量假突破")
+        if metrics.breakdown_below_prev30_low_pct >= Decimal("0.20"):
+            score -= Decimal("12") if metrics.volume_ratio_30 >= Decimal("1.50") else Decimal("6")
 
-    ma_align = _ma_alignment_score(current.current_price, metrics.ma5, metrics.ma15, metrics.ma60, metrics.ma240)
-    if ma_align >= 4:
-        score += Decimal("4")
-        rationale.append("均线多头排列完整（价格>MA5>MA15>MA60>MA240），趋势结构自我强化")
-    elif ma_align == 3:
-        score += Decimal("2")
-        rationale.append("均线多头排列基本确立（4层中3层对齐），趋势偏强")
-    elif ma_align <= -4:
-        score -= Decimal("4")
-        risk_flags.append("均线空头排列完整（价格<MA5<MA15<MA60<MA240），空头结构无支撑")
-    elif ma_align == -3:
-        score -= Decimal("2")
-        risk_flags.append("均线空头排列基本确立（4层中3层对齐），短线承压")
+        # Step change
+        if metrics.step_change_pct >= Decimal("1.00"):
+            score += Decimal("4")
+        elif metrics.step_change_pct <= Decimal("-1.00"):
+            score -= Decimal("5")
 
-    if metrics.step_change_pct >= Decimal("1.00"):
-        score += Decimal("4")
-        rationale.append("最近 1 分钟继续抬升，短线延续性尚可")
-    elif metrics.step_change_pct <= Decimal("-1.00"):
-        score -= Decimal("5")
-        rationale.append("最近 1 分钟回落较快，拉升持续性不足")
+        # RSI
+        if metrics.rsi14 >= Decimal("80"):
+            score -= Decimal("12"); risk_flags.append("RSI14过高")
+        elif metrics.rsi14 >= Decimal("72"):
+            score -= Decimal("6")
+        elif metrics.rsi14 <= Decimal("25"):
+            score += Decimal("8"); rationale.append("RSI14超卖")
+        elif metrics.rsi14 <= Decimal("32"):
+            score += Decimal("4")
 
-    if metrics.volume_ratio >= Decimal("5.00"):
-        if current.change_percent >= Decimal("0.30"):
-            score += Decimal("12")
-            rationale.append(f"量能突刺上行（量比 {_format_ratio(metrics.volume_ratio)}），主力资金强势介入")
-        elif current.change_percent <= Decimal("-0.30"):
-            score -= Decimal("12")
-            risk_flags.append(f"量能突刺下行（量比 {_format_ratio(metrics.volume_ratio)}），主力快速出货信号")
-        else:
+        # MACD
+        if metrics.macd_line > 0: score += Decimal("4")
+        elif metrics.macd_line < 0: score -= Decimal("4")
+        if metrics.macd_histogram > 0 and metrics.macd_prev_histogram <= 0:
+            score += Decimal("8"); rationale.append("MACD金叉")
+        elif metrics.macd_histogram < 0 and metrics.macd_prev_histogram >= 0:
+            score -= Decimal("8"); risk_flags.append("MACD死叉")
+
+        # Volatility
+        if is_volatile_period:
+            score -= Decimal("5"); risk_flags.append("波动期信号可靠性低")
+        if metrics.recent_range_pct >= Decimal("4.50"):
+            score -= Decimal("5")
+        if metrics.intraday_amplitude_pct >= Decimal("5.00"):
             score -= Decimal("4")
-            risk_flags.append(f"量能突刺但价格滞涨（量比 {_format_ratio(metrics.volume_ratio)}），多空分歧加剧")
-    elif metrics.volume_ratio >= Decimal("2.00") and current.change_percent >= Decimal("0.30"):
-        score += Decimal("10")
-        rationale.append("放量上行，量价配合较好")
-    elif metrics.volume_ratio <= Decimal("0.80") and current.change_percent > 0:
-        # Scale penalty by how much the stock rose: tiny gains with low volume
-        # are normal, not bearish.  Only penalize meaningful gains without volume.
-        if current.change_percent >= Decimal("0.50"):
-            score -= Decimal("8")
-            risk_flags.append("上涨缩量，冲高持续性存疑")
-        elif current.change_percent >= Decimal("0.20"):
-            score -= Decimal("3")
-            risk_flags.append("微涨缩量，方向尚不明确")
-        # else: price barely moved, low volume is neutral — no penalty
-    elif metrics.volume_ratio >= Decimal("1.80") and current.change_percent < 0:
-        score -= Decimal("10")
-        risk_flags.append("下跌放量，抛压仍在释放")
 
-    if metrics.volume_trend_ratio >= Decimal("1.25") and current.change_percent > 0:
-        score += Decimal("6")
-        rationale.append("近 5 分钟均量高于 30 分钟基线，短线参与度正在增强")
-    elif metrics.volume_trend_ratio <= Decimal("0.80") and current.change_percent > 0:
-        score -= Decimal("6")
-        risk_flags.append("近 5 分钟量能弱于 30 分钟基线，反弹持续性不足")
-    elif metrics.volume_trend_ratio >= Decimal("1.20") and current.change_percent < 0 and metrics.volume_ratio_30 >= Decimal("1.20"):
-        score -= Decimal("6")
-        risk_flags.append("下跌过程中近 5 分钟成交继续放大，资金流出仍偏主动")
+    # ═══════════════════════════════════════════════════════════
+    # PHASE 3: Market Environment (all regimes)
+    # ═══════════════════════════════════════════════════════════
 
-    if metrics.breakout_above_prev30_high_pct >= Decimal("0.20") and metrics.volume_ratio_30 >= Decimal("1.50"):
-        score += Decimal("12")
-        rationale.append("放量突破近 30 分钟前高，属于更有效的日内突破")
-    elif metrics.breakout_above_prev30_high_pct >= Decimal("0.20") and metrics.volume_ratio_30 >= Decimal("1.15"):
-        score += Decimal("5")
-        rationale.append("价格突破近 30 分钟前高，但量能只到中等强度")
-    elif metrics.breakout_above_prev30_high_pct >= Decimal("0.20"):
-        score -= Decimal("8")
-        risk_flags.append("价格突破前高但 30 分钟量能未同步放大，假突破风险较高")
-
-    if metrics.breakdown_below_prev30_low_pct >= Decimal("0.20") and metrics.volume_ratio_30 >= Decimal("1.50"):
-        score -= Decimal("12")
-        risk_flags.append("放量跌破近 30 分钟前低，承接明显不足")
-    elif metrics.breakdown_below_prev30_low_pct >= Decimal("0.20"):
-        score -= Decimal("6")
-        risk_flags.append("跌破近 30 分钟前低，短线结构已被破坏")
-
-    # ── RSI mean-reversion: oversold = opportunity, overbought = risk ──
-    if metrics.rsi14 >= Decimal("80"):
-        score -= Decimal("12")
-        risk_flags.append("RSI14 过高，追高风险显著")
-    elif metrics.rsi14 >= Decimal("72"):
-        score -= Decimal("6")
-        risk_flags.append("RSI14 偏高，继续上冲空间受限")
-    elif metrics.rsi14 <= Decimal("25"):
-        score += Decimal("8")
-        rationale.append(f"RSI14 深度超卖（{_format_ratio(metrics.rsi14)}），均值回归概率上升，别人恐慌时找买点")
-    elif metrics.rsi14 <= Decimal("32"):
-        score += Decimal("4")
-        rationale.append(f"RSI14 进入超卖区（{_format_ratio(metrics.rsi14)}），存在超跌修复窗口")
-    elif metrics.rsi14 <= Decimal("40") and metrics.relative_strength_pct > Decimal("-0.50"):
-        score += Decimal("2")
-        rationale.append("RSI14 偏低位且相对大盘不弱，可能正在筑底")
-
-    macd_golden_cross = metrics.macd_histogram > 0 and metrics.macd_prev_histogram <= 0
-    macd_death_cross = metrics.macd_histogram < 0 and metrics.macd_prev_histogram >= 0
-    if metrics.macd_line > 0:
-        score += Decimal("4")
-        rationale.append("MACD 线在零轴上方，处于多头区域")
-    elif metrics.macd_line < 0:
-        score -= Decimal("4")
-        rationale.append("MACD 线在零轴下方，处于空头区域")
-    if macd_golden_cross:
-        score += Decimal("8")
-        rationale.append("MACD 金叉，短线由空转多")
-    elif macd_death_cross:
-        score -= Decimal("8")
-        risk_flags.append("MACD 死叉，短线由多转空")
-    elif metrics.macd_histogram > 0 and metrics.macd_histogram > metrics.macd_prev_histogram:
-        score += Decimal("5")
-        rationale.append("MACD 红柱扩大，多头动能持续增强")
-    elif metrics.macd_histogram < 0 and metrics.macd_histogram < metrics.macd_prev_histogram:
-        score -= Decimal("5")
-        risk_flags.append("MACD 绿柱扩大，空头动能持续释放")
-
-    if metrics.benchmark_change_pct <= Decimal("-0.80") and metrics.relative_strength_pct >= Decimal("1.00"):
-        score += Decimal("8")
-        rationale.append("大盘偏弱时仍能跑赢指数，属于逆势偏强")
-    elif metrics.benchmark_change_pct >= Decimal("0.50") and metrics.relative_strength_pct <= Decimal("-1.00"):
-        score -= Decimal("8")
-        rationale.append("大盘并不弱但个股明显跑输，承接偏弱")
-    elif metrics.benchmark_change_pct <= Decimal("-1.00") and current.change_percent < 0:
-        score -= Decimal("6")
-        risk_flags.append("大盘走弱时个股同步回撤，逆势属性不足")
-
+    # 3.1 Market breadth (downweighted for bull+winner)
     if metrics.market_advance_ratio >= Decimal("0.65"):
-        score += Decimal("4")
-        rationale.append("市场人气偏强，上涨家数占比 65% 以上")
+        score += Decimal("4"); rationale.append("市场人气偏强")
     elif Decimal("0") < metrics.market_advance_ratio <= Decimal("0.35"):
-        score -= Decimal("4")
-        risk_flags.append("市场人气偏弱，上涨家数不足 35%")
+        penalty = Decimal("2") if (daily_regime == "bull" and position_ctx in ("winner", "normal")) else Decimal("4")
+        score -= penalty; risk_flags.append("市场人气偏弱，上涨不足35%")
 
+    # 3.2 Relative strength
+    if metrics.benchmark_change_pct <= Decimal("-0.80") and metrics.relative_strength_pct >= Decimal("1.00"):
+        score += Decimal("8"); rationale.append("逆势跑赢大盘")
+    elif metrics.benchmark_change_pct >= Decimal("0.50") and metrics.relative_strength_pct <= Decimal("-1.00"):
+        score -= Decimal("8"); risk_flags.append("大盘不弱但个股跑输")
+
+    # 3.3 Hot stock / sector leader
     if metrics.hot_stock_rank == 1:
-        score += Decimal("8")
-        rationale.append("今日涨幅全市场第一，市场热点龙头")
+        score += Decimal("8"); rationale.append("全市场涨幅第一")
     elif metrics.hot_stock_rank <= 5:
         score += Decimal("6")
-        rationale.append(f"今日涨幅全市场前 5（第 {metrics.hot_stock_rank} 名），强势热点")
-    elif metrics.hot_stock_rank <= 20:
-        score += Decimal("4")
-        rationale.append(f"进入今日全市场前 20 强势股（第 {metrics.hot_stock_rank} 名）")
-    elif metrics.hot_stock_rank <= 50:
-        score += Decimal("2")
-        rationale.append(f"进入今日全市场前 50 强势股（第 {metrics.hot_stock_rank} 名）")
-
     if sector_boards:
         for board in sector_boards:
             if board.get("leader_code") == current.code:
-                score += Decimal("5")
-                rationale.append(f"板块龙头（{board['name']} {board.get('change_percent', 0):+.2f}%），获得板块效应加持")
+                score += Decimal("5"); rationale.append(f"板块龙头({board['name']})")
                 break
 
-    if portfolio_cash_ratio is not None:
-        if portfolio_cash_ratio < Decimal("0.15"):
-            score -= Decimal("5")
-            risk_flags.append(f"组合现金比例偏低（{_format_percent(portfolio_cash_ratio * 100)}），加仓空间有限")
-        elif portfolio_cash_ratio >= Decimal("0.40"):
-            score += Decimal("2")
-            rationale.append(f"组合现金充裕（{_format_percent(portfolio_cash_ratio * 100)}），具备加仓条件")
+    # 3.4 Mean-reversion: anti-chase / buy-dip
+    if current.change_percent >= Decimal("5.00"):
+        score -= Decimal("8"); risk_flags.append(f"日涨{_format_percent(current.change_percent)}，不追高")
+    elif current.change_percent >= Decimal("3.00"):
+        score -= Decimal("4")
+    elif current.change_percent <= Decimal("-5.00"):
+        score += Decimal("6"); rationale.append(f"日跌{_format_percent(current.change_percent)}，关注止跌")
+    elif current.change_percent <= Decimal("-3.00"):
+        score += Decimal("3")
 
-    if portfolio_position_ratio is not None:
-        if portfolio_position_ratio >= Decimal("0.60"):
-            score -= Decimal("8")
-            risk_flags.append(f"单票持仓集中度过高（占总资产 {_format_percent(portfolio_position_ratio * 100)}），建议分散风险")
-        elif portfolio_position_ratio >= Decimal("0.50"):
-            score -= Decimal("4")
-            risk_flags.append(f"单票持仓集中度偏高（占总资产 {_format_percent(portfolio_position_ratio * 100)}），注意控制仓位上限")
+    # 3.5 Price vs auction open
+    if current.current_price >= current.open_price > 0:
+        score += Decimal("3")
+    elif current.open_price > 0 and current.current_price < current.open_price:
+        score -= Decimal("3")
 
-    if holding_return_pct is not None:
-        if holding_return_pct <= Decimal("-12"):
-            score -= Decimal("10")
-            risk_flags.append(f"持仓浮亏已达 {_format_percent(holding_return_pct)}，弱势里不宜继续硬扛或盲目补仓")
-        elif holding_return_pct <= Decimal("-8"):
-            score -= Decimal("7")
-            risk_flags.append(f"持仓浮亏较深（{_format_percent(holding_return_pct)}），优先考虑风控而不是补仓")
-        elif holding_return_pct <= Decimal("-5") and metrics.bias_to_ma60 <= Decimal("0"):
-            score -= Decimal("4")
-            risk_flags.append(f"仍低于成本 {_format_percent(abs(holding_return_pct))} 且未收复 MA60，补仓胜率偏低")
-        elif holding_return_pct >= Decimal("8") and current.current_price < metrics.ma15:
-            score -= Decimal("4")
-            risk_flags.append(f"已有浮盈 {_format_percent(holding_return_pct)} 但跌回 MA15，下半场先守利润")
-        elif holding_return_pct >= Decimal("3") and metrics.bias_to_ma15 >= Decimal("0") and metrics.bias_to_ma60 >= Decimal("0"):
+    # ═══════════════════════════════════════════════════════════
+    # PHASE 4: Position Context Modulation
+    # ═══════════════════════════════════════════════════════════
+    if holding_return_pct is not None and has_position:
+        if position_ctx == "winner":
+            score += Decimal("8")
+            rationale.append(f"浮盈{_format_percent(holding_return_pct)}，保护利润")
+        elif position_ctx == "normal":
             score += Decimal("4")
-            rationale.append(f"现价已高于持仓成本 {_format_percent(holding_return_pct)}，持仓安全垫开始形成")
-        # Position-age guard: positions with small losses (<5%) are likely recent
-        # purchases.  Minute-level MA noise should not trigger "avoid/sell" signals
-        # for positions that haven't had time to prove themselves.
-        if holding_return_pct >= Decimal("-5") and holding_return_pct <= Decimal("2"):
-            score += Decimal("6")
-            rationale.append(
-                f"浮亏仅 {_format_percent(abs(holding_return_pct))}，属正常波动范围，"
-                f"分钟级噪音不构成清仓理由"
-            )
+            if holding_return_pct >= Decimal("-5") and holding_return_pct <= Decimal("2"):
+                score += Decimal("6")
+                rationale.append(f"浮亏仅{_format_percent(abs(holding_return_pct))}，正常波动")
+        elif position_ctx == "loser":
+            score -= Decimal("5")
+            risk_flags.append(f"浮亏{_format_percent(holding_return_pct)}，谨慎")
+        elif position_ctx == "deep_loss":
+            score -= Decimal("15")
+            recovery = abs(Decimal("100") * holding_return_pct / (Decimal("100") + holding_return_pct))
+            risk_flags.append(f"深套{_format_percent(holding_return_pct)}，回本需涨{_format_percent(recovery)}，禁补")
 
-    if portfolio_holding is not None and portfolio_holding.cost_price > 0 and portfolio_holding.quantity > 0:
+    # ═══════════════════════════════════════════════════════════
+    # PHASE 5: Stop Loss & Take Profit
+    # ═══════════════════════════════════════════════════════════
+    if has_position and portfolio_holding is not None and portfolio_holding.cost_price > 0:
         from .stop_loss import compute_effective_stop as compute_stop
         _eff_stop, _label, dist_to_stop = compute_stop(
             cost_price=portfolio_holding.cost_price,
@@ -824,396 +770,145 @@ def _build_decision_signal(
             stop_loss_pct=monitor_config.stop_loss_pct,
         )
         if dist_to_stop <= 0:
-            # How far below the stop-loss price is the current price?
-            # If the stop was triggered long ago (current >15% below stop),
-            # the "execute now" advice is misleading — the window has passed.
-            stop_gap_pct = ((_eff_stop - current.current_price) / _eff_stop * 100) if _eff_stop > 0 else Decimal("0")
+            stop_gap_pct = (((_eff_stop - current.current_price) / _eff_stop * 100) if _eff_stop > 0 else Decimal("0"))
             if stop_gap_pct >= Decimal("15"):
                 score -= Decimal("3")
-                risk_flags.append(
-                    f"⚠️ 止损价 {_eff_stop} 已远高于现价（差 {_format_percent(stop_gap_pct)}），"
-                    f"止损窗口早已过去，反弹减仓优于现价割肉"
-                )
+                risk_flags.append(f"止损价{_eff_stop}远高于现价，反弹减仓优于割肉")
             else:
                 score -= Decimal("12")
-                risk_flags.append(f"已触及{_label}价 {_eff_stop}（成本 {_format_price(portfolio_holding.cost_price)}），建议立即执行止损")
+                risk_flags.append(f"已触及{_label}价{_eff_stop}，建议止损")
         elif dist_to_stop <= Decimal("2.50"):
             score -= Decimal("6")
-            risk_flags.append(f"距{_label}价 {_eff_stop} 仅剩 {_format_percent(dist_to_stop)}，收紧风控、做好出手准备")
+            risk_flags.append(f"距{_label}价{_eff_stop}仅{_format_percent(dist_to_stop)}")
 
-    # Limit board detection (computed here from current quote)
-    _is_limit_down = current.change_percent <= Decimal("-9.5")
-    _is_limit_up = current.change_percent >= Decimal("9.5")
-    if _is_limit_down:
-        score -= Decimal("15")
-        risk_flags.append("跌停板：无法卖出，信号不可操作，等待开板后再评估")
-    elif _is_limit_up:
-        score -= Decimal("8")
-        risk_flags.append("涨停板：无法买入，持有者可考虑是否止盈，追涨风险极高")
-
-    if is_volatile_period:
-        score -= Decimal("5")
-        risk_flags.append("当前处于开盘/收盘波动期，信号可靠性偏低，建议等市场稳定后再执行")
-
-    if metrics.recent_range_pct >= Decimal("4.50"):
-        score -= Decimal("5")
-        risk_flags.append("近 30 分钟波动偏大，追单性价比低")
-    if metrics.intraday_amplitude_pct >= Decimal("5.00"):
-        score -= Decimal("4")
-        risk_flags.append("日内振幅偏大，容易来回扫损")
-
-    if current.current_price >= current.open_price > 0:
-        score += Decimal("3")
-        rationale.append("现价守在开盘价上方，盘中承接尚可")
-    elif current.open_price > 0 and current.current_price < current.open_price:
-        score -= Decimal("3")
-        rationale.append("现价落在开盘价下方，盘中资金承接偏弱")
-
-    gap_pct = _percent_diff(current.open_price, current.previous_close) if current.previous_close > 0 and current.open_price > 0 else Decimal("0")
-    if gap_pct >= Decimal("2.50"):
-        score -= Decimal("5")
-        risk_flags.append(f"高开 {_format_percent(gap_pct)}，追高风险偏大，注意高开低走")
-    elif gap_pct >= Decimal("1.50"):
-        score -= Decimal("2")
-        risk_flags.append(f"小幅高开 {_format_percent(gap_pct)}，需确认能否持续")
-    elif gap_pct <= Decimal("-2.50"):
-        score -= Decimal("6")
-        risk_flags.append(f"大幅低开 {_format_percent(gap_pct)}，空头主导，谨慎抄底")
-    elif gap_pct <= Decimal("-1.50"):
-        score -= Decimal("3")
-        risk_flags.append(f"低开 {_format_percent(gap_pct)}，开盘承压，观望为主")
-
-    if current.high_price > current.low_price and current.high_price > 0 and current.low_price > 0:
-        intraday_range = current.high_price - current.low_price
-        price_in_range = ((current.current_price - current.low_price) / intraday_range).quantize(Decimal("0.01"))
-        if price_in_range >= Decimal("0.85") and metrics.volume_trend_ratio <= Decimal("0.85"):
-            score -= Decimal("5")
-            risk_flags.append(f"现价处于日内高位（{_format_percent(price_in_range * 100)} 分位）且量能趋势趋弱，高位缩量派发风险偏高")
-        elif price_in_range <= Decimal("0.15") and metrics.rsi14 <= Decimal("38") and metrics.relative_strength_pct >= Decimal("-1.00"):
-            score += Decimal("4")
-            rationale.append(f"现价处于日内低位（{_format_percent(price_in_range * 100)} 分位）且 RSI 偏低，相对强弱尚可，存在超卖反弹窗口")
-
-    if not rationale:
-        rationale.append("当前多空信号仍偏均衡，继续等待更明确的量价配合")
-
-    regime = _market_regime(current, metrics)
-    if regime == "distribution":
-        score -= Decimal("6")
-        risk_flags.append("量价背离（高位放量滞涨），警惕主力派发")
-    elif regime == "recovery":
-        score += Decimal("4")
-        rationale.append("超卖后出现止跌反弹迹象，关注量能确认")
-
-    # ── MERGED ENTRY GUARDS (baked into score, no separate override) ──
-    # Old _apply_entry_discipline_guards conditions now handled by scoring above.
-    # If score < 84 naturally, _decision_action won't output buy.
-    # But add extra penalty for the most common quality failure modes:
-    has_position = portfolio_holding is not None and portfolio_holding.quantity > 0
-
-    # Volume + relative strength insufficient → supplement penalty
-    vol_too_low = metrics.volume_ratio < Decimal("1.20") and metrics.volume_trend_ratio < Decimal("1.05")
-    rel_weak = metrics.relative_strength_pct < Decimal("0.50")
-    if vol_too_low and rel_weak:
-        score -= Decimal("4")
-        risk_flags.append("量能和相对大盘同步弱势，入场条件不足")
-    elif vol_too_low and not metrics.breakout_above_prev30_high_pct >= Decimal("0.10"):
-        score -= Decimal("3")
-        risk_flags.append("量能未见明显放大，缺乏突破确认")
-    elif rel_weak:
-        score -= Decimal("2")
-        risk_flags.append("相对大盘偏弱，买入胜率不够高")
-
-    # Chased too high
-    if current.change_percent >= Decimal("4.00"):
-        score -= Decimal("4")
-        risk_flags.append("当日涨幅已偏大，追价性价比不高")
-
-    # Cash buffer check
-    if portfolio_cash_ratio is not None and portfolio_cash_ratio < Decimal("0.20"):
-        score -= Decimal("3")
-        risk_flags.append("现金仓位不够宽裕，买入门槛进一步提高")
-
-    # ── MERGED PULLBACK REGIME GUARDS ──
-    healthy_pullback = all((
-        has_position,
-        metrics.bias_to_ma60 >= Decimal("0"),
-        metrics.breakdown_below_prev30_low_pct < Decimal("0.20"),
-        metrics.volume_ratio_30 < Decimal("1.50"),
-        metrics.relative_strength_pct >= Decimal("-0.30"),
-    ))
-    trend_failure = any((
-        metrics.bias_to_ma60 <= Decimal("-1.20"),
-        metrics.breakdown_below_prev30_low_pct >= Decimal("0.20") and metrics.volume_ratio_30 >= Decimal("1.20"),
-        metrics.relative_strength_pct <= Decimal("-1.50"),
-    ))
-    reclaim_setup = all((
-        not has_position,
-        metrics.bias_to_ma15 >= Decimal("0.60"),
-        metrics.bias_to_ma60 >= Decimal("0.20"),
-        metrics.volume_ratio >= Decimal("1.50"),
-        metrics.volume_trend_ratio >= Decimal("1.10"),
-        metrics.relative_strength_pct >= Decimal("0.80"),
-    ))
-    if healthy_pullback:
-        rationale.append("更像趋势内回撤，不把正常洗盘误判成卖点")
-    if trend_failure and has_position:
-        risk_flags.append("回撤已经从洗盘演变成走弱，注意减仓风险")
-        score -= Decimal("3")
-    if reclaim_setup:
-        rationale.append("卖后重新转强，允许按右侧确认接回")
-
-    # ── MERGED POSITION CONTEXT GUARDS ──
-    if has_position and holding_return_pct is not None:
-        if holding_return_pct <= Decimal("-5") and metrics.bias_to_ma60 <= Decimal("0"):
-            score -= Decimal("4")
-            risk_flags.append("浮亏股且未收复 MA60，停止逆势补仓")
-        if holding_return_pct <= Decimal("-10") and metrics.breakdown_below_prev30_low_pct >= Decimal("0.20"):
-            score -= Decimal("5")
-            risk_flags.append("浮亏较深且再破日内结构，减仓信号")
-        # Deep loss guard: when a position is down 30%+, ban all buy/add signals.
-        # For office workers, this prevents "averaging down into a falling knife."
-        if holding_return_pct <= Decimal("-30"):
-            score -= Decimal("15")
-            risk_flags.append(f"⚠️ 深套 {_format_percent(holding_return_pct)}：回本需涨 {_format_percent(abs(Decimal('100') * holding_return_pct / (Decimal('100') + holding_return_pct)))}，禁止补仓摊平")
-            rationale.append("深度套牢：只管理退出，不逆势补仓")
-
-    # ── 止盈检测（强制降级） ──
-    # When a take-profit tier triggers, force the action downward.
-    # A half-point score adjustment is not enough — bullish daily signals
-    # (e.g., +24 for daily MA bull) can overwhelm -2/-5.  Force "reduce".
+    # Take-profit tiers
     if has_position and holding_return_pct is not None and monitor_config.take_profit_tiers:
         for tier in monitor_config.take_profit_tiers:
             if holding_return_pct >= Decimal(str(tier.profit_pct)):
                 tier_sell_ratio = Decimal(str(tier.sell_ratio))
                 if tier_sell_ratio <= 0:
-                    # Warning tier only — no forced sell
-                    risk_flags.append(
-                        f"📢 {tier.label}：浮盈 {_format_percent(holding_return_pct)}≥{tier.profit_pct}%，"
-                        f"接近止盈区间，做好准备"
-                    )
-                    break
-                sell_qty = int(portfolio_holding.quantity * tier_sell_ratio)
-                sell_qty = (sell_qty // 100) * 100 if sell_qty >= 100 else max(sell_qty, 100)
-                if tier_sell_ratio >= Decimal("1.0") or sell_qty >= portfolio_holding.quantity:
-                    risk_flags.append(
-                        f"🎯 {tier.label}触发：浮盈 {_format_percent(holding_return_pct)}≥{tier.profit_pct}%，"
-                        f"强制清仓止盈，锁定全部利润"
-                    )
-                    score -= Decimal("20")  # Force score below buy/hold territory
-                    rationale.append(f"止盈纪律：{tier.label}触发，不贪最后一个铜板")
+                    risk_flags.append(f"📢 {tier.label}：浮盈{_format_percent(holding_return_pct)}，接近止盈")
                 else:
-                    risk_flags.append(
-                        f"🎯 {tier.label}触发：浮盈 {_format_percent(holding_return_pct)}≥{tier.profit_pct}%，"
-                        f"强制卖出 {sell_qty} 股（{tier.sell_ratio*100:.0f}%）锁定利润"
-                    )
-                    score -= Decimal("12")
-                    rationale.append(f"止盈纪律：{tier.label}触发，先锁定 {tier.sell_ratio*100:.0f}% 利润落袋")
-                break  # Only trigger the highest tier
+                    sell_qty = int(portfolio_holding.quantity * tier_sell_ratio)
+                    sell_qty = (sell_qty // 100) * 100 if sell_qty >= 100 else max(sell_qty, 100)
+                    is_full = tier_sell_ratio >= Decimal("1.0") or sell_qty >= portfolio_holding.quantity
+                    score -= Decimal("20") if is_full else Decimal("12")
+                    risk_flags.append(f"🎯 {tier.label}触发：卖出{sell_qty}股({'清仓' if is_full else '分批'}止盈)")
+                    rationale.append(f"止盈纪律：{tier.label}触发")
+                break
 
+    # ═══════════════════════════════════════════════════════════
+    # PHASE 6: Portfolio Guards
+    # ═══════════════════════════════════════════════════════════
+    if portfolio_cash_ratio is not None:
+        if portfolio_cash_ratio < Decimal("0.15"):
+            score -= Decimal("5"); risk_flags.append("现金偏低")
+        elif portfolio_cash_ratio >= Decimal("0.40"):
+            score += Decimal("2")
 
-    # ── ACCOUNT RISK GUARDS (kept as-is, these are position sizing logic) ──
+    if portfolio_position_ratio is not None:
+        if portfolio_position_ratio >= Decimal("0.60"):
+            score -= Decimal("8"); risk_flags.append("单票集中度过高")
+        elif portfolio_position_ratio >= Decimal("0.50"):
+            score -= Decimal("4")
+
+    # ═══════════════════════════════════════════════════════════
+    # PHASE 7: Limit Boards & Filters
+    # ═══════════════════════════════════════════════════════════
+    if current.change_percent <= Decimal("-9.5"):
+        score -= Decimal("15"); risk_flags.append("跌停板：不可操作")
+    elif current.change_percent >= Decimal("9.5"):
+        score -= Decimal("8"); risk_flags.append("涨停板：追涨风险极高")
+
+    # MA240 + Gap
+    if metrics.ma240 > 0:
+        if current.current_price >= metrics.ma240:
+            score += Decimal("4")
+        else:
+            score -= Decimal("4")
+
+    gap_pct = (_percent_diff(current.open_price, current.previous_close)
+               if current.previous_close > 0 and current.open_price > 0 else Decimal("0"))
+    if gap_pct >= Decimal("2.50"):
+        score -= Decimal("5"); risk_flags.append(f"高开{_format_percent(gap_pct)}")
+    elif gap_pct <= Decimal("-2.50"):
+        score -= Decimal("6"); risk_flags.append(f"大幅低开{_format_percent(gap_pct)}")
+
+    # Market regime
+    regime = _market_regime(current, metrics)
+    if regime == "distribution":
+        score -= Decimal("6"); risk_flags.append("量价背离，警惕派发")
+    elif regime == "recovery":
+        score += Decimal("4"); rationale.append("超卖反弹迹象")
+
+    if not rationale:
+        rationale.append("多空均衡，等待明确信号")
+
+    # ═══════════════════════════════════════════════════════════
+    # PHASE 8: Decision & Hard Guards
+    # ═══════════════════════════════════════════════════════════
     score = max(Decimal("0"), min(score, Decimal("100")))
     action = _decision_action(score, monitor_config, metrics.benchmark_change_pct, metrics.market_advance_ratio)
+
     action, guard_rationales, guard_risk_flags = _apply_account_risk_guards(
-        action,
-        monitor_config,
-        portfolio_holding,
+        action, monitor_config, portfolio_holding,
         portfolio_cash_ratio=portfolio_cash_ratio,
         portfolio_position_ratio=portfolio_position_ratio,
     )
     rationale.extend(guard_rationales)
     risk_flags.extend(guard_risk_flags)
 
-    # ── MARKET CRASH GUARD ──
-    # When the broader market is in freefall, all buy/hold signals are suppressed.
-    # For office workers who can't monitor intraday, this prevents buying into crashes.
+    # Market crash guard
     market_crash = (
         (metrics.benchmark_change_pct <= Decimal("-2.00") and metrics.market_advance_ratio <= Decimal("0.35"))
         or metrics.benchmark_change_pct <= Decimal("-3.50")
         or metrics.market_advance_ratio <= Decimal("0.20")
     )
     if market_crash and action in ("buy", "hold"):
-        prev_action = action
         action = "avoid"
-        risk_flags.append(
-            f"⚠️ 大盘暴跌（基准 {_format_percent(metrics.benchmark_change_pct)}，上涨占比 {_format_percent(metrics.market_advance_ratio * 100)}），"
-            f"覆巢之下无完卵，{prev_action} 信号被强制降级为观望"
-        )
-        rationale.append("大盘系统性风险：暴跌日不接飞刀")
+        risk_flags.append(f"大盘暴跌，覆巢之下无完卵")
+        rationale.append("大盘系统性风险")
 
-    # ── ANTI-CHASE GUARD ──
-    # Don't buy stocks already up sharply today. Chasing intraday spikes
-    # is the #1 way for office workers to lose money in A-shares.
-    stock_chasing = current.change_percent >= Decimal("3.00")
-    if stock_chasing and action in ("buy", "hold"):
-        prev_action = action
+    # Anti-chase guard
+    if current.change_percent >= Decimal("3.00") and action in ("buy", "hold"):
         action = "avoid"
-        risk_flags.append(
-            f"⚠️ 反追涨护栏：个股当日涨幅 {_format_percent(current.change_percent)}≥3%，"
-            f"{prev_action} 信号被强制降级为观望，必须等缩量回踩MA10后再评估"
-        )
-        rationale.append("不追高纪律：涨超3%坚决不入场，等确认回踩支撑")
+        risk_flags.append(f"反追涨护栏：日涨{_format_percent(current.change_percent)}≥3%")
+        rationale.append("不追高纪律")
 
-    # ── EX-DIVIDEND GUARD ──
-    # When a stock recently went ex-dividend, today's price change is
-    # artificially inflated.  Buying on this false signal means the user
-    # sees an immediate "loss" the next day when the adjustment reverses.
+    # Ex-dividend guard
     if recent_ex_dividend and action in ("buy", "hold"):
-        prev_action = action
         action = "avoid"
-        risk_flags.append(
-            "⚠️ 除权除息预警：近期日线存在异常跳空缺口，疑似除权除息调整，"
-            f"今日涨幅可能为技术性修复而非真实上涨，{prev_action} 信号被降级为观望"
-        )
-        rationale.append("除权除息防护：异常跳空缺口后不追涨，等缺口修复确认")
+        risk_flags.append("除权除息预警")
+        rationale.append("除权除息防护")
 
-    # ── STOP-PROFIT GUARD ──
-    # When a take-profit tier has been triggered (risk_flags already contain
-    # the tier message from scoring phase), force the action to "reduce".
-    # Score-based adjustment (-12/-20) is not enough — daily bull signals
-    # can push score back above buy threshold.
-    take_profit_triggered = any("🎯" in flag for flag in risk_flags)
-    if take_profit_triggered and action in ("buy", "hold", "avoid"):
-        is_full_sell = any("清仓" in flag for flag in risk_flags)
-        prev_action = action
-        if is_full_sell:
-            action = "reduce"  # reduce → sell all in _trade_plan context
-            rationale.append("止盈纪律强制：全仓止盈信号，不因日线多头而贪心")
-        else:
-            action = "reduce"
-            rationale.append("止盈纪律强制：分批止盈信号，先落袋为安")
+    # Stop-profit guard
+    if any("🎯" in flag for flag in risk_flags) and action in ("buy", "hold", "avoid"):
+        action = "reduce"
+        rationale.append("止盈纪律强制")
 
+    # ═══════════════════════════════════════════════════════════
+    # PHASE 9: Trade Plan
+    # ═══════════════════════════════════════════════════════════
     trade_advice, trade_size_hint, entry_note = _trade_plan(
-        action,
-        score,
-        current,
-        metrics,
-        portfolio_holding,
+        action, score, current, metrics, portfolio_holding,
         trading_habit_profile,
         monitor_config=monitor_config,
         total_assets=portfolio_total_assets,
     )
+
     return DecisionSignal(
         action=action,
         score=score.quantize(Decimal("0.01")),
         confidence=_confidence_level(score, sample_size),
         regime=regime,
-        rationale=rationale,
-        risk_flags=risk_flags,
-        trade_advice=trade_advice,
+        advice=trade_advice,
         trade_size_hint=trade_size_hint,
         entry_note=entry_note,
+        rationale="；".join(rationale),
+        risk_flags="；".join(risk_flags) if risk_flags else "",
+        holding_return_pct=holding_return_pct,
+        take_profit_triggered=any("🎯" in f for f in risk_flags),
     )
-
-
-def _confidence_level(score: Decimal, sample_size: int) -> str:
-    edge = abs(score - Decimal("50"))
-    if sample_size < 60:
-        return "low"
-    if sample_size >= 240 and edge >= Decimal("18"):
-        return "high"
-    if sample_size >= 120 and edge >= Decimal("14"):
-        return "high"
-    if sample_size >= 120 and edge >= Decimal("10"):
-        return "medium"
-    if edge >= Decimal("16"):
-        return "medium"
-    return "low"
-
-
-def _market_regime(current: StockQuote, metrics: ObservationMetrics) -> str:
-    # Distribution: heavy volume near highs but price stalling — possible top-side supply
-    near_high = metrics.bias_to_ma60 >= Decimal("0.50")
-    heavy_vol = metrics.volume_ratio_30 >= Decimal("1.50")
-    stalling = metrics.step_change_pct <= Decimal("0.10") or metrics.rsi14 >= Decimal("72")
-    if near_high and heavy_vol and stalling and current.change_percent <= Decimal("1.50"):
-        return "distribution"
-
-    # Recovery: oversold + nascent bounce (step up or MACD golden cross)
-    oversold = metrics.rsi14 <= Decimal("32")
-    bouncing = metrics.step_change_pct >= Decimal("0.20") or (
-        metrics.macd_histogram > 0 and metrics.macd_prev_histogram <= 0
-    )
-    if oversold and bouncing:
-        return "recovery"
-
-    if current.change_percent >= 0 and metrics.bias_to_ma15 >= 0 and metrics.bias_to_ma60 >= 0 and metrics.relative_strength_pct >= 0:
-        return "momentum"
-    if current.change_percent < 0 and metrics.bias_to_ma15 < 0 and metrics.bias_to_ma60 < 0 and metrics.relative_strength_pct <= 0:
-        return "drawdown"
-    if metrics.recent_range_pct >= Decimal("4.50"):
-        return "volatile"
-    return "range"
-
-
-def _decision_action(
-    score: Decimal,
-    monitor_config: MonitorConfig,
-    benchmark_change_pct: Decimal = Decimal("0"),
-    market_advance_ratio: Decimal = Decimal("0"),
-) -> str:
-    thresholds = monitor_config.decision_thresholds
-    buy = Decimal(str(thresholds.buy_score))
-    hold = Decimal(str(thresholds.hold_score))
-    reduce = Decimal(str(thresholds.reduce_score))
-    shift = _compute_threshold_shift(benchmark_change_pct, market_advance_ratio)
-    if score >= buy + shift:
-        return "buy"
-    if score >= hold + shift:
-        return "hold"
-    if score >= reduce + shift:
-        return "reduce"
-    return "avoid"
-
-
-def _apply_account_risk_guards(
-    action: str,
-    monitor_config: MonitorConfig,
-    portfolio_holding: PortfolioHolding | None,
-    *,
-    portfolio_cash_ratio: Decimal | None,
-    portfolio_position_ratio: Decimal | None,
-) -> tuple[str, list[str], list[str]]:
-    adjusted_action = action
-    rationale: list[str] = []
-    risk_flags: list[str] = []
-    has_position = portfolio_holding is not None and portfolio_holding.quantity > 0
-    risk_controls = monitor_config.risk_controls
-
-    total_position_pct = None
-    if portfolio_cash_ratio is not None:
-        total_position_pct = ((Decimal("1") - portfolio_cash_ratio) * Decimal("100")).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
-    single_position_pct = None
-    if portfolio_position_ratio is not None:
-        single_position_pct = (portfolio_position_ratio * Decimal("100")).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
-    min_cash_pct = Decimal(str(risk_controls.min_cash_pct))
-    max_total_position_pct = Decimal(str(risk_controls.max_total_position_pct))
-    max_single_position_pct = Decimal(str(risk_controls.max_single_position_pct))
-
-    if total_position_pct is not None and total_position_pct >= max_total_position_pct:
-        risk_flags.append(f"账户总仓位已到 {_format_percent(total_position_pct)}，触发总仓位上限 {_format_percent(max_total_position_pct)}")
-        if adjusted_action == "buy":
-            adjusted_action = "hold" if has_position else "avoid"
-            rationale.append("账户总仓位已触顶，新增仓位信号自动降级")
-
-    if portfolio_cash_ratio is not None:
-        cash_pct = (portfolio_cash_ratio * Decimal("100")).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
-        if cash_pct <= min_cash_pct:
-            risk_flags.append(f"现金缓冲仅剩 {_format_percent(cash_pct)}，低于最低现金线 {_format_percent(min_cash_pct)}")
-            if adjusted_action == "buy":
-                adjusted_action = "hold" if has_position else "avoid"
-                rationale.append("现金缓冲不足，先守纪律，不再新增仓位")
-
-    if single_position_pct is not None and single_position_pct >= max_single_position_pct:
-        risk_flags.append(f"单票仓位达到 {_format_percent(single_position_pct)}，超过单票上限 {_format_percent(max_single_position_pct)}")
-        if adjusted_action == "buy":
-            adjusted_action = "reduce" if has_position else "avoid"
-            rationale.append("单票已超仓，买入信号被改写为降仓/观望")
-        elif adjusted_action == "hold" and has_position:
-            adjusted_action = "reduce"
-            rationale.append("单票仓位已超上限，持有信号改写为减仓")
-
-    return adjusted_action, rationale, risk_flags
 
 
 def _trade_plan(
@@ -1506,13 +1201,35 @@ def _daily_rsi(closes: list[Decimal], period: int = 14) -> Decimal | None:
 
 
 def _daily_volume_ratio(volumes: list[Decimal], lookback: int = 5) -> Decimal | None:
-    """Compute today's volume vs N-day average volume ratio."""
+    """Compute today's volume vs N-day average volume ratio.
+
+    IMPORTANT: During intraday trading, today's volume from the daily K-line
+    API is only a partial-day figure.  Comparing it directly against full-day
+    averages artificially inflates "缩量" signals in the morning, triggering
+    false sell decisions.  We estimate the full-day volume by scaling
+    proportionally to the fraction of the trading day elapsed (capped at 3x
+    to avoid over-correcting the high-volume opening minutes).
+    """
+    from datetime import datetime
+    from .market_hours import is_a_share_trading_time
+
     if len(volumes) < lookback + 1:
         return None
     today_vol = volumes[-1]
     avg_vol = sum(volumes[-lookback-1:-1], Decimal("0")) / Decimal(lookback)
     if avg_vol <= 0:
         return None
+
+    # Intraday volume scaling
+    now = datetime.now()
+    if is_a_share_trading_time(now):
+        minutes_elapsed = (now - now.replace(hour=9, minute=30, second=0, microsecond=0)).total_seconds() / 60
+        if now.hour >= 13:
+            minutes_elapsed -= 90
+        if 10 < minutes_elapsed < 240:
+            scale = min(Decimal("3.00"), Decimal(240) / Decimal(str(round(minutes_elapsed, 1))))
+            today_vol = today_vol * scale
+
     return (today_vol / avg_vol).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
 
 

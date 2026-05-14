@@ -71,18 +71,19 @@ def seconds_until_next_session(now: datetime | None = None) -> float:
     else:
         now = now.astimezone(MARKET_TZ)
 
-    # Find the next auction time (9:25)
-    next_day = now + timedelta(days=1)
-    next_auction = next_day.replace(hour=9, minute=25, second=0, microsecond=0)
-
-    # Skip weekends
-    while next_auction.weekday() >= 5:
-        next_auction += timedelta(days=1)
+    today = now.date()
+    today_auction = datetime.combine(today, time(9, 25), tzinfo=MARKET_TZ)
 
     # If it's early morning (before 9:25) and today is a trading day, today's auction
-    today_auction = now.replace(hour=9, minute=25, second=0, microsecond=0)
-    if now < today_auction and now.weekday() < 5:
+    if now < today_auction and today.weekday() < 5:
         return (today_auction - now).total_seconds()
+
+    # Find the next trading day's auction
+    next_day = today + timedelta(days=1)
+    next_auction = datetime.combine(next_day, time(9, 25), tzinfo=MARKET_TZ)
+    while next_auction.weekday() >= 5:
+        next_day = next_auction.date() + timedelta(days=1)
+        next_auction = datetime.combine(next_day, time(9, 25), tzinfo=MARKET_TZ)
 
     return (next_auction - now).total_seconds()
 

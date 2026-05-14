@@ -16,7 +16,7 @@ from .models import StockQuote
 from .logging_utils import get_logger
 from .news import fetch_announcements_for_code, filter_new_announcements, format_announcement_line
 from .notify import deliver_feishu_message
-from .codex_bridge import flush_codex_bridge
+from .codex_bridge import flush_codex_bridge, check_stale_notifications
 from .portfolio import compute_cash_ratio, compute_position_ratio, find_holding, generate_portfolio_report, load_snapshot as load_portfolio_snapshot
 from .portfolio_doc_sync import sync_snapshot_from_doc
 from .providers import EastmoneyMarketSnapshotProvider, EastmoneyMinuteHistoryProvider, TencentQuoteProvider
@@ -48,6 +48,7 @@ class MonitorRuntime:
 
     def run_once(self) -> None:
         self._prune_notifications()
+        self._check_bridge_health()  # Alert if cron bridge stalled
         self._sync_portfolio_snapshot_if_needed()
         # Pre-market briefing must be checked BEFORE the trading-session guard,
         # because auction period (9:25-9:30) IS trading time.  Previously it was
@@ -124,7 +125,7 @@ class MonitorRuntime:
             dedup_body = f"{result.decision.action}:{int(result.decision.score) // 10}"
             if self._is_trade_signal(result, holding) and self._dedup_ok(stock.symbol, dedup_body, cooldown_minutes=self.config.monitor.notification.dedup.cooldown_minutes):
                 action_label = {"buy": "买入", "reduce": "减仓", "avoid": "清仓"}.get(result.decision.action, result.decision.action)
-                pending_notifications.append((stock.symbol, f"{quote.code} {quote.name} {action_label}", format_mobile_signal(result.title, result.message, include_title=False)))
+                pending_notifications.append((stock.symbol, f"{quote.code} {quote.name} {action_label}", format_mobile_signal(result.title, result.message, include_title=False), dedup_body))
 
         self._notify_batch(pending_notifications)
 
@@ -225,23 +226,25 @@ class MonitorRuntime:
         if not notifications:
             return
 
-        batchable: list[tuple[str, str, str]] = []
-        for symbol, title, message in notifications:
+        batchable: list[tuple[str, str, str, str]] = []
+        for item in notifications:
+            symbol, title, message = item[0], item[1], item[2]
+            dedup_body = item[3] if len(item) > 3 else ""
             if symbol.endswith(":trigger") or "【盘中交易指令】" in message or "触发交易区间" in title:
                 self._notify(symbol, title, message)
             else:
-                batchable.append((symbol, title, message))
+                batchable.append((symbol, title, message, dedup_body))
 
         if not batchable:
             return
         if len(batchable) == 1:
-            symbol, title, message = batchable[0]
+            symbol, title, message, dedup_body = batchable[0]
             self._notify(symbol, title, message)
             return
 
         lines = [f"【盘中动作卡】{datetime.now(MARKET_TZ):%H:%M}"]
         dedup_parts: list[str] = []
-        for symbol, title, message in batchable:
+        for symbol, title, message, dedup_body in batchable:
             body_lines = [line.strip() for line in message.splitlines() if line.strip()]
             action_line = next((line for line in body_lines if line.startswith("动作：") or line.startswith("操作指令：") or line.startswith("直接建议：")), body_lines[0] if body_lines else "")
             size_line = next((line for line in body_lines if line.startswith("执行数量：")), "")
@@ -264,6 +267,12 @@ class MonitorRuntime:
 
         self._notify("batch", "盘中动作卡", "\n".join(lines))
         self.last_notifications["batch"] = ("\n".join(dedup_parts), datetime.now())
+        # ── Per-symbol dedup: update individual stock entries so _dedup_ok
+        #     can enforce per-stock cooldown in subsequent daemon cycles ──
+        now = datetime.now()
+        for symbol, _title, _msg, dedup_body in batchable:
+            if dedup_body:
+                self.last_notifications[symbol] = (dedup_body, now)
 
     @staticmethod
     def _strip_label(line: str) -> str:
@@ -358,6 +367,19 @@ class MonitorRuntime:
         self.last_notifications = {
             key: value for key, value in self.last_notifications.items() if value[1] > cutoff
         }
+
+    def _check_bridge_health(self) -> None:
+        """Alert if notifications have been stuck in the outbox too long."""
+        try:
+            stale = check_stale_notifications(max_age_minutes=5)
+            if stale:
+                logger.warning(
+                    "Bridge health: %d notifications stuck >5min in outbox. "
+                    "Cron bridge may be stalled.",
+                    len(stale),
+                )
+        except Exception:
+            pass  # Don't let health check crash the daemon
 
     def _compute_effective_stop(self, quote: StockQuote, holding) -> tuple[Decimal, str, str] | None:
         if holding is None or holding.cost_price <= 0 or holding.quantity <= 0:

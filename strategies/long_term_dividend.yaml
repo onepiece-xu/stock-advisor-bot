@@ -1,0 +1,79 @@
+# 长线股息策略
+# 适用于：上班族底仓配置，持有 6 个月以上，以股息为主、价差为辅
+# 触发条件：现金占比 > 60%，总仓位中底仓占比 < 30%
+
+name: "长线股息底仓策略"
+version: "1.0"
+type: "long_term_dividend"
+
+# ── 触发条件 ──
+conditions:
+  min_cash_pct: 60           # 现金 > 60% 时才考虑
+  max_dividend_position_pct: 30  # 底仓不超过总资产 30%
+  market_not_crash: true     # 大盘未暴跌（> -1.5%）
+
+# ── 选股标准 ──
+selection:
+  sectors:                   # 优先行业
+    - 银行
+    - 电力
+    - 煤炭
+    - 石油
+    - 高速
+    - 公用事业
+  value_filters:
+    pe_max: 25               # PE < 25
+    pb_max: 2.5              # PB < 2.5（通常更低）
+    mcap_min_yi: 200         # 总市值 > 200 亿
+    chg_max_pct: 5.0         # 当日不追涨 > 5%
+  preference:
+    state_owned: true        # 央企优先
+    pe_lt_10: true           # PE < 10 优先
+    dividend_history: true   # 历史分红稳定优先
+
+# ── 买入规则 ──
+entry:
+  timing:
+    daily_chg_max_pct: 3.0   # 当日涨 > 3% 不入场
+    ma_condition: "price between MA20 and MA60, MA20 flat or rising"
+    weekly_buy_window: "Monday morning after pre-market briefing"
+  sizing:
+    per_stock_pct: 10        # 单只不超过总资产 10%
+    min_lot: 100             # 最少 100 股
+    max_lot_by_cash: true    # 不超过可投资现金
+  priority:
+    - "existing_profitable_holdings"  # 现有浮盈持仓加仓
+    - "cleared_old_stocks"            # 已清仓旧标的接回
+    - "new_dividend_candidates"       # 全新股息标的
+
+# ── 持有规则 ──
+holding:
+  min_period_months: 6       # 至少持有 6 个月
+  dividend_reinvest: true    # 股息再投入
+  review_frequency: "weekly" # 每周一审，不做频繁调整
+  ignore:
+    - "daily_fluctuation"    # 日波动不操作
+    - "minor_drawdown"       # 小回撤不恐慌
+    - "sector_rotation"      # 不追板块轮动
+
+# ── 卖出规则 ──
+exit:
+  fundamentals:
+    pe_above_30: true        # PE > 30 减持
+    dividend_cut: true       # 分红大幅减少
+    state_asset_injection: true  # 央企注资重组（可能稀释）
+  price:
+    profit_50pct: true       # 浮盈 > 50% 减半仓
+    stop_loss_20pct: true    # 浮亏 > 20% 清仓（极罕见）
+  exceptions:
+    - "不因微涨（< 20%）卖出"
+    - "不因大盘波动卖出"
+    - "不因短期利空卖出"
+
+# ── 禁止操作 ──
+forbidden:
+  - "追涨买入（日涨 > 3%）"
+  - "股息股做 T（手续费吃掉股息）"
+  - "融资加杠杆"
+  - "单只超配 > 15%"
+  - "频繁调仓（月换手 < 20%）"

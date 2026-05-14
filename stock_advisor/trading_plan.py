@@ -74,7 +74,7 @@ class TriggerHit:
 
 
 DEFAULT_TRIGGER_MAP = {
-    "003035": TradeTrigger(
+    "003035:南网能源": TradeTrigger(
         code="003035",
         name="南网能源",
         action="sell",
@@ -85,7 +85,7 @@ DEFAULT_TRIGGER_MAP = {
         note="反弹进入减仓带先卖 500 股，若跌回弱承接位下方再执行第二笔减仓",
         disable_buy=True,
     ),
-    "603993": TradeTrigger(
+    "603993:洛阳钼业": TradeTrigger(
         code="603993",
         name="洛阳钼业",
         action="sell",
@@ -96,7 +96,7 @@ DEFAULT_TRIGGER_MAP = {
         note="反弹到减仓带先卖 200 股，若重新跌回 20 下方，继续禁止补仓",
         disable_buy=True,
     ),
-    "601698": TradeTrigger(
+    "601698:中国卫通": TradeTrigger(
         code="601698",
         name="中国卫通",
         action="hold",
@@ -150,7 +150,7 @@ def load_triggers(path: str | Path | None) -> dict[str, TradeTrigger]:
             note=str(item.get("note", "")),
             disable_buy=bool(item.get("disableBuy", False)),
         )
-        triggers[trigger.code] = trigger
+        triggers[f"{trigger.code}:{trigger.name}"] = trigger
     return triggers
 
 
@@ -192,8 +192,9 @@ def detect_trigger_hit(
     risk: TriggerRiskContext | None = None,
 ) -> TriggerHit | None:
     trigger_map = triggers or DEFAULT_TRIGGER_MAP
-    trigger = trigger_map.get(quote.code)
-    if trigger is None:
+    # Support multiple triggers per code (key format: {code}:{name})
+    matching = [t for t in trigger_map.values() if t.code == quote.code]
+    if not matching:
         return None
     holding = _find_holding(snapshot, quote.code)
     if holding is None or holding.quantity <= 0:
@@ -204,19 +205,21 @@ def detect_trigger_hit(
         blocked, reason = risk.is_blocked()
         if blocked:
             logger.warning(
-                "Trigger blocked for %s(%s) price=%s action=%s reason=%s",
-                trigger.name, trigger.code, quote.current_price, trigger.action, reason,
+                "Trigger blocked for %s price=%s action=multi-trigger reason=%s",
+                quote.code, quote.current_price, reason,
             )
             return None
 
     price = quote.current_price
-    quantity = _dynamic_quantity(trigger, holding, snapshot)
-    weight_pct = _holding_weight_pct(holding, snapshot)
-    cash_after_trade = snapshot.cash + (price * Decimal(quantity)) if trigger.action == "sell" else snapshot.cash
-    if trigger.price_min <= price <= trigger.price_max:
-        return TriggerHit(trigger=trigger, current_price=price, hit_type="target_range", quantity=quantity, weight_pct=weight_pct, cash_after_trade=cash_after_trade)
-    if price <= trigger.fallback_price:
-        return TriggerHit(trigger=trigger, current_price=price, hit_type="fallback", quantity=quantity, weight_pct=weight_pct, cash_after_trade=cash_after_trade)
+    # Check each matching trigger for price range hit (first wins)
+    for trigger in matching:
+        quantity = _dynamic_quantity(trigger, holding, snapshot)
+        weight_pct = _holding_weight_pct(holding, snapshot)
+        cash_after_trade = snapshot.cash + (price * Decimal(quantity)) if trigger.action == "sell" else snapshot.cash
+        if trigger.price_min <= price <= trigger.price_max:
+            return TriggerHit(trigger=trigger, current_price=price, hit_type="target_range", quantity=quantity, weight_pct=weight_pct, cash_after_trade=cash_after_trade)
+        if price <= trigger.fallback_price:
+            return TriggerHit(trigger=trigger, current_price=price, hit_type="fallback", quantity=quantity, weight_pct=weight_pct, cash_after_trade=cash_after_trade)
     return None
 
 
@@ -423,8 +426,8 @@ def check_stale_triggers(triggers: dict[str, TradeTrigger], snapshot: PortfolioS
     - Action is sell/hold and current price is >15% below fallback (trigger is unreachable)
     """
     warnings: list[str] = []
-    for code, trigger in triggers.items():
-        holding = _find_holding(snapshot, code)
+    for _key, trigger in triggers.items():
+        holding = _find_holding(snapshot, trigger.code)
         if holding is None or holding.quantity <= 0:
             continue
         current = holding.current_price

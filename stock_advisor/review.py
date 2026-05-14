@@ -8,7 +8,6 @@ from pathlib import Path
 from zoneinfo import ZoneInfo
 
 from .config import AppConfig
-from .habit_learning import build_trading_habit_profile
 from .market_hours import MARKET_TZ, next_session_str
 from .portfolio import load_snapshot as load_portfolio_snapshot
 from .storage import connect_db, fetch_daily_review_snapshot, fetch_latest_trade_date
@@ -80,8 +79,6 @@ def mark_close_review_sent(config: AppConfig, trade_date: date) -> None:
 
 
 def _render_review_body(config: AppConfig, trade_date: date, items: list[dict], *, requested_trade_date: date) -> str:
-    conn = connect_db(config.storage.sqlite_path)
-    trading_habit_profile = build_trading_habit_profile(conn)
     lines = [f"【收盘复盘】{trade_date.isoformat()}"]
     if trade_date != requested_trade_date:
         lines.append(f"说明: 当日暂无落库行情，已回退到最近交易日 {trade_date.isoformat()}")
@@ -92,37 +89,48 @@ def _render_review_body(config: AppConfig, trade_date: date, items: list[dict], 
 
     scores = [Decimal(str(item["score"])) for item in items if item["score"] is not None]
     avg_score = _avg(scores)
-    positive = max(items, key=lambda item: item["change_percent"])
-    negative = min(items, key=lambda item: item["change_percent"])
-    buy_like = [item["code"] for item in items if item["action"] == "buy"]
     reduce_like = [item["code"] for item in items if item["action"] in {"reduce", "avoid"}]
 
-    lines.extend(
-        [
-            f"覆盖标的: {len(items)}",
-            f"平均分: {_fmt_decimal(avg_score)}" if avg_score is not None else "平均分: N/A",
-            f"偏强: {positive['code']} {positive['name']} {_signed(positive['change_percent'])}%",
-            f"偏弱: {negative['code']} {negative['name']} {_signed(negative['change_percent'])}%",
-            f"关注买点: {', '.join(buy_like) if buy_like else '暂无'}",
-            f"优先减仓: {', '.join(reduce_like) if reduce_like else '暂无'}",
-            "",
-            "【标的复盘】",
-        ]
-    )
+    # ── 整体一句话 ──
+    summary_parts = []
+    if avg_score is not None:
+        if avg_score >= 58:
+            summary_parts.append("偏强")
+        elif avg_score <= 42:
+            summary_parts.append("偏弱")
+        else:
+            summary_parts.append("分化")
+    summary_parts.append(f"{len(items)}只标的")
+    lines.append("整体：" + " | ".join(summary_parts))
 
+    if reduce_like:
+        lines.append(f"⚠️ 优先减仓：{', '.join(reduce_like)}")
+
+    # ── 【标的复盘】每只 1-2 行 ──
+    lines.append("")
+    action_emoji = {"buy": "🟢", "hold": "🟡", "reduce": "🔴", "avoid": "⛔"}
     for item in items:
-        lines.append(
-            f"- {item['code']} {item['name']} | 收盘 {_fmt_float(item['current_price'])} | 涨跌 {_signed(item['change_percent'])}% | 动作 {item['action']} | 评分 {_fmt_optional(item['score'])}"
-        )
-        lines.append(f"  状态 {item['regime']} / {item['confidence']} / {item['signal_level']}")
+        emoji = action_emoji.get(item["action"], "⚪")
+        # 主线：名称 + 涨跌 + 动作 + 一句话建议
+        header = f"{emoji} {item['code']} {item['name']} | {_signed(item['change_percent'])}% | **{item['action']}**"
         if item["trade_advice"]:
-            lines.append(f"  建议 {item['trade_advice']} | 仓位 {item['trade_size_hint']}")
-        if item["entry_note"]:
-            lines.append(f"  处理 {item['entry_note']}")
-        reason = "；".join(item["rationale"][:2]) if item["rationale"] else "暂无明显理由"
-        lines.append(f"  理由 {reason}")
+            header += f" | {_shorten_advice(item['trade_advice'], 30)}"
+        if item.get("score") is not None:
+            header += f" | 分{item['score']:.0f}"
+        lines.append(header)
+
+        # 副线：关键理由（只取第一条）
+        if item["rationale"]:
+            reason = item["rationale"][0]
+            if len(reason) > 60:
+                reason = reason[:57] + "..."
+            lines.append(f"  {reason}")
+
+        # 关键风险 tag
         if item["risk_flags"]:
-            lines.append(f"  风险 {'；'.join(item['risk_flags'][:2])}")
+            important_flags = [f for f in item["risk_flags"][:3] if f not in ("📊", "📉")]
+            if important_flags:
+                lines.append(f"  ⚠️ {' | '.join(important_flags)}")
 
     portfolio_path = config.snapshot_path
     if portfolio_path.exists():
@@ -205,16 +213,6 @@ def _render_review_body(config: AppConfig, trade_date: date, items: list[dict], 
         _save_plan_record(config.review.data_dir, trade_date, snapshot, triggers, item_map, config)
     except Exception:
         pass  # Non-critical
-
-    if trading_habit_profile is not None:
-        lines.extend(["", "【交易习惯学习】"])
-        lines.append(f"样本数: {trading_habit_profile.sample_count}")
-        lines.append(f"画像: {trading_habit_profile.summary}")
-        lines.append(
-            f"建议已按习惯校准: 买入常用 {trading_habit_profile.preferred_buy_lot} 股 | "
-            f"加仓常用 {trading_habit_profile.preferred_add_lot} 股 | "
-            f"减仓习惯 {_fmt_decimal(trading_habit_profile.preferred_reduce_ratio * Decimal('100'))}%"
-        )
 
     # ── Friday weekly wrap + cash deployment ──
     is_friday = trade_date.weekday() == 4
@@ -442,12 +440,12 @@ def _avg(values: list[Decimal]) -> Decimal | None:
     return (total / Decimal(len(values))).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
 
 
-def _fmt_optional(value: float | None) -> str:
-    return "N/A" if value is None else f"{value:.0f}"
-
-
-def _fmt_float(value: float) -> str:
-    return f"{value:.3f}"
+def _shorten_advice(advice: str, max_len: int = 30) -> str:
+    """Trim verbose trade advice to a compact form."""
+    advice = advice.strip()
+    if len(advice) <= max_len:
+        return advice
+    return advice[:max_len-1] + "…"
 
 
 def _fmt_decimal(value: Decimal) -> str:

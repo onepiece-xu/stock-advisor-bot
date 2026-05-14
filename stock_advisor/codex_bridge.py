@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 import json
+import subprocess
 from datetime import datetime
 from pathlib import Path
 
 
 OUTBOX_PATH = Path(__file__).resolve().parent.parent / "data" / "codex_outbox.jsonl"
 MAX_MESSAGE_LENGTH = 8000  # Feishu text limit ~20KB; keep well under with headroom
+BRIDGE_SCRIPT = Path("/root/.hermes/scripts/stock_advisor_codex_bridge.sh")
 
 
 def queue_codex_notification(title: str, message: str) -> None:
@@ -61,3 +63,23 @@ def pull_codex_notifications(limit: int = 20, *, mark_sent: bool = True) -> list
         )
 
     return pulled
+
+
+def flush_codex_bridge() -> bool:
+    """Run the bridge script immediately to flush pending outbox notifications.
+
+    Returns True if the flush succeeded, False on error.
+    Used as a dual-insurance layer: after queuing a time-sensitive notification
+    (pre-market briefing, close review), call this to avoid waiting for cron.
+    """
+    if not BRIDGE_SCRIPT.exists():
+        return False
+    try:
+        result = subprocess.run(
+            ["/bin/bash", str(BRIDGE_SCRIPT)],
+            capture_output=True,
+            timeout=30,
+        )
+        return result.returncode == 0
+    except Exception:
+        return False

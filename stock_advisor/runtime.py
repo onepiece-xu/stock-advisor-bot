@@ -16,6 +16,7 @@ from .models import StockQuote
 from .logging_utils import get_logger
 from .news import fetch_announcements_for_code, filter_new_announcements, format_announcement_line
 from .notify import deliver_feishu_message
+from .codex_bridge import flush_codex_bridge
 from .portfolio import compute_cash_ratio, compute_position_ratio, find_holding, generate_portfolio_report, load_snapshot as load_portfolio_snapshot
 from .portfolio_doc_sync import sync_snapshot_from_doc
 from .providers import EastmoneyMarketSnapshotProvider, EastmoneyMinuteHistoryProvider, TencentQuoteProvider
@@ -427,6 +428,7 @@ class MonitorRuntime:
                     app_secret=self.config.feishu_bot.app_secret,
                 )
                 mark_close_review_sent(self.config, trade_date)
+                flush_codex_bridge()  # 双保险：不等 cron，立即推送
             except Exception as exc:  # noqa: BLE001
                 logger.exception("Close review delivery failed error=%s", exc)
                 return
@@ -694,6 +696,7 @@ class MonitorRuntime:
                     app_id=self.config.feishu_bot.app_id,
                     app_secret=self.config.feishu_bot.app_secret,
                 )
+                flush_codex_bridge()  # 双保险：不等 cron，立即推送
             except Exception as exc:  # noqa: BLE001
                 logger.exception("Pre-market briefing delivery failed error=%s", exc)
 

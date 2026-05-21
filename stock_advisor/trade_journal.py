@@ -181,6 +181,40 @@ class TradeJournal:
             ),
         }
 
+    def get_strategy_stats(self) -> dict:
+        """按策略统计交易表现。
+
+        Returns:
+            {strategy_name: {total, buys, sells, verified, good, bad, win_rate, total_pnl, avg_holding_days}}
+        """
+        entries = self._read_all()
+        sells = [e for e in entries if e["side"] == "sell"]
+
+        # Group by strategy
+        strategies: dict[str, list[dict]] = {}
+        for e in sells:
+            s = e.get("strategy", "unknown")
+            strategies.setdefault(s, []).append(e)
+
+        result = {}
+        for strategy, trades in sorted(strategies.items()):
+            verified = [t for t in trades if t.get("verdict")]
+            good = sum(1 for t in verified if t["verdict"] == "good")
+            bad = sum(1 for t in verified if t["verdict"] == "bad")
+            total_pnl = sum(t["pnl_pct"] for t in trades if t.get("pnl_pct"))
+            holding_days = [t["holding_days"] for t in trades if t.get("holding_days")]
+
+            result[strategy] = {
+                "total": len(trades),
+                "verified": len(verified),
+                "good": good,
+                "bad": bad,
+                "win_rate": round(good / len(verified) * 100, 1) if verified else 0,
+                "total_pnl_pct": round(total_pnl, 2),
+                "avg_holding_days": round(sum(holding_days) / len(holding_days), 1) if holding_days else 0,
+            }
+        return result
+
     def _append(self, entry: TradeEntry) -> None:
         with open(self.journal_path, "a", encoding="utf-8") as f:
             f.write(json.dumps(asdict(entry), ensure_ascii=False) + "\n")

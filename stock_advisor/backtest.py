@@ -649,3 +649,236 @@ def run_daily_backtest(
         daily_returns=signals,
         summary="\\n".join(summary_lines),
     )
+
+
+# ═══════════════════════════════════════════════════════════════════
+# Enhanced backtest (borrowed from daily_stock_analysis)
+# Adds: multi-horizon returns, direction accuracy, all-signal eval
+# ═══════════════════════════════════════════════════════════════════
+
+HORIZONS = (1, 3, 5)  # trading days
+
+
+def _multi_horizon_return(
+    trading_dates: list,
+    day_groups: dict,
+    today_idx: int,
+    horizon: int,
+) -> float | None:
+    """Return % price change from today's close to horizon days later."""
+    future_idx = today_idx + horizon
+    if future_idx >= len(trading_dates):
+        return None
+    today_close = float(day_groups[trading_dates[today_idx]][-1].current_price)
+    future_close = float(day_groups[trading_dates[future_idx]][-1].current_price)
+    if today_close <= 0:
+        return None
+    return (future_close - today_close) / today_close * 100
+
+
+def direction_accuracy(
+    action: str,
+    returns: dict[int, float | None],
+    neutral_band: float = 1.0,
+) -> dict:
+    """Check if price moved in the direction predicted by the action.
+
+    action → expected direction:
+      buy    → up (> +neutral_band%)
+      hold   → not_down (> -neutral_band%)
+      reduce → down (< -neutral_band%)
+      avoid  → not_up (< +neutral_band%)
+
+    Returns {horizon: 'win'|'loss'|'neutral'|None}
+    """
+    expected = {
+        "buy": "up",
+        "hold": "not_down",
+        "reduce": "down",
+        "avoid": "not_up",
+    }.get(action, "flat")
+
+    result = {}
+    for h in HORIZONS:
+        r = returns.get(h)
+        if r is None:
+            result[h] = None
+            continue
+
+        if expected == "up":
+            result[h] = "win" if r >= neutral_band else ("loss" if r <= -neutral_band else "neutral")
+        elif expected == "down":
+            result[h] = "win" if r <= -neutral_band else ("loss" if r >= neutral_band else "neutral")
+        elif expected == "not_down":
+            result[h] = "win" if r > -neutral_band else "loss"
+        elif expected == "not_up":
+            result[h] = "win" if r < neutral_band else "loss"
+        else:
+            result[h] = "win" if abs(r) <= neutral_band else "loss"
+    return result
+
+
+def _build_enhanced_summary(
+    signals: list[dict],
+    action_breakdown: dict[str, dict],
+) -> list[str]:
+    """Build enhanced summary with multi-horizon win rates and direction metrics."""
+    total = len(signals)
+    if total == 0:
+        return ["无有效信号"]
+
+    lines = ["── 增强回测报告 ──", f"总信号: {total}"]
+
+    # Per-action breakdown
+    for action in ["buy", "hold", "reduce", "avoid"]:
+        bd = action_breakdown.get(action, {})
+        cnt = bd.get("count", 0)
+        if cnt == 0:
+            continue
+        lines.append(f"\n【{action}】共 {cnt} 次")
+        for h in HORIZONS:
+            wins = bd.get(f"wins_{h}d", 0)
+            lines.append(f"  {h}日方向正确: {wins}/{cnt} ({wins/cnt*100:.0f}%)")
+        # Average return
+        for h in HORIZONS:
+            returns = bd.get(f"returns_{h}d", [])
+            if returns:
+                avg = sum(returns) / len(returns)
+                lines.append(f"  {h}日平均收益: {avg:+.2f}%")
+
+    # Overall
+    lines.append("\n── 综合 ──")
+    for h in HORIZONS:
+        total_wins = sum(
+            bd.get(f"wins_{h}d", 0) for bd in action_breakdown.values()
+        )
+        lines.append(f"{h}日总体方向正确率: {total_wins}/{total} ({total_wins/total*100:.0f}%)")
+
+    return lines
+
+
+def run_enhanced_daily_backtest(
+    config,
+    stock,
+    days: int = 60,
+    *,
+    initial_cost: Decimal | None = None,
+    initial_quantity: int = 0,
+) -> dict:
+    """Enhanced backtest: multi-horizon + direction accuracy + all-signal eval.
+
+    Unlike the original run_daily_backtest (which only checks buy next-day win rate),
+    this evaluates every signal across 1d/3d/5d horizons and checks if the price
+    moved in the direction predicted by the action.
+    """
+    from collections import defaultdict
+    from datetime import date, timedelta
+
+    from .models import PortfolioHolding
+
+    provider = EastmoneyMinuteHistoryProvider(config.monitor)
+    end_date = date.today()
+    start_date = end_date - timedelta(days=days * 2)
+
+    daily_closes: list[Decimal] | None = None
+    daily_volumes: list[Decimal] | None = None
+    try:
+        daily_closes, daily_volumes = provider.fetch_daily_klines(stock, ndays=max(days, 60))
+    except Exception:
+        pass
+
+    all_quotes = provider.fetch_quotes(stock, start_date, end_date)
+    if not all_quotes:
+        raise RuntimeError(f"No historical data for {stock.symbol}")
+
+    day_groups: dict[date, list] = defaultdict(list)
+    for q in all_quotes:
+        day_groups[q.quote_time.date()].append(q)
+
+    trading_dates = sorted(day_groups.keys())[-days:]
+
+    holding = PortfolioHolding(
+        name=stock.code, code=stock.code,
+        quantity=initial_quantity,
+        cost_price=initial_cost or Decimal("0"),
+        current_price=Decimal("0"),
+    ) if initial_quantity > 0 else None
+
+    signals = []
+    # Accumulators for per-action breakdown
+    action_breakdown: dict[str, dict] = defaultdict(lambda: {
+        "count": 0,
+        "returns_1d": [], "returns_3d": [], "returns_5d": [],
+        "wins_1d": 0, "wins_3d": 0, "wins_5d": 0,
+    })
+
+    for i, td in enumerate(trading_dates):
+        quotes = day_groups[td]
+        if len(quotes) < 5:
+            continue
+
+        try:
+            result = analyze_quotes(
+                quotes, config.monitor,
+                portfolio_holding=holding,
+                include_news=False,
+                daily_closes=daily_closes[:i+1] if daily_closes else None,
+                daily_volumes=daily_volumes[:i+1] if daily_volumes else None,
+            )
+        except Exception:
+            continue
+
+        action = result.decision.action
+        today_close = float(quotes[-1].current_price)
+
+        # Multi-horizon returns
+        returns = {}
+        for h in HORIZONS:
+            returns[h] = _multi_horizon_return(trading_dates, day_groups, i, h)
+
+        # Direction accuracy
+        acc = direction_accuracy(action, returns)
+
+        signal = {
+            "date": td.isoformat(),
+            "close": today_close,
+            "action": action,
+            "score": float(result.decision.score),
+            "confidence": result.decision.confidence,
+        }
+        for h in HORIZONS:
+            r = returns.get(h)
+            signal[f"return_{h}d"] = round(r, 2) if r is not None else None
+            signal[f"direction_{h}d"] = acc.get(h)
+
+        signals.append(signal)
+
+        # Update breakdown
+        bd = action_breakdown[action]
+        bd["count"] += 1
+        for h in HORIZONS:
+            r = returns.get(h)
+            if r is not None:
+                bd[f"returns_{h}d"].append(r)
+            if acc.get(h) == "win":
+                bd[f"wins_{h}d"] += 1
+
+    summary_lines = _build_enhanced_summary(signals, dict(action_breakdown))
+
+    return {
+        "symbol": stock.symbol,
+        "start": trading_dates[0].isoformat(),
+        "end": trading_dates[-1].isoformat(),
+        "trading_days": len(trading_dates),
+        "signals": signals,
+        "breakdown": {k: {
+            "count": v["count"],
+            "wins_1d": v["wins_1d"],
+            "wins_3d": v["wins_3d"],
+            "wins_5d": v["wins_5d"],
+            "avg_return_1d": round(sum(v["returns_1d"])/len(v["returns_1d"]), 2) if v["returns_1d"] else None,
+            "avg_return_3d": round(sum(v["returns_3d"])/len(v["returns_3d"]), 2) if v["returns_3d"] else None,
+            "avg_return_5d": round(sum(v["returns_5d"])/len(v["returns_5d"]), 2) if v["returns_5d"] else None,
+        } for k, v in action_breakdown.items()},
+        "summary": "\n".join(summary_lines),
+    }

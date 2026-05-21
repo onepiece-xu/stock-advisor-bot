@@ -14,9 +14,11 @@ from .backtest import (
     render_minute_backtest,
     render_optimization_report,
     run_daily_backtest,
+    run_enhanced_daily_backtest,
     run_minute_backtest,
 )
 from .cash_deploy import generate_deploy_signal, render_deploy_signal
+from .data_review import generate_data_review
 from .trade_journal import TradeJournal
 from .briefing import format_mobile_digest, format_mobile_replay, format_mobile_signal
 from .codex_bridge import pull_codex_notifications
@@ -178,6 +180,12 @@ def main() -> None:
     daily_bt_parser.add_argument("--mobile", action="store_true", help="输出手机友好摘要")
     daily_bt_parser.add_argument("--notify", action="store_true", help="把回测结果发送到飞书")
 
+    enhanced_bt_parser = subparsers.add_parser("backtest-enhanced", help="增强回测：多窗口+方向准确率+全信号评估")
+    enhanced_bt_parser.add_argument("--config", required=True, help="配置文件路径")
+    enhanced_bt_parser.add_argument("--stock", required=True, help="股票代码，如 601698")
+    enhanced_bt_parser.add_argument("--days", type=int, default=60, help="回测天数（默认60）")
+    enhanced_bt_parser.add_argument("--notify", action="store_true", help="把回测结果发送到飞书")
+
     # ── 交易日志 ──
     journal_stats_parser = subparsers.add_parser("journal-stats", help="查看交易日志统计")
     journal_stats_parser.add_argument("--config", required=True, help="配置文件路径")
@@ -189,12 +197,30 @@ def main() -> None:
     journal_verify_parser.add_argument("--verdict", required=True, choices=["good", "bad", "neutral"], help="评价")
     journal_verify_parser.add_argument("--lessons", required=True, help="经验教训")
 
+    journal_strategy_parser = subparsers.add_parser("journal-strategies", help="按策略统计交易表现")
+    journal_strategy_parser.add_argument("--config", required=True, help="配置文件路径")
+    journal_strategy_parser.add_argument("--notify", action="store_true", help="把统计发送到飞书")
+
+    # ── 数据驱动复盘 ──
+    data_review_parser = subparsers.add_parser("data-review", help="生成数据驱动的量价复盘（不依赖LLM）")
+    data_review_parser.add_argument("--config", required=True, help="配置文件路径")
+    data_review_parser.add_argument("--date", help="复盘日期 YYYY-MM-DD，默认今天")
+    data_review_parser.add_argument("--notify", action="store_true", help="发送到飞书")
+    data_review_parser.add_argument("--save-doc", action="store_true", help="更新飞书复盘文档")
+
+    # ── 增强回测（上面已定义）──
+
 
     import_snap_parser = subparsers.add_parser("import-snapshot", help="从券商App复制文本解析并更新持仓快照")
     import_snap_parser.add_argument("--snapshot", required=True, help="目标持仓快照 JSON 文件路径")
     import_snap_parser.add_argument("--text", help="持仓文本（不传则从 stdin 读取）")
     import_snap_parser.add_argument("--date", help="交易日期 YYYY-MM-DD，默认今天")
     import_snap_parser.add_argument("--dry-run", action="store_true", help="仅打印解析结果，不写入文件")
+
+    # ── 多Agent辩论 ──
+    multi_agent_parser = subparsers.add_parser("multi-agent-debate", help="多Agent（猎手/风控/判官）仲裁辩论")
+    multi_agent_parser.add_argument("--config", required=True, help="配置文件路径")
+    multi_agent_parser.add_argument("--period", default="morning", choices=["morning", "close"], help="盘前/收盘")
 
     args = parser.parse_args()
 
@@ -240,10 +266,18 @@ def main() -> None:
         run_cash_deploy(args.config, args.mobile, args.notify)
     elif args.command == "backtest-daily":
         run_backtest_daily(args.config, args.stock, args.days, args.mobile, args.notify)
+    elif args.command == "backtest-enhanced":
+        run_enhanced_backtest(args.config, args.stock, args.days, args.notify)
     elif args.command == "journal-stats":
         run_journal_stats(args.config, args.notify)
     elif args.command == "journal-verify":
         run_journal_verify(args.config, args.entry_id, args.verdict, args.lessons)
+    elif args.command == "journal-strategies":
+        run_journal_strategies(args.config, args.notify)
+    elif args.command == "multi-agent-debate":
+        run_multi_agent_debate(args.config, args.period)
+    elif args.command == "data-review":
+        run_data_review(args.config, args.date, args.notify, args.save_doc)
     elif args.command == "import-snapshot":
         run_import_snapshot(args.snapshot, args.text, args.date, args.dry_run)
     elif args.command == "prune-data":
@@ -825,6 +859,45 @@ def run_backtest_daily(config_path: str, stock_code: str, days: int, mobile: boo
         notify_feishu_if_enabled(config, f"【日线回测】{stock_code}\n{rendered}")
 
 
+def run_enhanced_backtest(config_path: str, stock_code: str, days: int, notify: bool) -> None:
+    """增强回测：多窗口方向准确率 + 全信号评估。"""
+    config = require_valid_config(config_path)
+    code = stock_code
+    exchange = "sh" if code.startswith(("6", "5")) else "sz"
+    stock = StockRef(exchange, code)
+
+    result = run_enhanced_daily_backtest(config, stock, days=days)
+
+    # Build output
+    lines = [result["summary"], ""]
+
+    # Detailed signal table (last 10)
+    signals = result["signals"]
+    if signals:
+        lines.append(f"最近 10 条信号明细：")
+        lines.append(f"{'日期':<12} {'动作':<8} {'评分':<6} {'1日':>7} {'3日':>7} {'5日':>7}")
+        for s in signals[-10:]:
+            r1 = f"{s.get('return_1d'):+.2f}%" if s.get('return_1d') is not None else "  N/A"
+            r3 = f"{s.get('return_3d'):+.2f}%" if s.get('return_3d') is not None else "  N/A"
+            r5 = f"{s.get('return_5d'):+.2f}%" if s.get('return_5d') is not None else "  N/A"
+            d1 = {"win": "✅", "loss": "❌", "neutral": "➖"}.get(s.get("direction_1d"), "  ")
+            d3 = {"win": "✅", "loss": "❌", "neutral": "➖"}.get(s.get("direction_3d"), "  ")
+            d5 = {"win": "✅", "loss": "❌", "neutral": "➖"}.get(s.get("direction_5d"), "  ")
+            lines.append(
+                f"{s['date']:<12} {s['action']:<8} {s['score']:<6.0f} "
+                f"{d1}{r1:>6} {d3}{r3:>6} {d5}{r5:>6}"
+            )
+
+    lines.append("")
+    lines.append("方向判定：buy→涨=✅ | reduce→跌=✅ | hold→不跌=✅ | avoid→不涨=✅")
+    lines.append("仅供参考，不构成投资建议")
+
+    rendered = "\n".join(lines)
+    print(rendered)
+    if notify:
+        notify_feishu_if_enabled(config, f"【增强回测】{stock_code}\n{rendered}")
+
+
 def run_journal_stats(config_path: str, notify: bool) -> None:
     """查看交易日志统计。"""
     config = require_valid_config(config_path)
@@ -855,6 +928,147 @@ def run_journal_verify(config_path: str, entry_id: str, verdict: str, lessons: s
         print(f"✅ 已验证交易 {entry_id}：{verdict}")
     else:
         print(f"❌ 未找到交易 {entry_id}")
+
+
+def run_journal_strategies(config_path: str, notify: bool) -> None:
+    """按策略统计交易表现。"""
+    config = require_valid_config(config_path)
+    journal = TradeJournal(Path(config.portfolio.data_dir) / "trade_journal")
+    stats = journal.get_strategy_stats()
+
+    if not stats:
+        print("暂无策略统计（需要先有交易记录并事后验证）")
+        return
+
+    lines = ["【策略有效性统计】", ""]
+    lines.append(f"{'策略':<20} {'交易':>4} {'验证':>4} {'好':>4} {'坏':>4} {'胜率':>7} {'盈亏':>8} {'均持':>5}")
+    lines.append("-" * 65)
+
+    for strategy, s in stats.items():
+        emoji = "🟢" if s["win_rate"] >= 60 else ("🟡" if s["win_rate"] >= 40 else "🔴")
+        lines.append(
+            f"{strategy:<20} {s['total']:>4} {s['verified']:>4} {s['good']:>4} {s['bad']:>4} "
+            f"{emoji}{s['win_rate']:>5.0f}% {s['total_pnl_pct']:>+7.1f}% {s['avg_holding_days']:>4.0f}天"
+        )
+
+    lines.append("")
+    lines.append("🟢 胜率≥60% → 可继续使用  🟡 40-60% → 观察  🔴 <40% → 需调整或停用")
+
+    rendered = "\n".join(lines)
+    print(rendered)
+    if notify:
+        notify_feishu_if_enabled(config, rendered)
+
+
+def run_data_review(config_path: str, trade_date: str | None, notify: bool, save_doc: bool) -> None:
+    """Generate data-driven review from market.db."""
+    config = require_valid_config(config_path)
+    if trade_date is None:
+        from datetime import datetime as dt
+        trade_date = dt.now().strftime("%Y-%m-%d")
+
+    # Load holdings from snapshot
+    from .portfolio import load_snapshot
+    snapshot_path = config.snapshot_path
+    stocks = []
+    if snapshot_path.exists():
+        snapshot = load_snapshot(snapshot_path)
+        for h in snapshot.holdings:
+            if h.quantity > 0:
+                stocks.append({
+                    "code": h.code,
+                    "name": h.name,
+                    "cost": float(h.cost_price),
+                    "shares": int(h.quantity),
+                })
+
+    if not stocks:
+        print("No active holdings found.")
+        return
+
+    review_full, review_mobile = generate_data_review(
+        config.storage.sqlite_path, stocks, trade_date=trade_date
+    )
+    print(review_full)
+
+    if notify:
+        from .notify import deliver_feishu_message
+        # 发短摘要到飞书（不会截断）
+        deliver_feishu_message(
+            config.monitor.notification.feishu,
+            f"📊 {trade_date} 数据复盘",
+            review_mobile,
+            app_id=config.feishu_bot.app_id,
+            app_secret=config.feishu_bot.app_secret,
+        )
+        print("\n✅ 短摘要已发送到飞书")
+
+    if save_doc:
+        _save_review_to_feishu_doc(review_full, trade_date)
+
+
+def _save_review_to_feishu_doc(content: str, trade_date: str) -> None:
+    """Append data review section to the Feishu review document."""
+    import json
+    import re
+    import subprocess
+    import tempfile
+    from pathlib import Path
+
+    REVIEW_DOC_TOKEN = "F2Uidqo8ZoaVDZxA0tWcoLo4nvf"
+
+    # 1. Fetch existing doc
+    result = subprocess.run(
+        ["lark-cli", "docs", "+fetch", "--doc", REVIEW_DOC_TOKEN, "--format", "markdown"],
+        capture_output=True, text=True, timeout=30,
+    )
+    if result.returncode != 0:
+        print(f"❌ lark-cli fetch failed: {result.stderr[:200]}")
+        return
+
+    try:
+        doc = json.loads(result.stdout)
+        old_md = doc.get("data", {}).get("markdown", "")
+    except json.JSONDecodeError:
+        old_md = result.stdout
+
+    # 2. Merge: new content first, then existing (remove the same date if already present)
+    date_header = f"## {trade_date.replace('-', '.')}"
+    if date_header in old_md:
+        # Remove existing section for this date
+        old_md = re.sub(
+            rf"{re.escape(date_header)}.*?(?=\n## \d|\Z)",
+            "",
+            old_md,
+            flags=re.DOTALL,
+        )
+    new_md = content + "\n\n" + old_md.strip()
+
+    # 3. Write to project data dir (lark-cli requires relative path)
+    out_path = Path("data") / f"review_{trade_date.replace('-', '')}.md"
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    out_path.write_text(new_md, encoding="utf-8")
+
+    try:
+        result = subprocess.run(
+            ["lark-cli", "docs", "+update", "--doc", REVIEW_DOC_TOKEN,
+             "--mode", "overwrite", "--markdown", f"@./{out_path}"],
+            capture_output=True, text=True, timeout=60, cwd="/root/projects/stock-advisor-bot",
+        )
+        if result.returncode == 0:
+            print("✅ 已写入飞书复盘文档")
+        else:
+            print(f"❌ lark-cli update failed: {result.stderr[:200]}")
+    finally:
+        out_path.unlink(missing_ok=True)
+
+
+def run_multi_agent_debate(config_path: str, period: str) -> None:
+    """Run multi-agent debate on all holdings (猎手/风控/判官 → 仲裁)."""
+    config = require_valid_config(config_path)
+    from .multi_agent_briefing import run_multi_agent_briefing
+    report = run_multi_agent_briefing(config, period=period)
+    print(report)
 
 
 if __name__ == "__main__":

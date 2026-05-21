@@ -2,13 +2,39 @@ from __future__ import annotations
 
 import fcntl
 import json
+import logging
 import os
+import re
 from datetime import datetime
 from pathlib import Path
 
+logger = logging.getLogger(__name__)
 
 OUTBOX_PATH = Path(__file__).resolve().parent.parent / "data" / "codex_outbox.jsonl"
 MAX_MESSAGE_LENGTH = 8000  # Feishu text limit ~20KB; keep well under with headroom
+
+# A股最小交易单位：100股（1手）
+_MIN_LOT_SIZE = 100
+# 匹配消息中的股数：卖出50股、买入150 股、减仓50股等
+_QTY_PATTERN = re.compile(r"(\d+)\s*股")
+
+SKIPPED_LOG_PATH = Path(__file__).resolve().parent.parent / "data" / "bridge_skipped.log"
+
+
+def _validate_a_share_quantity(text: str) -> tuple[bool, str]:
+    """Scan message for invalid A-share quantities (< 100 or not multiple of 100).
+
+    Returns (is_valid, reason).  is_valid=False means the message
+    contains a quantity that can't be executed on A-share market.
+    """
+    matches = _QTY_PATTERN.findall(text)
+    for m in matches:
+        qty = int(m)
+        if qty < _MIN_LOT_SIZE:
+            return False, f"数量{qty}股低于最小交易单位{_MIN_LOT_SIZE}股（1手），禁止发送"
+        if qty % _MIN_LOT_SIZE != 0:
+            return False, f"数量{qty}股不是{_MIN_LOT_SIZE}的整数倍，A股必须按手交易"
+    return True, ""
 
 
 def _acquire_outbox_lock() -> int:
@@ -29,6 +55,23 @@ def _release_outbox_lock(fd: int) -> None:
 
 def queue_codex_notification(title: str, message: str) -> None:
     OUTBOX_PATH.parent.mkdir(parents=True, exist_ok=True)
+    # ═══ A股数量校验 ═══
+    is_valid, reason = _validate_a_share_quantity(message)
+    if not is_valid:
+        skip_entry = {
+            "skipped_at": datetime.now().isoformat(timespec="seconds"),
+            "title": title,
+            "reason": reason,
+            "message_preview": message[:200],
+        }
+        try:
+            with open(SKIPPED_LOG_PATH, "a", encoding="utf-8") as f:
+                f.write(json.dumps(skip_entry, ensure_ascii=False) + "\n")
+        except OSError:
+            pass
+        logger.warning("BLOCKED notification (quantity): %s — %s", title, reason)
+        return
+    # ═══ /校验 ═══
     if len(message) > MAX_MESSAGE_LENGTH:
         message = message[:MAX_MESSAGE_LENGTH]
         last_nl = message.rfind("\n", MAX_MESSAGE_LENGTH - 500)

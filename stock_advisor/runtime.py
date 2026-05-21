@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import time
 from collections import defaultdict
 from datetime import date, datetime, timedelta
@@ -14,12 +15,12 @@ from .habit_learning import build_trading_habit_profile
 from .market_hours import MARKET_TZ, is_a_share_trading_time, is_auction_period, is_high_volatility_period, is_opening_grace_period, next_session_str, seconds_until_next_session
 from .models import StockQuote
 from .logging_utils import get_logger
-from .news import fetch_announcements_for_code, filter_new_announcements, format_announcement_line
+from .news import fetch_announcements_for_code, fetch_stock_news, filter_new_announcements, format_announcement_line, is_important_announcement
 from .notify import deliver_feishu_message
 from .codex_bridge import flush_codex_bridge, check_stale_notifications
 from .portfolio import compute_cash_ratio, compute_position_ratio, find_holding, generate_portfolio_report, load_snapshot as load_portfolio_snapshot
 from .portfolio_doc_sync import sync_snapshot_from_doc
-from .providers import EastmoneyMarketSnapshotProvider, EastmoneyMinuteHistoryProvider, TencentQuoteProvider
+from .providers import EastmoneyMarketSnapshotProvider, EastmoneyMinuteHistoryProvider, SinaMinuteHistoryProvider, TencentQuoteProvider
 from .review import already_sent_close_review, build_close_review, find_latest_plan_record, mark_close_review_sent, should_send_close_review_now
 from .stop_loss import compute_effective_stop
 from .storage import cache_quotes, connect_db, load_recent_quotes, persist_observation
@@ -33,6 +34,8 @@ class MonitorRuntime:
     def __init__(self, config: AppConfig) -> None:
         self.config = config
         self.provider = self._build_provider()
+        self.sina_provider = SinaMinuteHistoryProvider(config.monitor)  # fallback when eastmoney blocked
+        self.tencent_provider = TencentQuoteProvider(config.monitor)  # last-resort fallback
         self.history: dict[str, list[StockQuote]] = defaultdict(list)
         self.last_notifications: dict[str, tuple[str, datetime]] = {}
         self.db = connect_db(config.storage.sqlite_path)
@@ -45,6 +48,11 @@ class MonitorRuntime:
         self._pre_market_sent_dates: set[date] = set()
         self._daily_closes: dict[str, list[Decimal]] = {}
         self._daily_closes_date: date | None = None
+        self._last_news_check: datetime | None = None
+        # Signal reversal detection: store last pushed action per stock
+        self._signal_states: dict[str, str] = {}
+        self._signal_state_path = Path(config.portfolio.data_dir) / "signal_history.json"
+        self._load_signal_states()
 
     def run_once(self) -> None:
         self._prune_notifications()
@@ -58,6 +66,8 @@ class MonitorRuntime:
             self._maybe_send_close_review()
             logger.info("skip: outside A-share trading session")
             return
+
+        self._maybe_send_breaking_news()
 
         today = datetime.now(MARKET_TZ).date()
         if self._price_high_marks_date != today:
@@ -74,6 +84,16 @@ class MonitorRuntime:
         advance_ratio, rank_map, sector_boards = self._load_market_context()
         volatile_period = is_high_volatility_period()
         pending_notifications: list[tuple[str, str, str]] = []
+
+        # Pre-fetch Tencent batch quotes as fallback when eastmoney minute API is blocked.
+        # Cache to DB so per-stock fallback can read from DB.
+        try:
+            tencent_quotes = self.tencent_provider.fetch_quotes_batch(self.config.monitor.stocks)
+            if tencent_quotes:
+                cache_quotes(self.db, tencent_quotes)
+        except Exception as exc:
+            logger.warning("Tencent batch poll failed: %s", exc)
+
         for stock in self.config.monitor.stocks:
             bucket = self._load_stock_history(stock)
             if not bucket:
@@ -123,9 +143,10 @@ class MonitorRuntime:
                 continue
 
             dedup_body = f"{result.decision.action}:{int(result.decision.score) // 10}"
-            if self._is_trade_signal(result, holding) and self._dedup_ok(stock.symbol, dedup_body, cooldown_minutes=self.config.monitor.notification.dedup.cooldown_minutes):
+            if self._is_trade_signal(result, holding, code=quote.code) and self._dedup_ok(stock.symbol, dedup_body, cooldown_minutes=self.config.monitor.notification.dedup.cooldown_minutes):
                 action_label = {"buy": "买入", "reduce": "减仓", "avoid": "清仓"}.get(result.decision.action, result.decision.action)
                 pending_notifications.append((stock.symbol, f"{quote.code} {quote.name} {action_label}", format_mobile_signal(result.title, result.message, include_title=False), dedup_body))
+                self._update_signal_state(quote.code, result.decision.action)
 
         self._notify_batch(pending_notifications)
 
@@ -195,15 +216,67 @@ class MonitorRuntime:
         prev = self.last_notifications.get(key)
         if prev is None:
             return True
-        prev_msg, prev_time = prev
-        return prev_msg != message or datetime.now() - prev_time >= timedelta(minutes=cooldown_minutes)
+        elapsed = (datetime.now() - prev[1]).total_seconds()
+        return elapsed > (cooldown_minutes * 60)
 
-    def _is_trade_signal(self, result, holding) -> bool:
+    # ── Signal reversal detection ──
+
+    REVERSAL_PAIRS: dict[tuple[str, str], str] = {
+        # (yesterday, today) → action to take
+        ("buy", "reduce"): "suppress",   # Don't sell right after telling to buy
+        ("reduce", "buy"): "suppress",   # Don't buy right after telling to sell
+        ("avoid", "buy"): "suppress",    # Don't buy if yesterday said avoid
+        ("avoid", "reduce"): "suppress", # Don't sell if yesterday said avoid (already avoided)
+    }
+
+    def _load_signal_states(self) -> None:
+        """Load previous signal states from disk."""
+        try:
+            if self._signal_state_path.exists():
+                self._signal_states = json.loads(self._signal_state_path.read_text())
+        except Exception:
+            self._signal_states = {}
+
+    def _save_signal_states(self) -> None:
+        """Persist signal states to disk."""
+        try:
+            self._signal_state_path.parent.mkdir(parents=True, exist_ok=True)
+            self._signal_state_path.write_text(json.dumps(self._signal_states, ensure_ascii=False))
+        except Exception:
+            pass
+
+    def _check_signal_reversal(self, code: str, action: str) -> bool:
+        """Return True if this signal is a reversal and should be suppressed.
+
+        A reversal is when today's action contradicts yesterday's action.
+        E.g. yesterday=buy, today=reduce → suppress (noise, not a real change).
+        """
+        prev = self._signal_states.get(code)
+        if prev is None:
+            return False  # No history, allow
+        verdict = self.REVERSAL_PAIRS.get((prev, action))
+        if verdict == "suppress":
+            logger.info(
+                "Signal reversal suppressed: %s %s→%s (yesterday→today)",
+                code, prev, action,
+            )
+            return True
+        return False
+
+    def _update_signal_state(self, code: str, action: str) -> None:
+        """Update signal state after a push."""
+        self._signal_states[code] = action
+        self._save_signal_states()
+
+    def _is_trade_signal(self, result, holding, *, code: str = "") -> bool:
         if not self.config.monitor.notification.feishu.enabled:
             return False
         if self.config.monitor.notification.feishu.delivery_mode == "webhook" and not self.config.monitor.notification.feishu.webhook_url:
             return False
         action = result.decision.action
+        # Signal reversal check: don't push contradictory signals
+        if code and self._check_signal_reversal(code, action):
+            return False
         # Mute low-confidence neutral zone signals: score 45-55 with low confidence
         # are noise that distracts office workers without actionable value.
         confidence = result.decision.confidence
@@ -221,6 +294,43 @@ class MonitorRuntime:
                 return False
             return True
         return False
+
+    def _maybe_send_breaking_news(self) -> None:
+        """Check for important new announcements during trading hours and push alerts.
+
+        Runs on every daemon cycle during trading hours (9:30-15:00).
+        Cooldown: 1 minute between checks to avoid spamming.
+        Only pushes announcements matching IMPORTANT_ANNOUNCEMENT_KEYWORDS
+        that haven't been seen before (dedup via announcement-seen.json).
+        """
+        now = datetime.now(MARKET_TZ)
+        # Only run during continuous auction (skip pre-market auction 9:25-9:30)
+        if is_auction_period():
+            return
+        # Cooldown: at most once every 1 minute
+        if self._last_news_check is not None:
+            elapsed = (now - self._last_news_check).total_seconds()
+            if elapsed < 60:
+                return
+
+        self._last_news_check = now
+        all_important: list[str] = []
+        for stock in self.config.monitor.stocks:
+            try:
+                items = fetch_announcements_for_code(stock.code, limit=3)
+            except Exception:
+                continue
+            new_items = filter_new_announcements(items)
+            for item in new_items:
+                if is_important_announcement(item.title):
+                    line = format_announcement_line(item)
+                    all_important.append(f"- [{stock.code}] {line}")
+
+        if not all_important:
+            return
+
+        message = "📰 **盘中重要公告**\n" + "\n".join(all_important)
+        deliver_feishu_message(self.config.feishu, "盘中公告", message)
 
     def _notify_batch(self, notifications: list[tuple[str, str, str]]) -> None:
         if not notifications:
@@ -322,7 +432,26 @@ class MonitorRuntime:
             history = self.provider.fetch_recent_window(stock, self.config.monitor.history_size)
             if history:
                 cache_quotes(self.db, history)
-            return history
+                return history
+            # eastmoney blocked — try Sina minute API
+            logger.warning(
+                "eastmoney returned empty for %s, trying sina fallback", stock.symbol
+            )
+            history = self.sina_provider.fetch_recent_window(stock, self.config.monitor.history_size)
+            if history:
+                cache_quotes(self.db, history)
+                return history
+            # Both blocked — fallback to Tencent real-time + DB history
+            logger.warning(
+                "sina also failed for %s, falling back to tencent+DB", stock.symbol
+            )
+            tencent_quote = self._poll_tencent_single(stock)
+            if tencent_quote:
+                cache_quotes(self.db, [tencent_quote])
+            db_history = load_recent_quotes(self.db, stock.symbol, self.config.monitor.history_size)
+            if tencent_quote and (not db_history or db_history[-1].quote_time < tencent_quote.quote_time):
+                db_history.append(tencent_quote)
+            return db_history
 
         self._hydrate_history(stock.symbol)
         quote = self.provider.fetch_quote(stock)
@@ -331,6 +460,14 @@ class MonitorRuntime:
         if len(bucket) > self.config.monitor.history_size:
             del bucket[:-self.config.monitor.history_size]
         return bucket
+
+    def _poll_tencent_single(self, stock) -> StockQuote | None:
+        """Fetch a single quote via Tencent API. Used as fallback."""
+        try:
+            return self.tencent_provider.fetch_quote(stock)
+        except Exception as exc:
+            logger.warning("Tencent fallback failed for %s: %s", stock.symbol, exc)
+            return None
 
     def _load_benchmark_history(self) -> list[StockQuote] | None:
         benchmark = self.config.monitor.benchmark

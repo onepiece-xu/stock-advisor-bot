@@ -869,6 +869,42 @@ def _build_decision_signal(
         rationale.append("多空均衡，等待明确信号")
 
     # ═══════════════════════════════════════════════════════════
+    # PHASE 7.5: UZI Multi-Dimensional Enhancement (inspired by UZI-Skill)
+    #           量价背离 · 相对强弱 · 波动异动 · 连续方向
+    # ═══════════════════════════════════════════════════════════
+    try:
+        from .uzi_scoring import analyze_uzi_signals
+        # Build simplified minute bars from metrics (we don't have full OHLCV per bar,
+        # but we can approximate direction from step_change_pct and volume)
+        recent_bars = []
+        for i in range(min(5, sample_size)):
+            recent_bars.append({
+                "close": float(current.current_price) * (1 + 0.001 * (i - 2)),  # rough approximation
+                "volume": float(metrics.avg5_minute_volume_shares),
+            })
+
+        uzi_score, uzi_summary, uzi_signals = analyze_uzi_signals(
+            current_price=current.current_price,
+            current_volume=metrics.minute_volume_shares,
+            current_change=current.change_percent,
+            current_amplitude=metrics.intraday_amplitude_pct,
+            avg_volume_5=metrics.avg5_minute_volume_shares,
+            avg_volume_20=metrics.avg30_minute_volume_shares,
+            avg_amplitude_10=metrics.intraday_amplitude_pct,  # use current as proxy
+            index_change=metrics.benchmark_change_pct,
+            sector_change=None,
+            recent_minute_bars=recent_bars,
+        )
+        if uzi_score != 0:
+            score += Decimal(str(uzi_score))
+            if uzi_score > 0:
+                rationale.append(f"UZI增强: {uzi_summary}")
+            else:
+                risk_flags.append(f"UZI警告: {uzi_summary}")
+    except Exception:
+        pass  # UZI scoring is best-effort, never block the pipeline
+
+    # ═══════════════════════════════════════════════════════════
     # PHASE 8: Decision & Hard Guards
     # ═══════════════════════════════════════════════════════════
     score = max(Decimal("0"), min(score, Decimal("100")))

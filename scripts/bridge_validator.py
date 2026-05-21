@@ -61,6 +61,11 @@ def validate_message(msg: str, holdings: dict[str, dict]) -> bool:
     elif re.search(r'卖出|清仓|减仓|reduce|avoid|sell', msg):
         action = 'sell'
 
+    # Pass-through: briefing/review messages are always delivered
+    # These contain stock codes and action words but are analysis, not signals
+    if re.search(r'数据复盘|收盘复盘|盘前简报|今日速判|复盘结论|复盘文档', msg):
+        return True
+
     # Pass-through: messages without stock code or action
     if not code or not action:
         return True

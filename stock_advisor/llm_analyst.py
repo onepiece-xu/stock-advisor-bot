@@ -20,8 +20,8 @@ logger = logging.getLogger(__name__)
 
 DEEPSEEK_API_KEY = "sk-6071217d15f44505b3db5f13d635ce42"
 DEEPSEEK_BASE_URL = "https://api.deepseek.com"
-DEEPSEEK_MODEL = "deepseek-v4-flash"
-REQUEST_TIMEOUT = 15
+DEEPSEEK_MODEL = "deepseek-v4-pro"
+REQUEST_TIMEOUT = 25  # pro model needs more time
 
 STRATEGIES_DIR = Path(__file__).parent.parent / "strategies"
 
@@ -49,20 +49,47 @@ def _load_strategies() -> dict[str, str]:
 
 
 def _match_strategies(holdings: list[dict]) -> str:
-    """Match strategies to holdings based on position state."""
+    """Match strategies to holdings based on position state.
+
+    Strategy-to-condition mapping:
+      emotion_cycle  — always (meta-strategy / thinking framework)
+      deep_loss_exit — pnl <= -20%
+      bottom_volume  — pnl <= -30% (deepest loss, bottom detection)
+      bull_trend_hold — pnl >= 5%
+      volume_breakout — pnl >= 5% or cash > 60%
+      shrink_pullback — cash > 60% (entry timing)
+      cash_deploy     — cash > 60%
+    """
     strategies = _load_strategies()
     matched: set[str] = set()
 
+    # Always include emotion cycle as the thinking framework
+    matched.add("emotion_cycle")
+
+    has_deep_loss = False
+    has_winner = False
+
     for h in holdings:
         pnl = h.get("pnl_pct", 0)
-        if pnl <= -20:
+        if pnl <= -30:
             matched.add("deep_loss_exit")
+            matched.add("bottom_volume")
+            has_deep_loss = True
+        elif pnl <= -20:
+            matched.add("deep_loss_exit")
+            has_deep_loss = True
         elif pnl >= 5:
             matched.add("bull_trend_hold")
+            has_winner = True
 
     cash_pct = holdings[0].get("_cash_pct", 0) if holdings else 0
     if cash_pct > 60:
         matched.add("cash_deploy")
+        matched.add("shrink_pullback")
+
+    # volume_breakout useful when we have winners near resistance or cash to deploy
+    if has_winner or cash_pct > 60:
+        matched.add("volume_breakout")
 
     lines: list[str] = []
     for name in matched:
@@ -194,7 +221,7 @@ def _call_deepseek(prompt: str, max_tokens: int = 300) -> str:
             json={
                 "model": DEEPSEEK_MODEL,
                 "messages": [
-                    {"role": "system", "content": "你是专业A股交易顾问。严格遵守用户提供的交易纪律。回答直接、简洁、可操作。"},
+                    {"role": "system", "content": "你是专业A股交易顾问。严格遵守用户提供的交易纪律。回答直接、简洁、可操作。\n\n【A股交易铁律 — 违反等于废单】\n- 最小交易单位：100股（1手），挂单量必须是100的整数倍（100/200/300/500/1000...）\n- 50股、150股、250股等不是100整数倍的挂单无法成交，绝对禁止\n- 建议数量时只说100的整数倍，如\"减仓200股\"\"买入100股\"\"加仓300股\"\n- 如果不知道该卖多少，宁可说\"减仓\"不写数量，也不要写50股"},
                     {"role": "user", "content": prompt},
                 ],
                 "max_tokens": max_tokens,

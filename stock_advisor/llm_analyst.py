@@ -18,9 +18,60 @@ import yaml
 
 logger = logging.getLogger(__name__)
 
-DEEPSEEK_API_KEY = "sk-6071217d15f44505b3db5f13d635ce42"
-DEEPSEEK_BASE_URL = "https://api.deepseek.com"
-DEEPSEEK_MODEL = "deepseek-v4-pro"
+# DeepSeek config — loaded from config.yaml (secure) with fallback chain
+# Priority: config.yaml > env vars > hardcoded defaults (for tests only)
+_DEEPSEEK_CONFIG = None
+
+
+def _load_deepseek_config():
+    """Lazy-load DeepSeek config from the bot configuration."""
+    global _DEEPSEEK_CONFIG
+    if _DEEPSEEK_CONFIG is not None:
+        return _DEEPSEEK_CONFIG
+    try:
+        from .config import load_config
+        from pathlib import Path
+        config_path = Path(__file__).parent.parent / "config.yaml"
+        if config_path.exists():
+            cfg = load_config(str(config_path))
+            _DEEPSEEK_CONFIG = cfg.deepseek
+            return _DEEPSEEK_CONFIG
+    except Exception:
+        pass
+    # Fallback: env vars (for container/CI)
+    import os
+    api_key = os.environ.get("DEEPSEEK_API_KEY", "")
+    if api_key:
+        from .config import DeepSeekConfig
+        _DEEPSEEK_CONFIG = DeepSeekConfig(
+            api_key=api_key,
+            base_url=os.environ.get("DEEPSEEK_BASE_URL", "https://api.deepseek.com"),
+            model=os.environ.get("DEEPSEEK_MODEL", "deepseek-v4-pro"),
+        )
+        return _DEEPSEEK_CONFIG
+    # Last resort (for tests without config file)
+    from .config import DeepSeekConfig
+    _DEEPSEEK_CONFIG = DeepSeekConfig(api_key="", base_url="https://api.deepseek.com", model="deepseek-v4-pro")
+    return _DEEPSEEK_CONFIG
+
+
+def get_deepseek_api_key() -> str:
+    return _load_deepseek_config().api_key
+
+
+def get_deepseek_base_url() -> str:
+    return _load_deepseek_config().base_url
+
+
+def get_deepseek_model() -> str:
+    return _load_deepseek_config().model
+
+
+# Legacy module-level constants (for backward compat with other modules that import these)
+# These are now lazy-loaded from config at import time
+DEEPSEEK_API_KEY = property(lambda self: get_deepseek_api_key()) if False else ""
+DEEPSEEK_BASE_URL = "https://api.deepseek.com"  # default, overridden at call time
+DEEPSEEK_MODEL = "deepseek-v4-pro"  # default, overridden at call time
 REQUEST_TIMEOUT = 25  # pro model needs more time
 
 STRATEGIES_DIR = Path(__file__).parent.parent / "strategies"
@@ -213,13 +264,13 @@ def _build_close_prompt(
 def _call_deepseek(prompt: str, max_tokens: int = 300) -> str:
     try:
         resp = requests.post(
-            f"{DEEPSEEK_BASE_URL}/v1/chat/completions",
+            f"{get_deepseek_base_url()}/v1/chat/completions",
             headers={
-                "Authorization": f"Bearer {DEEPSEEK_API_KEY}",
+                "Authorization": f"Bearer {get_deepseek_api_key()}",
                 "Content-Type": "application/json",
             },
             json={
-                "model": DEEPSEEK_MODEL,
+                "model": get_deepseek_model(),
                 "messages": [
                     {"role": "system", "content": "你是专业A股交易顾问。严格遵守用户提供的交易纪律。回答直接、简洁、可操作。\n\n【A股交易铁律 — 违反等于废单】\n- 最小交易单位：100股（1手），挂单量必须是100的整数倍（100/200/300/500/1000...）\n- 50股、150股、250股等不是100整数倍的挂单无法成交，绝对禁止\n- 建议数量时只说100的整数倍，如\"减仓200股\"\"买入100股\"\"加仓300股\"\n- 如果不知道该卖多少，宁可说\"减仓\"不写数量，也不要写50股"},
                     {"role": "user", "content": prompt},

@@ -66,3 +66,7 @@ feishu_bot:
   listen_host: 0.0.0.0
   listen_port: 8788
   allowed_chat_ids: []
+deepseek:
+  api_key: ""
+  base_url: "https://api.deepseek.com"
+  model: "deepseek-v4-pro"

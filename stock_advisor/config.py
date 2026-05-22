@@ -145,6 +145,7 @@ class AppConfig:
     trading_plan: TradingPlanConfig
     review: ReviewConfig
     feishu_bot: FeishuBotConfig
+    deepseek: DeepSeekConfig
 
     @property
     def snapshot_path(self) -> Path:
@@ -154,6 +155,13 @@ class AppConfig:
 
 class ConfigValidationError(RuntimeError):
     pass
+
+
+@dataclass(slots=True)
+class DeepSeekConfig:
+    api_key: str
+    base_url: str = "https://api.deepseek.com"
+    model: str = "deepseek-v4-pro"
 
 
 def load_config(path: str | Path) -> AppConfig:
@@ -267,6 +275,11 @@ def load_config(path: str | Path) -> AppConfig:
             listen_host=str(bot_raw.get("listen_host", "0.0.0.0")),
             listen_port=int(bot_raw.get("listen_port", 8788)),
             allowed_chat_ids=[str(item) for item in bot_raw.get("allowed_chat_ids", [])],
+        ),
+        deepseek=DeepSeekConfig(
+            api_key=str(raw.get("deepseek", {}).get("api_key", "")),
+            base_url=str(raw.get("deepseek", {}).get("base_url", "https://api.deepseek.com")),
+            model=str(raw.get("deepseek", {}).get("model", "deepseek-v4-pro")),
         ),
     )
 

@@ -24,7 +24,7 @@ from typing import Literal
 
 import requests
 
-from .llm_analyst import DEEPSEEK_API_KEY, DEEPSEEK_BASE_URL
+from .llm_analyst import get_deepseek_api_key, get_deepseek_base_url
 from .feedback_loop import log_debate_result, get_weighted_confidence
 
 logger = logging.getLogger(__name__)
@@ -161,9 +161,9 @@ def _call_agent(
             user_msg += f"\n\n【你的专业领域】请重点分析{focus_hint}"
 
         resp = requests.post(
-            f"{DEEPSEEK_BASE_URL}/v1/chat/completions",
+            f"{get_deepseek_base_url()}/v1/chat/completions",
             headers={
-                "Authorization": f"Bearer {DEEPSEEK_API_KEY}",
+                "Authorization": f"Bearer {get_deepseek_api_key()}",
                 "Content-Type": "application/json",
             },
             json={
@@ -405,9 +405,9 @@ def debate(
 
     try:
         resp = requests.post(
-            f"{DEEPSEEK_BASE_URL}/v1/chat/completions",
+            f"{get_deepseek_base_url()}/v1/chat/completions",
             headers={
-                "Authorization": f"Bearer {DEEPSEEK_API_KEY}",
+                "Authorization": f"Bearer {get_deepseek_api_key()}",
                 "Content-Type": "application/json",
             },
             json={

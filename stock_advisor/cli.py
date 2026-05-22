@@ -495,6 +495,24 @@ def run_close_review(config_path: str, notify: bool) -> None:
     artifact = build_close_review(config)
     print(artifact.body)
     print(f"\n[saved] {artifact.saved_path}")
+    
+    # Run self-feedback loop: evaluate today's debate predictions
+    try:
+        from .feedback_loop import run_daily_feedback
+        from decimal import Decimal
+        prices = {}
+        for h in config.monitor.holdings:
+            if h.current_price and h.current_price > 0:
+                prices[h.symbol] = h.current_price
+        if prices:
+            feedbacks = run_daily_feedback(prices)
+            correct = sum(1 for f in feedbacks if f.was_correct)
+            total = len(feedbacks)
+            if total > 0:
+                print(f"\n[feedback] 今日辩论验证: {correct}/{total} 命中 ({correct/total*100:.0f}%)")
+    except Exception:
+        pass  # Feedback is best-effort
+    
     if notify and config.monitor.notification.feishu.enabled:
         deliver_feishu_message(
             config.monitor.notification.feishu,

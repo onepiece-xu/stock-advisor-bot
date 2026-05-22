@@ -997,6 +997,49 @@ def _build_decision_signal(
         pass  # UZI scoring is best-effort, never block the pipeline
 
     # ═══════════════════════════════════════════════════════════
+    # PHASE 7.6: Wyckoff Volume-Price Structure (inspired by WyckoffTradingAgent ⭐421)
+    #            Climax detection · Accumulation/Distribution · Spring patterns
+    # ═══════════════════════════════════════════════════════════
+    try:
+        from .wyckoff_scoring import analyze_wyckoff
+
+        # Compute derived ratios
+        _wyckoff_ma20 = daily_ma20 if daily_ma20 and daily_ma20 > 0 else metrics.ma15
+        _wyckoff_ma60 = daily_ma60 if daily_ma60 and daily_ma60 > 0 else metrics.ma60
+        price_vs_ma20 = (current.current_price / _wyckoff_ma20) if _wyckoff_ma20 and _wyckoff_ma20 > 0 else Decimal("1")
+        price_vs_ma60 = (current.current_price / _wyckoff_ma60) if _wyckoff_ma60 and _wyckoff_ma60 > 0 else Decimal("1")
+
+        # Volume trend heuristic
+        if daily_vol_ratio is not None and daily_vol_ratio < Decimal("0.7"):
+            vol_trend = "shrinking"
+        elif daily_vol_ratio is not None and daily_vol_ratio > Decimal("1.3"):
+            vol_trend = "expanding"
+        else:
+            vol_trend = "stable"
+
+        # Use daily RSI if available, fallback to minute RSI
+        _wyckoff_rsi = daily_rsi14 if daily_rsi14 is not None else metrics.rsi14
+
+        wyckoff_score, wyckoff_summary, wyckoff_signals = analyze_wyckoff(
+            change_pct=current.change_percent,
+            vol_ratio=metrics.volume_ratio,
+            amplitude_pct=metrics.intraday_amplitude_pct,
+            rsi14=_wyckoff_rsi,
+            price_vs_ma20=price_vs_ma20,
+            price_vs_ma60=price_vs_ma60,
+            vol_trend=vol_trend,
+            daily_vol_shrinking=(daily_vol_ratio is not None and daily_vol_ratio < Decimal("0.85")),
+        )
+        if wyckoff_score != 0:
+            score += Decimal(str(wyckoff_score))
+            if wyckoff_score > 0:
+                rationale.append(f"威科夫: {wyckoff_summary}")
+            else:
+                risk_flags.append(f"威科夫: {wyckoff_summary}")
+    except Exception:
+        pass  # Wyckoff scoring is best-effort
+
+    # ═══════════════════════════════════════════════════════════
     # PHASE 7.8: Oversold Bounce Bonus — independent buy signal
     #            RSI oversold + volume confirmation = accumulation
     #            NOT blocked by daily regime — buying opportunity

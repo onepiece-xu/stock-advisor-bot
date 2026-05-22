@@ -25,6 +25,7 @@ from typing import Literal
 import requests
 
 from .llm_analyst import DEEPSEEK_API_KEY, DEEPSEEK_BASE_URL
+from .feedback_loop import log_debate_result, get_weighted_confidence
 
 logger = logging.getLogger(__name__)
 
@@ -99,20 +100,47 @@ A股铁律：最小交易单位100股（1手），建议数量必须是100的整
         "focus": "技术指标信号：MA排列方向、MACD金叉死叉、RSI超买超卖区间、布林带位置、支撑阻力位",
         "temperature": 0.5,
     },
+    "宏观观察": {
+        "system": """你是A股"宏观观察"——宏观策略分析师。你的信条：
+- 个股离不开大盘，板块轮动决定方向
+- 政策风向是第一生产力
+- 流动性是市场的血液
+- 关注：大盘指数趋势、板块资金轮动、货币政策信号、产业政策利好
+- 你的风格是"自上而下，先看天再下地"
+
+A股铁律：最小交易单位100股（1手），建议数量必须是100的整数倍。
+输出格式（严格遵守）：动作:买/卖/持有|数量:XXX股|价格:XX-XX|信心:0.X|理由:一句话""",
+        "focus": "宏观环境：大盘趋势方向、市场情绪、板块轮动、政策催化、流动性松紧",
+        "temperature": 0.3,
+    },
+    "资金猎犬": {
+        "system": """你是A股"资金猎犬"——资金流向追踪专家。你的信条：
+- 资金是股价的唯一驱动力
+- 主力资金的动向比任何技术指标都真实
+- 北向资金、融资余额、大宗交易是明牌
+- 关注：主力净流入/流出、北向资金持仓变化、龙虎榜上榜、大宗交易折溢价
+- 你的风格是"跟着钱走，钱在哪我在哪"
+
+A股铁律：最小交易单位100股（1手），建议数量必须是100的整数倍。
+输出格式（严格遵守）：动作:买/卖/持有|数量:XXX股|价格:XX-XX|信心:0.X|理由:一句话""",
+        "focus": "资金信号：主力净流向、成交量异动、北向资金动向、大单成交占比、龙虎榜席位",
+        "temperature": 0.5,
+    },
 }
 
-ARBITER_SYSTEM = """你是A股交易"仲裁官"。三位分析师（大胆猎手、铁血风控、趋势判官）各给出了意见。
-请综合三方观点，输出最终决策。
+ARBITER_SYSTEM = """你是A股交易"仲裁官"。五位分析师（大胆猎手、铁血风控、趋势判官、宏观观察、资金猎犬）各给出了意见。
+请综合多方观点，输出最终决策。
 
 决策规则（严格按优先级）：
-1. ⚠️ 铁血风控信心>0.8 → 必须采纳风控意见，无视其他两方（本金安全最高）
-2. 三方一致 → 直接执行
-3. 两方一致 → 执行多数意见，但仓位减半
-4. 三方分歧 → 持有不动（hold）
-5. 数量必须是100的整数倍，0股=不动
+1. ⚠️ 铁血风控信心>0.8 → 必须采纳风控意见，无视其他方（本金安全最高）
+2. 4+方一致 → 直接执行
+3. 3方一致 → 执行多数意见，仓位7成
+4. 2方一致 → 执行少数派意见，仓位减半
+5. 各方分歧 → 持有不动（hold）
+6. 数量必须是100的整数倍，0股=不动
 
 输出格式（严格遵守，用|分隔各字段）：
-动作:买/卖/持有|数量:XXX股|价格:XX.XX-XX.XX|信心:0.X|投票:猎手:买/卖/持有|风控:买/卖/持有|判官:买/卖/持有|理由:综合判断理由（≤100字）"""
+动作:买/卖/持有|数量:XXX股|价格:XX.XX-XX.XX|信心:0.X|投票:猎手:买/卖/持有|风控:买/卖/持有|判官:买/卖/持有|宏观:买/卖/持有|猎犬:买/卖/持有|理由:综合判断理由（≤100字）"""
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -239,35 +267,42 @@ def _pre_arbiter_rules(
                 agent_opinions=opinions,
             )
 
-    # Rule 2: 全体一致 → 跳过仲裁，省一次 API 调用
-    if len(opinions) >= 2:
+    # Rule 2: ≥3 agents agree → skip arbiter (majority with 5-agent panel)
+    if len(opinions) >= 3:
         actions = [o.action for o in opinions]
-        if len(set(actions)) == 1:
-            action = actions[0]
-            avg_conf = sum(o.confidence for o in opinions) / len(opinions)
-            if action == "buy":
-                qty = max(o.quantity for o in opinions)  # When bullish, go with boldest
-            elif action == "sell":
-                qty = max(o.quantity for o in opinions)  # When bearish, exit fully
+        action_counts = {}
+        for a in actions:
+            action_counts[a] = action_counts.get(a, 0) + 1
+        top_action = max(action_counts, key=action_counts.get)
+        top_count = action_counts[top_action]
+        
+        if top_count >= 3:
+            # 3+ agree → strong consensus
+            agreeing = [o for o in opinions if o.action == top_action]
+            avg_conf = sum(o.confidence for o in agreeing) / len(agreeing)
+            if top_action == "buy":
+                qty = max(o.quantity for o in agreeing)
+            elif top_action == "sell":
+                qty = max(o.quantity for o in agreeing)
             else:
                 qty = 0
             logger.info(
-                "⚡ 全票通过 %s → %s（%d/%d agent，跳过仲裁省一次API）",
-                name, action, len(opinions), len(AGENT_ROLES),
+                "⚡ 多数一致 %s → %s（%d/%d agent，跳过仲裁省一次API）",
+                name, top_action, top_count, len(opinions),
             )
             vote_detail = " | ".join(f"{o.role}:{o.action}" for o in opinions)
             return MultiAgentDecision(
-                action=action,
+                action=top_action,
                 quantity=qty,
-                price_range=opinions[0].price_hint,
+                price_range=agreeing[0].price_hint,
                 confidence=avg_conf,
                 vote_summary=vote_detail,
-                reasoning=f"全票{'买入' if action == 'buy' else '卖出' if action == 'sell' else '持有'}（{len(opinions)}/{len(AGENT_ROLES)} agent一致，跳过仲裁）",
+                reasoning=f"{'买入' if top_action == 'buy' else '卖出' if top_action == 'sell' else '持有'}（{top_count}/{len(opinions)} agent一致，跳过仲裁）",
                 risk_warnings=[],
                 agent_opinions=opinions,
             )
 
-    return None  # 分歧存在，需要仲裁
+    return None  # No strong consensus, need arbiter
 
 
 def debate(
@@ -301,8 +336,8 @@ def debate(
     t0 = time.time()
     opinions: list[AgentOpinion] = []
 
-    # Phase 1: Call all 3 agents in parallel with role-specific focus
-    with ThreadPoolExecutor(max_workers=3) as pool:
+    # Phase 1: Call all 5 agents in parallel with role-specific focus
+    with ThreadPoolExecutor(max_workers=5) as pool:
         futures = {
             pool.submit(
                 _call_agent,
@@ -322,8 +357,10 @@ def debate(
                 logger.warning("Agent %s thread failed: %s", role_name, exc)
                 opinion = None
             if opinion:
+                # Apply learned agent weight to confidence
+                opinion.confidence = round(get_weighted_confidence(role_name, opinion.confidence), 2)
                 opinions.append(opinion)
-                logger.info("Agent %s: action=%s qty=%d confidence=%.2f", role_name, opinion.action, opinion.quantity, opinion.confidence)
+                logger.info("Agent %s: action=%s qty=%d confidence=%.2f (weighted)", role_name, opinion.action, opinion.quantity, opinion.confidence)
 
     if len(opinions) < 1:
         logger.warning("Multi-agent debate: no agents responded, aborting")
@@ -332,6 +369,20 @@ def debate(
     # Phase 1.5: Pre-arbiter rules — short-circuit when possible
     pre_ruling = _pre_arbiter_rules(opinions, name, symbol, current_price)
     if pre_ruling is not None:
+        # Log for feedback learning
+        try:
+            log_debate_result(
+                symbol=symbol,
+                name=name,
+                price=current_price,
+                action=pre_ruling.action,
+                confidence=float(pre_ruling.confidence),
+                vote_summary=pre_ruling.vote_summary,
+                reasoning=pre_ruling.reasoning,
+                agent_votes={o.role: o.action for o in opinions},
+            )
+        except Exception:
+            pass
         elapsed = time.time() - t0
         logger.info(
             "Multi-agent debate short-circuited in %.1fs: action=%s qty=%d confidence=%.2f",
@@ -345,7 +396,7 @@ def debate(
         for o in opinions
     )
 
-    arbiter_prompt = f"""以下是三位分析师对{name}({symbol})的操作建议：
+    arbiter_prompt = f"""以下为多位分析师对{name}({symbol})的操作建议：
 现价：{current_price}
 
 {opinion_text}
@@ -378,6 +429,21 @@ def debate(
         content = resp.json()["choices"][0]["message"]["content"].strip()
         decision = _parse_arbiter_response(content, opinions, name, symbol)
         decision.agent_opinions = opinions
+
+        # Log for feedback learning
+        try:
+            log_debate_result(
+                symbol=symbol,
+                name=name,
+                price=current_price,
+                action=decision.action,
+                confidence=float(decision.confidence),
+                vote_summary=decision.vote_summary,
+                reasoning=decision.reasoning,
+                agent_votes={o.role: o.action for o in opinions},
+            )
+        except Exception:
+            pass
 
         elapsed = time.time() - t0
         logger.info("Multi-agent debate complete in %.1fs: action=%s qty=%d confidence=%.2f", elapsed, decision.action, decision.quantity, decision.confidence)

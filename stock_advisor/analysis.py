@@ -481,6 +481,22 @@ def _percent_diff(current: Decimal, base: Decimal) -> Decimal:
     return (((current - base) / base) * Decimal("100")).quantize(Decimal("0.01"))
 
 
+def _confidence_level(score: Decimal, sample_size: int) -> str:
+    """Determine confidence level based on score extremity and sample size."""
+    edge = abs(score - Decimal("50"))
+    if sample_size < 60:
+        return "low"
+    if sample_size >= 240 and edge >= Decimal("18"):
+        return "high"
+    if sample_size >= 120 and edge >= Decimal("14"):
+        return "high"
+    if sample_size >= 120 and edge >= Decimal("10"):
+        return "medium"
+    if edge >= Decimal("16"):
+        return "medium"
+    return "low"
+
+
 def _market_regime(current: StockQuote, metrics: ObservationMetrics) -> str:
     """Detect intraday volume-price regime.
     
@@ -503,6 +519,82 @@ def _market_regime(current: StockQuote, metrics: ObservationMetrics) -> str:
         return "recovery"
     
     return "neutral"
+
+
+def _decision_action(
+    score: Decimal,
+    monitor_config,
+    benchmark_change_pct: Decimal = Decimal("0"),
+    market_advance_ratio: Decimal = Decimal("0.5"),
+) -> str:
+    """Map a calibrated score to a trading action using configurable thresholds.
+
+    Thresholds from config.yaml -> monitor.signal.decision_thresholds:
+      buy_score (default 78), hold_score (default 58), reduce_score (default 38)
+    """
+    thresholds = monitor_config.decision_thresholds
+    buy_thresh = Decimal(str(thresholds.buy_score))
+    hold_thresh = Decimal(str(thresholds.hold_score))
+    reduce_thresh = Decimal(str(thresholds.reduce_score))
+
+    if score >= buy_thresh:
+        return "buy"
+    if score >= hold_thresh:
+        return "hold"
+    if score >= reduce_thresh:
+        return "reduce"
+    return "avoid"
+
+
+def _apply_account_risk_guards(
+    action: str,
+    monitor_config,
+    portfolio_holding,
+    *,
+    portfolio_cash_ratio: Decimal | None = None,
+    portfolio_position_ratio: Decimal | None = None,
+) -> tuple[str, list[str], list[str]]:
+    """Apply account-level risk limits that override trade-level decisions.
+
+    Returns (possibly_changed_action, rationale_lines, risk_flag_lines).
+    These guards are hard limits — they override any buy signal regardless of score.
+    """
+    guard_rationales: list[str] = []
+    guard_risk_flags: list[str] = []
+
+    risk = getattr(monitor_config, "risk_controls", None)
+    max_single_pct = Decimal(str(getattr(risk, "max_single_position_pct", 35) if risk else 35))
+    max_total_pct = Decimal(str(getattr(risk, "max_total_position_pct", 85) if risk else 85))
+    min_cash_pct = Decimal(str(getattr(risk, "min_cash_pct", 15) if risk else 15))
+
+    # ── Deep loss: never buy more of a deep-loss position ──
+    if portfolio_holding and action == "buy":
+        pnl_pct = _safe_pnl_pct(portfolio_holding)
+        if pnl_pct is not None and pnl_pct <= Decimal("-20"):
+            action = "avoid"
+            guard_rationales.append("深套股不补仓")
+            guard_risk_flags.append(f"⚠️ 深套 {float(pnl_pct):+.1f}%，禁止买入")
+
+    # ── Single position limit ──
+    if portfolio_position_ratio is not None and action == "buy":
+        if portfolio_position_ratio >= max_single_pct:
+            action = "avoid"
+            guard_rationales.append(f"单票仓位{float(portfolio_position_ratio):.0f}%≥上限{float(max_single_pct):.0f}%")
+
+    # ── Total position limit ──
+    if portfolio_cash_ratio is not None and action == "buy":
+        total_pos = Decimal("100") - portfolio_cash_ratio * Decimal("100")
+        if total_pos >= max_total_pct:
+            action = "avoid"
+            guard_rationales.append(f"总仓位{float(total_pos):.0f}%≥上限{float(max_total_pct):.0f}%")
+
+    # ── Minimum cash reserve ──
+    if portfolio_cash_ratio is not None and action == "buy":
+        if portfolio_cash_ratio * Decimal("100") < min_cash_pct:
+            action = "avoid"
+            guard_rationales.append(f"现金{float(portfolio_cash_ratio*100):.0f}%低于{float(min_cash_pct):.0f}%安全线")
+
+    return action, guard_rationales, guard_risk_flags
 
 
 def _build_decision_signal(
@@ -961,13 +1053,11 @@ def _build_decision_signal(
         score=score.quantize(Decimal("0.01")),
         confidence=_confidence_level(score, sample_size),
         regime=regime,
-        advice=trade_advice,
+        trade_advice=trade_advice,
         trade_size_hint=trade_size_hint,
         entry_note=entry_note,
-        rationale="；".join(rationale),
-        risk_flags="；".join(risk_flags) if risk_flags else "",
-        holding_return_pct=holding_return_pct,
-        take_profit_triggered=any("🎯" in f for f in risk_flags),
+        rationale=rationale,
+        risk_flags=risk_flags,
     )
 
 

@@ -1,0 +1,37 @@
+{
+  "triggers": [
+    {
+      "code": "601698",
+      "name": "中国卫通-抄底",
+      "action": "buy",
+      "quantity": 200,
+      "priceMin": "32.50",
+      "priceMax": "33.50",
+      "fallbackPrice": "31.00",
+      "note": "抄底区：跌到32.50-33.50加仓200股，跌破31止损",
+      "disableBuy": false
+    },
+    {
+      "code": "000063",
+      "name": "中兴通讯-加仓",
+      "action": "buy",
+      "quantity": 100,
+      "priceMin": "35.50",
+      "priceMax": "36.50",
+      "fallbackPrice": "34.50",
+      "note": "跌到35.5-36.5加仓100股摊低成本至37.5，跌破34.5不补",
+      "disableBuy": false
+    },
+    {
+      "code": "002439",
+      "name": "启明星辰-止盈",
+      "action": "sell",
+      "quantity": 100,
+      "priceMin": "16.50",
+      "priceMax": "17.00",
+      "fallbackPrice": "15.00",
+      "note": "回到16.5以上卖100股落袋，跌破15止损",
+      "disableBuy": true
+    }
+  ]
+}

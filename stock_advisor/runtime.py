@@ -25,6 +25,8 @@ from .review import already_sent_close_review, build_close_review, find_latest_p
 from .stop_loss import compute_effective_stop
 from .storage import cache_quotes, connect_db, load_recent_quotes, persist_observation
 from .trading_plan import build_risk_context, detect_trigger_hit, load_snapshot as load_trade_snapshot, load_triggers, render_trade_instruction
+from .trade_journal import TradeJournal
+import hashlib
 
 
 logger = get_logger(__name__)
@@ -49,6 +51,9 @@ class MonitorRuntime:
         self._daily_closes: dict[str, list[Decimal]] = {}
         self._daily_closes_date: date | None = None
         self._last_news_check: datetime | None = None
+        # Auto trade logging via snapshot diff
+        self._last_snapshot_hash: str = ""
+        self._trade_journal = TradeJournal(Path(config.portfolio.data_dir) / "trade_journal")
         # Signal reversal detection: store last pushed action per stock
         self._signal_states: dict[str, str] = {}
         self._signal_state_path = Path(config.portfolio.data_dir) / "signal_history.json"
@@ -78,6 +83,7 @@ class MonitorRuntime:
             self._daily_closes_date = today
 
         portfolio_snapshot = self._load_portfolio_snapshot()
+        self._detect_and_log_trades(portfolio_snapshot)
         cash_ratio = compute_cash_ratio(portfolio_snapshot)
         benchmark_history = self._load_benchmark_history()
         trading_habit_profile = build_trading_habit_profile(self.db)
@@ -883,6 +889,114 @@ class MonitorRuntime:
             app_id=self.config.feishu_bot.app_id,
             app_secret=self.config.feishu_bot.app_secret,
         )
+
+    def _detect_and_log_trades(self, snapshot) -> None:
+        """Detect portfolio changes vs last known snapshot and auto-log trades."""
+        if snapshot is None:
+            return
+        try:
+            # Build a compact fingerprint of current holdings
+            holdings_data = [
+                {"code": h.code, "name": h.name, "qty": h.quantity, "cost": float(h.cost_price)}
+                for h in snapshot.holdings
+            ]
+            current_hash = hashlib.md5(
+                json.dumps(holdings_data, sort_keys=True, default=str).encode()
+            ).hexdigest()
+
+            if not self._last_snapshot_hash:
+                self._last_snapshot_hash = current_hash
+                return
+            if current_hash == self._last_snapshot_hash:
+                return
+
+            # Snapshot changed — try to load previous to diff
+            prev_path = Path(self.config.portfolio.data_dir) / "snapshot_prev.json"
+            prev_snapshot = None
+            if prev_path.exists():
+                prev_snapshot = load_portfolio_snapshot(prev_path)
+
+            if prev_snapshot is None:
+                self._last_snapshot_hash = current_hash
+                # Save current as baseline for next diff
+                with open(prev_path, "w") as f:
+                    f.write(self.config.snapshot_path.read_text())
+                return
+
+            # Diff holdings
+            prev_map = {h.code: h for h in prev_snapshot.holdings}
+            curr_map = {h.code: h for h in snapshot.holdings}
+
+            for code, curr_h in curr_map.items():
+                prev_h = prev_map.get(code)
+                if prev_h is None:
+                    # New stock appeared — log buy
+                    self._trade_journal.log_buy(
+                        symbol=f"{'sh' if code.startswith('6') else 'sz'}{code}",
+                        name=curr_h.name,
+                        quantity=curr_h.quantity,
+                        price=curr_h.cost_price,
+                        reason=f"用户手动买入 {curr_h.quantity}股@{float(curr_h.cost_price):.2f}",
+                        strategy="manual",
+                        confidence="medium",
+                        market_context="自动检测",
+                    )
+                    logger.info("Auto-logged BUY: %s %d股@%.2f", curr_h.name, curr_h.quantity, float(curr_h.cost_price))
+                elif curr_h.quantity != prev_h.quantity:
+                    delta = curr_h.quantity - prev_h.quantity
+                    if delta > 0:
+                        # Added more shares
+                        self._trade_journal.log_buy(
+                            symbol=f"{'sh' if code.startswith('6') else 'sz'}{code}",
+                            name=curr_h.name,
+                            quantity=delta,
+                            price=curr_h.cost_price,
+                            reason=f"用户手动加仓 {delta}股@{float(curr_h.cost_price):.2f}",
+                            strategy="manual",
+                            confidence="medium",
+                            market_context="自动检测",
+                        )
+                        logger.info("Auto-logged ADD: %s +%d股", curr_h.name, delta)
+                    else:
+                        # Sold shares
+                        self._trade_journal.log_sell(
+                            symbol=f"{'sh' if code.startswith('6') else 'sz'}{code}",
+                            name=curr_h.name,
+                            quantity=abs(delta),
+                            price=curr_h.cost_price,
+                            reason=f"用户手动卖出 {abs(delta)}股@{float(curr_h.cost_price):.2f}",
+                            buy_price=float(prev_h.cost_price) if prev_h.cost_price > 0 else None,
+                            buy_date=prev_h.trade_date.isoformat() if prev_h.trade_date else None,
+                            strategy="manual",
+                            confidence="medium",
+                            market_context="自动检测",
+                        )
+                        logger.info("Auto-logged SELL: %s -%d股", curr_h.name, abs(delta))
+
+            for code, prev_h in prev_map.items():
+                if code not in curr_map:
+                    # Stock disappeared — log full sell
+                    self._trade_journal.log_sell(
+                        symbol=f"{'sh' if code.startswith('6') else 'sz'}{code}",
+                        name=prev_h.name,
+                        quantity=prev_h.quantity,
+                        price=prev_h.cost_price,  # approximate — actual sell price unknown
+                        reason=f"用户清仓 {prev_h.name}（{prev_h.quantity}股）",
+                        buy_price=float(prev_h.cost_price) if prev_h.cost_price > 0 else None,
+                        buy_date=prev_h.trade_date.isoformat() if prev_h.trade_date else None,
+                        strategy="manual",
+                        confidence="medium",
+                        market_context="自动检测-清仓",
+                    )
+                    logger.info("Auto-logged CLEAR: %s %d股", prev_h.name, prev_h.quantity)
+
+            # Save current snapshot as baseline for next diff
+            with open(prev_path, "w") as f:
+                f.write(self.config.snapshot_path.read_text())
+            self._last_snapshot_hash = current_hash
+
+        except Exception as exc:
+            logger.warning("Trade auto-logger failed: %s", exc)
 
     def _load_portfolio_snapshot(self):
         if not self.config.snapshot_path.exists():

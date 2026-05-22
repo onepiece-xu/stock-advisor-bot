@@ -2,36 +2,69 @@
   "triggers": [
     {
       "code": "601698",
-      "name": "中国卫通-抄底",
-      "action": "buy",
+      "name": "中国卫通-减亏",
+      "action": "sell",
       "quantity": 200,
-      "priceMin": "32.50",
-      "priceMax": "33.50",
-      "fallbackPrice": "31.00",
-      "note": "抄底区：跌到32.50-33.50加仓200股，跌破31止损",
+      "priceMin": "34.50",
+      "priceMax": "35.50",
+      "fallbackPrice": "34.00",
+      "note": "现价33.29，成本35.12(-5.2%)。反弹到34.5-35.5先卖200股减仓",
+      "disableBuy": false
+    },
+    {
+      "code": "601698",
+      "name": "中国卫通-清仓",
+      "action": "sell",
+      "quantity": 300,
+      "priceMin": "36.50",
+      "priceMax": "37.50",
+      "fallbackPrice": "35.50",
+      "note": "成本线上方全清剩余300股",
       "disableBuy": false
     },
     {
       "code": "000063",
-      "name": "中兴通讯-加仓",
-      "action": "buy",
+      "name": "中兴通讯-减亏",
+      "action": "sell",
       "quantity": 100,
-      "priceMin": "35.50",
-      "priceMax": "36.50",
-      "fallbackPrice": "34.50",
-      "note": "跌到35.5-36.5加仓100股摊低成本至37.5，跌破34.5不补",
+      "priceMin": "36.50",
+      "priceMax": "37.50",
+      "fallbackPrice": "35.50",
+      "note": "加权成本37.29(-4.8%)，反弹先减100股",
+      "disableBuy": false
+    },
+    {
+      "code": "000063",
+      "name": "中兴通讯-回本出",
+      "action": "sell",
+      "quantity": 100,
+      "priceMin": "38.00",
+      "priceMax": "39.00",
+      "fallbackPrice": "37.00",
+      "note": "成本线上方清仓剩余100股",
       "disableBuy": false
     },
     {
       "code": "002439",
-      "name": "启明星辰-止盈",
+      "name": "启明星辰-减亏",
       "action": "sell",
       "quantity": 100,
-      "priceMin": "16.50",
-      "priceMax": "17.00",
+      "priceMin": "15.80",
+      "priceMax": "16.20",
       "fallbackPrice": "15.00",
-      "note": "回到16.5以上卖100股落袋，跌破15止损",
+      "note": "成本16.00(-4.4%)，反弹到16附近走人",
       "disableBuy": true
+    },
+    {
+      "code": "601698",
+      "name": "中国卫通-抄底",
+      "action": "buy",
+      "quantity": 100,
+      "priceMin": "31.50",
+      "priceMax": "32.50",
+      "fallbackPrice": "30.50",
+      "note": "深跌到31.5-32.5加100股摊薄",
+      "disableBuy": false
     }
   ]
 }

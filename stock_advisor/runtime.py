@@ -84,6 +84,7 @@ class MonitorRuntime:
 
         portfolio_snapshot = self._load_portfolio_snapshot()
         self._detect_and_log_trades(portfolio_snapshot)
+        self._adjust_for_drawdown(portfolio_snapshot)
         cash_ratio = compute_cash_ratio(portfolio_snapshot)
         benchmark_history = self._load_benchmark_history()
         trading_habit_profile = build_trading_habit_profile(self.db)
@@ -889,6 +890,49 @@ class MonitorRuntime:
             app_id=self.config.feishu_bot.app_id,
             app_secret=self.config.feishu_bot.app_secret,
         )
+
+    def _adjust_for_drawdown(self, snapshot) -> None:
+        """When all holdings are in the red, tighten risk controls.
+
+        Automatically raises buy_score so the system doesn't keep buying
+        into a losing streak. Restores to config value when any holding
+        turns green.
+        """
+        if snapshot is None or not snapshot.holdings:
+            return
+
+        active = [h for h in snapshot.holdings if h.quantity > 0]
+        if not active:
+            return
+
+        # Remember the original buy_score from config (first run only)
+        if not hasattr(self, '_original_buy_score'):
+            self._original_buy_score = self.config.monitor.decision_thresholds.buy_score
+
+        # Check if ALL active holdings are losing money
+        all_red = all(
+            h.cost_price > 0 and h.current_price < h.cost_price
+            for h in active
+        )
+
+        if all_red:
+            total_loss_pct = sum(
+                float((h.current_price - h.cost_price) / h.cost_price * 100)
+                for h in active
+            )
+            avg_loss = total_loss_pct / len(active)
+            base = self._original_buy_score
+            if avg_loss < -3:
+                self.config.monitor.decision_thresholds.buy_score = base + 6
+                logger.info(
+                    "回撤管理激活：全仓浮亏(均%.1f%%)，买入门槛 %s→%s",
+                    avg_loss, base, base + 6,
+                )
+            else:
+                self.config.monitor.decision_thresholds.buy_score = base + 3
+        else:
+            # Normal mode: restore original threshold
+            self.config.monitor.decision_thresholds.buy_score = self._original_buy_score
 
     def _detect_and_log_trades(self, snapshot) -> None:
         """Detect portfolio changes vs last known snapshot and auto-log trades."""

@@ -215,6 +215,87 @@ class TradeJournal:
             }
         return result
 
+    def auto_verify(self) -> int:
+        """Auto-verify all unverified sells by matching with buys.
+
+        For each unverified sell entry, finds the most recent buy for the same
+        symbol that hasn't been matched yet, computes actual PnL, and assigns
+        a verdict based on PnL threshold:
+          - PnL > 0 → good
+          - PnL < -5% → bad
+          - else → neutral
+
+        Returns count of verified trades.
+        """
+        entries = self._read_all()
+        buys = [e for e in entries if e["side"] == "buy"]
+        sells = [e for e in entries if e["side"] == "sell"]
+
+        verified = 0
+        used_buy_ids: set[str] = set()
+
+        for sell in sells:
+            if sell.get("verdict"):
+                continue  # Already verified
+
+            # Find matching buy: same symbol, before sell date, not already used
+            sell_date = sell.get("trade_date", "")
+            symbol = sell.get("symbol", "")
+            sell_qty = sell.get("quantity", 0)
+
+            matching_buys = [
+                b for b in buys
+                if b["symbol"] == symbol
+                and b.get("trade_date", "") <= sell_date
+                and b["entry_id"] not in used_buy_ids
+            ]
+
+            if not matching_buys:
+                continue
+
+            # Use the most recent buy before this sell
+            buy = matching_buys[-1]
+            buy_price = buy.get("price", 0)
+            sell_price = sell.get("price", 0)
+
+            if buy_price <= 0:
+                continue
+
+            pnl_pct = round((sell_price - buy_price) / buy_price * 100, 2)
+            buy_date = buy.get("trade_date", "")
+            holding_days = 0
+            try:
+                from datetime import date
+                holding_days = (date.fromisoformat(sell_date) - date.fromisoformat(buy_date)).days
+            except Exception:
+                pass
+
+            # Auto-verdict
+            if pnl_pct > 0:
+                verdict = "good"
+            elif pnl_pct < -5:
+                verdict = "bad"
+            else:
+                verdict = "neutral"
+
+            sell["pnl_pct"] = pnl_pct
+            sell["buy_price"] = buy_price
+            sell["buy_date"] = buy_date
+            sell["holding_days"] = holding_days
+            sell["verdict"] = verdict
+            if not sell.get("lessons"):
+                sell["lessons"] = f"自动验证：策略={sell.get('strategy','unknown')}，PnL={pnl_pct:+.1f}%"
+
+            used_buy_ids.add(buy["entry_id"])
+            verified += 1
+
+        if verified > 0:
+            self.journal_path.write_text(
+                "\n".join(json.dumps(e, ensure_ascii=False) for e in entries) + "\n"
+            )
+
+        return verified
+
     def _append(self, entry: TradeEntry) -> None:
         with open(self.journal_path, "a", encoding="utf-8") as f:
             f.write(json.dumps(asdict(entry), ensure_ascii=False) + "\n")

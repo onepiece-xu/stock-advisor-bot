@@ -528,6 +528,28 @@ def run_close_review(config_path: str, notify: bool) -> None:
     except Exception:
         pass  # Correlation is best-effort
     
+    # Run signal accuracy evaluation
+    try:
+        from .signal_tracker import evaluate_signal_accuracy, format_accuracy_report
+        stats = evaluate_signal_accuracy(days_lookback=7)
+        if stats.get("total_signals", 0) > 0:
+            print(f"\n{format_accuracy_report(stats)}")
+    except Exception:
+        pass
+    
+    # Run sector strength report
+    try:
+        from .sector_strength import fetch_sector_boards, format_sector_report
+        sectors = fetch_sector_boards(top_n=60)
+        holdings_list = [
+            {"symbol": h.symbol, "name": h.name or h.symbol}
+            for h in config.monitor.holdings
+        ]
+        if sectors:
+            print(f"\n{format_sector_report(sectors, holdings_list)}")
+    except Exception:
+        pass
+    
     if notify and config.monitor.notification.feishu.enabled:
         deliver_feishu_message(
             config.monitor.notification.feishu,

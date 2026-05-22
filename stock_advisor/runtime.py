@@ -845,6 +845,21 @@ class MonitorRuntime:
         except Exception:
             pass
 
+        # ── 9. 板块强度（当日最强/最弱板块）──
+        try:
+            from .sector_strength import fetch_sector_boards, format_sector_report
+            sectors = fetch_sector_boards(top_n=60)
+            if sectors:
+                holdings_list = [
+                    {"symbol": h.code if hasattr(h, 'code') else h.symbol, "name": h.name}
+                    for h in (snapshot.holdings if snapshot else [])
+                ]
+                sector_text = format_sector_report(sectors, holdings_list)
+                if sector_text:
+                    lines.append(f"\n{sector_text}")
+        except Exception:
+            pass
+
         # Save briefing data for status command
         try:
             _save_pre_market_state(Path("data"), today, lines, snapshot)

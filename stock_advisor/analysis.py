@@ -649,6 +649,23 @@ def _build_decision_signal(
     else:
         daily_regime = "neutral"
 
+    # ── Multi-Timeframe Filter (Weekly + Daily) ──
+    try:
+        from .multi_timeframe import multi_timeframe_filter
+        mtf = multi_timeframe_filter(
+            current.symbol, current.current_price, daily_ma20, daily_ma60
+        )
+        mtf_block_buy = mtf.get("block_buy", False)
+        mtf_block_sell = mtf.get("block_sell", False)
+        mtf_score_adjust = mtf.get("score_adjust", 0)
+        mtf_desc = mtf.get("description", "")
+        if mtf_score_adjust != 0:
+            rationale.append(f"多周期: {mtf_desc}")
+    except Exception:
+        mtf_block_buy = False
+        mtf_block_sell = False
+        mtf_score_adjust = 0
+
     # ── Position Context ──
     if holding_return_pct is None:
         position_ctx = "no_position"
@@ -667,6 +684,10 @@ def _build_decision_signal(
     score = Decimal("50")
     rationale: list[str] = []
     risk_flags: list[str] = []
+
+    # Apply multi-timeframe score adjustment
+    if mtf_score_adjust != 0:
+        score += Decimal(str(mtf_score_adjust))
 
     # 1.1 Daily MA Structure (dominant signal)
     if daily_regime == "bull":
@@ -1040,6 +1061,23 @@ def _build_decision_signal(
         pass  # Wyckoff scoring is best-effort
 
     # ═══════════════════════════════════════════════════════════
+    # PHASE 7.7: Sector Strength Boost — 板块强度加分
+    #           持仓所在板块今日表现 → score +3~+5
+    # ═══════════════════════════════════════════════════════════
+    try:
+        from .sector_strength import fetch_sector_boards, compute_sector_score_boost
+        _sectors = fetch_sector_boards(top_n=60)
+        sector_boost = compute_sector_score_boost(_sectors, current.symbol)
+        if sector_boost != 0:
+            score += Decimal(str(sector_boost))
+            if sector_boost > 0:
+                rationale.append(f"板块强度加分: +{sector_boost}")
+            else:
+                risk_flags.append(f"板块弱势罚分: {sector_boost}")
+    except Exception:
+        pass
+
+    # ═══════════════════════════════════════════════════════════
     # PHASE 7.8: Oversold Bounce Bonus — independent buy signal
     #            RSI oversold + volume confirmation = accumulation
     #            NOT blocked by daily regime — buying opportunity
@@ -1088,6 +1126,17 @@ def _build_decision_signal(
         risk_flags.append(f"反追涨护栏：日涨{_format_percent(current.change_percent)}≥5%")
         rationale.append("不追高纪律")
 
+    # Multi-timeframe block: weekly bear → suppress buy
+    if mtf_block_buy and action == "buy":
+        action = "avoid"
+        risk_flags.append("多周期护栏: 周线空头，禁止买入")
+        rationale.append("周线空头禁买")
+
+    # Multi-timeframe block: weekly+day bull → suppress sell
+    if mtf_block_sell and action in ("sell", "reduce"):
+        action = "hold"
+        rationale.append("多周期护栏: 趋势强劲，暂缓卖出")
+
     # Ex-dividend guard
     if recent_ex_dividend and action in ("buy", "hold"):
         action = "avoid"
@@ -1108,6 +1157,22 @@ def _build_decision_signal(
         monitor_config=monitor_config,
         total_assets=portfolio_total_assets,
     )
+
+    # Log signal for accuracy tracking
+    try:
+        from .signal_tracker import log_signal
+        log_signal(
+            symbol=current.symbol,
+            name=current.name or current.symbol,
+            action=action,
+            score=score,
+            price=current.current_price,
+            confidence=_confidence_level(score, sample_size),
+            regime=regime,
+            rationale="; ".join(rationale[:3]),
+        )
+    except Exception:
+        pass
 
     return DecisionSignal(
         action=action,

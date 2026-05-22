@@ -513,6 +513,21 @@ def run_close_review(config_path: str, notify: bool) -> None:
     except Exception:
         pass  # Feedback is best-effort
     
+    # Run portfolio correlation check
+    try:
+        from .correlation_guard import analyze_portfolio_correlation, format_correlation_report
+        holdings_list = [
+            {"symbol": h.symbol, "name": h.name or h.symbol}
+            for h in config.monitor.holdings
+            if h.symbol and h.current_price and h.current_price > 0
+        ]
+        if len(holdings_list) >= 2:
+            report = analyze_portfolio_correlation(holdings_list)
+            if report:
+                print(f"\n{format_correlation_report(report)}")
+    except Exception:
+        pass  # Correlation is best-effort
+    
     if notify and config.monitor.notification.feishu.enabled:
         deliver_feishu_message(
             config.monitor.notification.feishu,

@@ -1144,7 +1144,21 @@ def _trade_plan(
         entry_ceiling = min(current.current_price, metrics.ma15) if metrics.ma15 > 0 else current.current_price
         entry_floor = max(metrics.ma60 * Decimal("0.98"), current.current_price * Decimal("0.97")) if metrics.ma60 > 0 else current.current_price * Decimal("0.98")
         entry_floor = min(entry_floor, entry_ceiling * Decimal("0.98"))  # always some spread
-        stop_level = entry_floor * Decimal("0.93")  # -7% stop from entry floor
+        stop_level = entry_floor * Decimal("0.93")  # -7% stop from entry floor (fallback)
+        # Try ATR-based dynamic stop-loss for smarter risk management
+        try:
+            from .atr_risk import compute_atr_stop
+            atr_result = compute_atr_stop(
+                current.symbol, current.current_price, entry_floor,
+            )
+            if atr_result:
+                stop_level = atr_result.dynamic_stop
+                entry_note = (
+                    f"ATR动态止损 {stop_level:.2f}"
+                    f"（-{atr_result.dynamic_stop_pct:.1f}%，{atr_result.volatility_level}波动）"
+                )
+        except Exception:
+            pass  # ATR是增强特性，失败了用固定止损
         tier_tag = f"[{tier_label}] " if tier_label else ""
         return (
             f"{tier_tag}挂单 {_format_price(entry_floor)}-{_format_price(entry_ceiling)} 买入 {buy_qty} 股{habit_note}",

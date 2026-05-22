@@ -70,6 +70,7 @@ AGENT_ROLES = {
 
 A股铁律：最小交易单位100股（1手），建议数量必须是100的整数倍。
 输出格式（严格遵守）：动作:买/卖/持有|数量:XXX股|价格:XX-XX|信心:0.X|理由:一句话""",
+        "focus": "短期动量信号：价格突破、成交量放大、资金净流入、板块联动、游资动向",
         "temperature": 0.7,
     },
     "铁血风控": {
@@ -82,6 +83,7 @@ A股铁律：最小交易单位100股（1手），建议数量必须是100的整
 
 A股铁律：最小交易单位100股（1手），建议数量必须是100的整数倍。
 输出格式（严格遵守）：动作:买/卖/持有|数量:XXX股|价格:XX-XX|信心:0.X|理由:一句话""",
+        "focus": "风险指标：最大回撤、止损距离、仓位集中度、下行风险、黑天鹅概率",
         "temperature": 0.2,
     },
     "趋势判官": {
@@ -94,6 +96,7 @@ A股铁律：最小交易单位100股（1手），建议数量必须是100的整
 
 A股铁律：最小交易单位100股（1手），建议数量必须是100的整数倍。
 输出格式（严格遵守）：动作:买/卖/持有|数量:XXX股|价格:XX-XX|信心:0.X|理由:一句话""",
+        "focus": "技术指标信号：MA排列方向、MACD金叉死叉、RSI超买超卖区间、布林带位置、支撑阻力位",
         "temperature": 0.5,
     },
 }
@@ -121,9 +124,14 @@ def _call_agent(
     role_config: dict,
     stock_context: str,
     timeout: int = 25,
+    focus_hint: str = "",
 ) -> AgentOpinion | None:
-    """Call a single agent with role-specific prompt."""
+    """Call a single agent with role-specific prompt and focus area."""
     try:
+        user_msg = f"分析以下股票并给出操作建议：\n\n{stock_context}"
+        if focus_hint:
+            user_msg += f"\n\n【你的专业领域】请重点分析{focus_hint}"
+
         resp = requests.post(
             f"{DEEPSEEK_BASE_URL}/v1/chat/completions",
             headers={
@@ -134,7 +142,7 @@ def _call_agent(
                 "model": "deepseek-v4-pro",
                 "messages": [
                     {"role": "system", "content": role_config["system"]},
-                    {"role": "user", "content": f"分析以下股票并给出操作建议：\n\n{stock_context}"},
+                    {"role": "user", "content": user_msg},
                 ],
                 "max_tokens": 1000,
                 "temperature": role_config.get("temperature", 0.5),
@@ -198,6 +206,70 @@ def _parse_agent_response(role: str, text: str) -> AgentOpinion | None:
         return None
 
 
+def _pre_arbiter_rules(
+    opinions: list[AgentOpinion],
+    name: str,
+    symbol: str,
+    current_price: Decimal,
+) -> MultiAgentDecision | None:
+    """Check if we can short-circuit without calling the arbiter.
+
+    Two rules, enforced in code (not relying on LLM to follow them):
+    1. 风控 confidence > 0.8 + says sell → VETO, force sell immediately
+    2. All responding agents agree → UNANIMOUS, skip arbiter
+    """
+    if not opinions:
+        return None
+
+    # Rule 1: 风控强制否决 (safety override — budget protection above all)
+    for o in opinions:
+        if o.role == "铁血风控" and o.confidence > 0.8 and o.action == "sell":
+            logger.info(
+                "🛡 风控否决 %s：信心%.2f，跳过仲裁强制执行卖出",
+                name, o.confidence,
+            )
+            return MultiAgentDecision(
+                action="sell",
+                quantity=o.quantity,
+                price_range=o.price_hint,
+                confidence=o.confidence,
+                vote_summary="风控否决（跳过仲裁）",
+                reasoning=f"风控官强制执行卖出：{o.reasoning}",
+                risk_warnings=[f"⚠️ 风控否决: {o.reasoning}"],
+                agent_opinions=opinions,
+            )
+
+    # Rule 2: 全体一致 → 跳过仲裁，省一次 API 调用
+    if len(opinions) >= 2:
+        actions = [o.action for o in opinions]
+        if len(set(actions)) == 1:
+            action = actions[0]
+            avg_conf = sum(o.confidence for o in opinions) / len(opinions)
+            if action == "buy":
+                qty = max(o.quantity for o in opinions)  # When bullish, go with boldest
+            elif action == "sell":
+                qty = max(o.quantity for o in opinions)  # When bearish, exit fully
+            else:
+                qty = 0
+            logger.info(
+                "⚡ 全票通过 %s → %s（%d/%d agent，跳过仲裁省一次API）",
+                name, action, len(opinions), len(AGENT_ROLES),
+            )
+            vote_detail = " | ".join(f"{o.role}:{o.action}" for o in opinions)
+            return MultiAgentDecision(
+                action=action,
+                quantity=qty,
+                price_range=opinions[0].price_hint,
+                confidence=avg_conf,
+                vote_summary=vote_detail,
+                reasoning=f"全票{'买入' if action == 'buy' else '卖出' if action == 'sell' else '持有'}（{len(opinions)}/{len(AGENT_ROLES)} agent一致，跳过仲裁）",
+                risk_warnings=[],
+                agent_opinions=opinions,
+            )
+
+    return None  # 分歧存在，需要仲裁
+
+
 def debate(
     symbol: str,
     name: str,
@@ -229,10 +301,17 @@ def debate(
     t0 = time.time()
     opinions: list[AgentOpinion] = []
 
-    # Phase 1: Call all 3 agents in parallel
+    # Phase 1: Call all 3 agents in parallel with role-specific focus
     with ThreadPoolExecutor(max_workers=3) as pool:
         futures = {
-            pool.submit(_call_agent, role_name, role_config, context, timeout=timeout_per_agent): role_name
+            pool.submit(
+                _call_agent,
+                role_name,
+                role_config,
+                context,
+                timeout=timeout_per_agent,
+                focus_hint=role_config.get("focus", ""),
+            ): role_name
             for role_name, role_config in AGENT_ROLES.items()
         }
         for future in as_completed(futures):
@@ -250,7 +329,17 @@ def debate(
         logger.warning("Multi-agent debate: no agents responded, aborting")
         return None
 
-    # Phase 2: Arbiter synthesizes
+    # Phase 1.5: Pre-arbiter rules — short-circuit when possible
+    pre_ruling = _pre_arbiter_rules(opinions, name, symbol, current_price)
+    if pre_ruling is not None:
+        elapsed = time.time() - t0
+        logger.info(
+            "Multi-agent debate short-circuited in %.1fs: action=%s qty=%d confidence=%.2f",
+            elapsed, pre_ruling.action, pre_ruling.quantity, pre_ruling.confidence,
+        )
+        return pre_ruling
+
+    # Phase 2: Arbiter synthesizes (only called when there's real disagreement)
     opinion_text = "\n\n".join(
         f"【{o.role}】动作:{o.action} 数量:{o.quantity}股 信心:{o.confidence} 理由:{o.reasoning}"
         for o in opinions

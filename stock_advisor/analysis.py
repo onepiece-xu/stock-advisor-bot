@@ -997,6 +997,24 @@ def _build_decision_signal(
         pass  # UZI scoring is best-effort, never block the pipeline
 
     # ═══════════════════════════════════════════════════════════
+    # PHASE 7.8: Oversold Bounce Bonus — independent buy signal
+    #            RSI oversold + volume confirmation = accumulation
+    #            NOT blocked by daily regime — buying opportunity
+    # ═══════════════════════════════════════════════════════════
+    vol_ok = metrics.volume_ratio >= Decimal("0.8")
+    rsi_low = metrics.rsi14 <= Decimal("40")
+    if rsi_low and vol_ok:
+        if metrics.rsi14 <= Decimal("35") and metrics.volume_ratio >= Decimal("1.0"):
+            score += Decimal("10")
+            rationale.append("超卖+放量：底部吸筹信号，买入窗口")
+        elif metrics.rsi14 <= Decimal("30") and metrics.volume_ratio >= Decimal("0.8"):
+            score += Decimal("8")
+            rationale.append("深度超卖+量能确认：反弹概率高")
+        elif metrics.rsi14 <= Decimal("40") and metrics.volume_ratio >= Decimal("1.2"):
+            score += Decimal("6")
+            rationale.append("低位放量：资金入场迹象")
+
+    # ═══════════════════════════════════════════════════════════
     # PHASE 8: Decision & Hard Guards
     # ═══════════════════════════════════════════════════════════
     score = max(Decimal("0"), min(score, Decimal("100")))
@@ -1021,10 +1039,10 @@ def _build_decision_signal(
         risk_flags.append(f"大盘暴跌，覆巢之下无完卵")
         rationale.append("大盘系统性风险")
 
-    # Anti-chase guard
-    if current.change_percent >= Decimal("3.00") and action in ("buy", "hold"):
+    # Anti-chase guard: relaxed from 3% to 5% — allow moderate trend buys
+    if current.change_percent >= Decimal("5.00") and action in ("buy", "hold"):
         action = "avoid"
-        risk_flags.append(f"反追涨护栏：日涨{_format_percent(current.change_percent)}≥3%")
+        risk_flags.append(f"反追涨护栏：日涨{_format_percent(current.change_percent)}≥5%")
         rationale.append("不追高纪律")
 
     # Ex-dividend guard

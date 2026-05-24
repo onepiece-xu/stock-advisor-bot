@@ -295,7 +295,7 @@ class AnalysisRegressionTests(unittest.TestCase):
             volume_ratio_30=Decimal("1.00"),
             relative_strength_pct=Decimal("0.10"),
         )
-        holding = SimpleNamespace(quantity=100, cost_price=Decimal("28"))
+        holding = SimpleNamespace(quantity=100, cost_price=Decimal("28"), current_price=Decimal("30"))
 
         decision = _build_decision_signal(
             quote, metrics, 240, holding, config, None,
@@ -317,7 +317,7 @@ class AnalysisRegressionTests(unittest.TestCase):
             volume_ratio_30=Decimal("1.40"),
             relative_strength_pct=Decimal("-1.60"),
         )
-        holding = SimpleNamespace(quantity=100, cost_price=Decimal("28"))
+        holding = SimpleNamespace(quantity=100, cost_price=Decimal("28"), current_price=Decimal("30"))
 
         decision = _build_decision_signal(
             quote, metrics, 240, holding, config, None,
@@ -353,7 +353,7 @@ class AnalysisRegressionTests(unittest.TestCase):
         config = load_config(Path(__file__).resolve().parent.parent / "config.yaml").monitor
         quote = self._quote("30")
         metrics = self._metrics(bias_to_ma15=Decimal("-1.20"), bias_to_ma60=Decimal("-3.20"))
-        holding = SimpleNamespace(quantity=100, cost_price=Decimal("35"))
+        holding = SimpleNamespace(quantity=100, cost_price=Decimal("35"), current_price=Decimal("30"))
 
         decision = _build_decision_signal(
             quote,
@@ -382,7 +382,7 @@ class AnalysisRegressionTests(unittest.TestCase):
             bias_to_ma60=Decimal("-3.20"),
             breakdown_below_prev30_low_pct=Decimal("0.35"),
         )
-        holding = SimpleNamespace(quantity=300, cost_price=Decimal("35"))
+        holding = SimpleNamespace(quantity=300, cost_price=Decimal("35"), current_price=Decimal("30"))
 
         decision = _build_decision_signal(
             quote,

@@ -8,7 +8,7 @@ from pathlib import Path
 import requests
 
 from .config import FeishuConfig
-from .codex_bridge import queue_codex_notification
+from .outbox import queue_notification
 from .direct_notify import write_direct_dm
 from .feishu_bot_server import FeishuBotClient
 from .logging_utils import get_logger
@@ -90,8 +90,8 @@ def _queue_failed_notification(delivery_mode: str, title: str, message: str, err
 
 
 def deliver_feishu_message(feishu: FeishuConfig, title: str, message: str, *, app_id: str = "", app_secret: str = "") -> None:
-    if feishu.delivery_mode == "codex_bridge":
-        queue_codex_notification(title, message)
+    if feishu.delivery_mode == "outbox":
+        queue_notification(title, message)
         return
     if feishu.delivery_mode == "direct_dm":
         write_direct_dm(title, message)

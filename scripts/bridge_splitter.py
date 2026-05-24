@@ -9,7 +9,7 @@ under FEISHU_MAX bytes. Chunks are separated by --- for multi-message delivery.
 import re
 import sys
 
-FEISHU_MAX = 800  # bytes — well under Feishu's limit, safe margin
+FEISHU_MAX = 4000  # bytes — safe under Feishu's ~20KB limit, less spammy
 
 
 def split_at_sections(text: str, max_bytes: int = FEISHU_MAX) -> list[str]:

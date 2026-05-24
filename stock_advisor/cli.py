@@ -21,7 +21,7 @@ from .cash_deploy import generate_deploy_signal, render_deploy_signal
 from .data_review import generate_data_review
 from .trade_journal import TradeJournal
 from .briefing import format_mobile_digest, format_mobile_replay, format_mobile_signal
-from .codex_bridge import pull_codex_notifications
+from .outbox import pull_outbox
 from .feishu_bot_server import serve_feishu_bot
 from .market_overview import build_market_overview, render_market_overview
 from .historical import (
@@ -117,9 +117,9 @@ def main() -> None:
     flush_parser = subparsers.add_parser("flush-failed-notifications", help="重放失败的 webhook 通知")
     flush_parser.add_argument("--config", required=False, help="保留参数位，兼容统一运维脚本")
 
-    codex_pull_parser = subparsers.add_parser("pull-codex-notifications", help="读取本地 Codex bridge 推送队列")
-    codex_pull_parser.add_argument("--limit", type=int, default=20, help="最多读取多少条未读消息，默认 20")
-    codex_pull_parser.add_argument("--keep-unread", action="store_true", help="只读取，不标记已读")
+    outbox_parser = subparsers.add_parser("pull-outbox", help="读取 outbox 消息队列")
+    outbox_parser.add_argument("--limit", type=int, default=20, help="最多读取多少条未读消息，默认 20")
+    outbox_parser.add_argument("--keep-unread", action="store_true", help="只读取，不标记已读")
 
     review_parser = subparsers.add_parser("close-review", help="生成收盘复盘报告")
     review_parser.add_argument("--config", required=True, help="配置文件路径")
@@ -246,8 +246,8 @@ def main() -> None:
         run_validate_config(args.config)
     elif args.command == "flush-failed-notifications":
         run_flush_failed_notifications()
-    elif args.command == "pull-codex-notifications":
-        run_pull_codex_notifications(args.limit, args.keep_unread)
+    elif args.command == "pull-outbox":
+        run_pull_outbox(args.limit, args.keep_unread)
     elif args.command == "close-review":
         run_close_review(args.config, args.notify)
     elif args.command == "advice-at":
@@ -476,10 +476,10 @@ def run_flush_failed_notifications() -> None:
         print("没有待重放的失败通知")
 
 
-def run_pull_codex_notifications(limit: int, keep_unread: bool) -> None:
-    items = pull_codex_notifications(limit=max(limit, 1), mark_sent=not keep_unread)
+def run_pull_outbox(limit: int, keep_unread: bool) -> None:
+    items = pull_outbox(limit=max(limit, 1), mark_sent=not keep_unread)
     if not items:
-        print("没有未读的 Codex 推送")
+        print("没有未读的 outbox 消息")
         return
 
     for idx, item in enumerate(items, start=1):

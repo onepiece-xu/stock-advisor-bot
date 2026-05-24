@@ -11,9 +11,13 @@ SNAPSHOT_PATH = Path(__file__).resolve().parent.parent / "portfolio-snapshot.jso
 
 CODE_MAP = {
     "中国卫通": "601698",
-    "洛阳钼业": "603993",
+    "中兴通讯": "000063",
+    "启明星辰": "002439",
+    "华天科技": "002185",
     "南网能源": "003035",
+    "洛阳钼业": "603993",
 }
+_ACCOUNT_SUFFIX = re.compile(r"[（(][^)）]*[）)]")
 
 
 def parse_latest_snapshot(markdown: str) -> dict:
@@ -31,8 +35,8 @@ def parse_latest_snapshot(markdown: str) -> dict:
     else:
         section = markdown[section_start:]
 
-    total_assets = _extract_decimal(section, r"- 总资产[：:]\s*([0-9.]+)")
-    cash = _extract_decimal(section, r"- 可用/可取[：:]\s*([0-9.]+)")
+    total_assets = _extract_decimal(section, r"- (?:合并)?总资产[：:]\s*([0-9.]+)")
+    cash = _extract_decimal(section, r"- 可用(?:现金|/可取)?[：:]\s*([0-9.]+)")
 
     holdings: list[dict] = []
     cell_re = re.compile(r"<lark-td>\s*(?P<cell>.*?)\s*</lark-td>", re.S)
@@ -43,6 +47,8 @@ def parse_latest_snapshot(markdown: str) -> dict:
         if len(cells) < 7:
             continue
         name = cells[0]
+        # Strip account suffix like "（东吴）" or "（兴业）"
+        name = _ACCOUNT_SUFFIX.sub("", name).strip()
         if name == "股票":
             continue
         code = CODE_MAP.get(name)

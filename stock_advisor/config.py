@@ -347,8 +347,8 @@ def validate_config(path: str | Path) -> list[str]:
     if config.monitor.notification.dedup.cooldown_minutes < 0:
         errors.append("monitor.notification.dedup.cooldown_minutes 不能小于 0")
 
-    if config.monitor.notification.feishu.delivery_mode not in {"webhook", "direct_dm", "app_dm", "codex_bridge"}:
-        errors.append("monitor.notification.feishu.delivery_mode 仅支持 webhook、direct_dm、app_dm 或 codex_bridge")
+    if config.monitor.notification.feishu.delivery_mode not in {"webhook", "direct_dm", "app_dm", "outbox"}:
+        errors.append("monitor.notification.feishu.delivery_mode 仅支持 webhook、direct_dm、app_dm 或 outbox")
 
     if config.monitor.notification.feishu.enabled:
         if config.monitor.notification.feishu.delivery_mode == "webhook" and not config.monitor.notification.feishu.webhook_url:

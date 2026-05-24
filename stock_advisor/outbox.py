@@ -10,7 +10,7 @@ from pathlib import Path
 
 logger = logging.getLogger(__name__)
 
-OUTBOX_PATH = Path(__file__).resolve().parent.parent / "data" / "codex_outbox.jsonl"
+OUTBOX_PATH = Path(__file__).resolve().parent.parent / "data" / "outbox.jsonl"
 MAX_MESSAGE_LENGTH = 8000  # Feishu text limit ~20KB; keep well under with headroom
 
 # A股最小交易单位：100股（1手）
@@ -53,7 +53,13 @@ def _release_outbox_lock(fd: int) -> None:
         os.close(fd)
 
 
-def queue_codex_notification(title: str, message: str) -> None:
+def queue_notification(title: str, message: str) -> None:
+    """Queue a notification for delivery via the cron bridge.
+
+    Messages are written to data/outbox.jsonl and picked up by
+    the bridge script (stock_advisor_bridge.sh) which delivers
+    them to Feishu via webhook.
+    """
     OUTBOX_PATH.parent.mkdir(parents=True, exist_ok=True)
     # ═══ A股数量校验 ═══
     is_valid, reason = _validate_a_share_quantity(message)
@@ -92,7 +98,16 @@ def queue_codex_notification(title: str, message: str) -> None:
         _release_outbox_lock(fd)
 
 
-def pull_codex_notifications(limit: int = 20, *, mark_sent: bool = True) -> list[dict[str, str]]:
+def pull_outbox(limit: int = 20, *, mark_sent: bool = True) -> list[dict[str, str]]:
+    """Pull unsent notifications from the outbox.
+
+    Args:
+        limit: Max unsent items to pull.
+        mark_sent: If True, mark pulled items as sent and write back.
+
+    Returns list of pulled items with keys: created_at, title, message.
+    Also trims stale sent entries (>24h) on each call.
+    """
     if limit <= 0 or not OUTBOX_PATH.exists():
         return []
 
@@ -105,12 +120,27 @@ def pull_codex_notifications(limit: int = 20, *, mark_sent: bool = True) -> list
 
         pending: list[dict] = []
         pulled: list[dict[str, str]] = []
+        cutoff = datetime.now().timestamp() - 24 * 3600  # 24h TTL for sent entries
+        trimmed = 0
 
         for row in rows:
             if not row.strip():
                 continue
             item = json.loads(row)
-            if item.get("sent") or len(pulled) >= limit:
+
+            # ── Trim stale sent entries (>24h) ──
+            if item.get("sent"):
+                try:
+                    ts = datetime.fromisoformat(item["created_at"]).timestamp()
+                    if ts < cutoff:
+                        trimmed += 1
+                        continue
+                except (ValueError, KeyError):
+                    pass
+                pending.append(item)
+                continue
+
+            if len(pulled) >= limit:
                 pending.append(item)
                 continue
             pulled.append(
@@ -124,45 +154,46 @@ def pull_codex_notifications(limit: int = 20, *, mark_sent: bool = True) -> list
                 item["sent"] = True
             pending.append(item)
 
-        if mark_sent and pulled:
-            # Write back with updated sent flags
+        if (mark_sent and pulled) or trimmed > 0:
             content = "\n".join(json.dumps(item, ensure_ascii=False) for item in pending)
             if pending:
                 content += "\n"
             os.lseek(fd, 0, os.SEEK_SET)
             os.truncate(fd, 0)
             os.write(fd, content.encode("utf-8"))
+        if trimmed:
+            logger.info("Trimmed %d stale sent entries from outbox", trimmed)
     finally:
         _release_outbox_lock(fd)
 
     return pulled
 
 
-def flush_codex_bridge() -> bool:
-    """Verify pending notifications are queued for the cron bridge to deliver.
+def flush_outbox() -> bool:
+    """Check whether outbox has pending (unsent) notifications.
 
-    IMPORTANT: This does NOT consume notifications.  The cron bridge job
-    (every 1 min) is the sole delivery path.  This function only checks
-    that outbox has pending items — a safety check after queuing.
+    This does NOT consume notifications. The cron bridge is the sole
+    delivery path. This is a safety check after queuing — confirms
+    items were written and are awaiting delivery.
 
-    Returns True if there are pending (unsent) notifications, False if empty.
+    Returns True if there are unsent notifications, False if empty.
     """
     try:
-        pending = pull_codex_notifications(limit=20, mark_sent=False)
+        pending = pull_outbox(limit=20, mark_sent=False)
         return len(pending) > 0
     except Exception:
         return False
 
 
-def check_stale_notifications(max_age_minutes: int = 5) -> list[dict]:
+def check_stale(max_age_minutes: int = 5) -> list[dict]:
     """Check for unsent notifications older than max_age_minutes.
 
     Returns list of stale notifications that haven't been delivered.
-    Used as a health check — if notifications are piling up, the cron
+    Used as a health check — if notifications are piling up, the
     bridge may have stalled.
     """
     cutoff = datetime.now().timestamp() - max_age_minutes * 60
-    pending = pull_codex_notifications(limit=50, mark_sent=False)
+    pending = pull_outbox(limit=50, mark_sent=False)
     stale = []
     for item in pending:
         try:

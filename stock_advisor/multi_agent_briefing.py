@@ -18,7 +18,7 @@ from zoneinfo import ZoneInfo
 
 from .market_hours import MARKET_TZ
 from .multi_agent import MultiAgentDecision, debate
-from .codex_bridge import queue_codex_notification
+from .outbox import queue_notification
 
 logger = logging.getLogger(__name__)
 
@@ -64,7 +64,7 @@ def run_multi_agent_briefing(
     
     # Queue for Feishu delivery
     if config.monitor.notification.feishu.enabled:
-        queue_codex_notification(
+        queue_notification(
             f"多Agent辩论 · {today} {'盘前' if period == 'morning' else '收盘'}",
             report,
         )

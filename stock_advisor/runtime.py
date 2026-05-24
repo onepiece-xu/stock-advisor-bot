@@ -17,7 +17,7 @@ from .models import StockQuote
 from .logging_utils import get_logger
 from .news import fetch_announcements_for_code, fetch_stock_news, filter_new_announcements, format_announcement_line, is_important_announcement
 from .notify import deliver_feishu_message
-from .codex_bridge import flush_codex_bridge, check_stale_notifications
+from .outbox import flush_outbox, check_stale
 from .portfolio import compute_cash_ratio, compute_position_ratio, find_holding, generate_portfolio_report, load_snapshot as load_portfolio_snapshot
 from .portfolio_doc_sync import sync_snapshot_from_doc
 from .providers import EastmoneyMarketSnapshotProvider, EastmoneyMinuteHistoryProvider, SinaMinuteHistoryProvider, TencentQuoteProvider
@@ -337,7 +337,7 @@ class MonitorRuntime:
             return
 
         message = "📰 **盘中重要公告**\n" + "\n".join(all_important)
-        deliver_feishu_message(self.config.feishu, "盘中公告", message)
+        deliver_feishu_message(self.config.monitor.notification.feishu, "盘中公告", message)
 
     def _notify_batch(self, notifications: list[tuple[str, str, str]]) -> None:
         if not notifications:
@@ -515,7 +515,7 @@ class MonitorRuntime:
     def _check_bridge_health(self) -> None:
         """Alert if notifications have been stuck in the outbox too long."""
         try:
-            stale = check_stale_notifications(max_age_minutes=5)
+            stale = check_stale(max_age_minutes=5)
             if stale:
                 logger.warning(
                     "Bridge health: %d notifications stuck >5min in outbox. "
@@ -594,7 +594,7 @@ class MonitorRuntime:
                     app_secret=self.config.feishu_bot.app_secret,
                 )
                 mark_close_review_sent(self.config, trade_date)
-                flush_codex_bridge()  # 双保险：不等 cron，立即推送
+                flush_outbox()  # 双保险：不等 cron，立即推送
             except Exception as exc:  # noqa: BLE001
                 logger.exception("Close review delivery failed error=%s", exc)
                 return
@@ -877,7 +877,7 @@ class MonitorRuntime:
                     app_id=self.config.feishu_bot.app_id,
                     app_secret=self.config.feishu_bot.app_secret,
                 )
-                flush_codex_bridge()  # 双保险：不等 cron，立即推送
+                flush_outbox()  # 双保险：不等 cron，立即推送
             except Exception as exc:  # noqa: BLE001
                 logger.exception("Pre-market briefing delivery failed error=%s", exc)
 

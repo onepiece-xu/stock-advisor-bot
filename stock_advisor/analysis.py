@@ -570,7 +570,12 @@ def _apply_account_risk_guards(
     # ── Deep loss: never buy more of a deep-loss position ──
     if portfolio_holding and action == "buy":
         pnl_pct = _safe_pnl_pct(portfolio_holding)
-        if pnl_pct is not None and pnl_pct <= Decimal("-20"):
+        if pnl_pct is None:
+            # Conservative: cannot determine PnL — disallow buying
+            action = "avoid"
+            guard_rationales.append("无法计算持仓盈亏，禁止买入")
+            guard_risk_flags.append("⚠️ 持仓缺少市价数据，禁止补仓")
+        elif pnl_pct <= Decimal("-20"):
             action = "avoid"
             guard_rationales.append("深套股不补仓")
             guard_risk_flags.append(f"⚠️ 深套 {float(pnl_pct):+.1f}%，禁止买入")
@@ -649,6 +654,13 @@ def _build_decision_signal(
     else:
         daily_regime = "neutral"
 
+    # ═══════════════════════════════════════════════════════════
+    # PHASE 0: Initialize scoring + rationale (MUST come before multi-timeframe filter)
+    # ═══════════════════════════════════════════════════════════
+    score = Decimal("50")
+    rationale: list[str] = []
+    risk_flags: list[str] = []
+
     # ── Multi-Timeframe Filter (Weekly + Daily) ──
     try:
         from .multi_timeframe import multi_timeframe_filter
@@ -660,6 +672,8 @@ def _build_decision_signal(
         mtf_score_adjust = mtf.get("score_adjust", 0)
         mtf_desc = mtf.get("description", "")
         if mtf_score_adjust != 0:
+            score += Decimal(str(mtf_score_adjust))
+        if mtf_desc:
             rationale.append(f"多周期: {mtf_desc}")
     except Exception:
         mtf_block_buy = False
@@ -681,13 +695,6 @@ def _build_decision_signal(
     # ═══════════════════════════════════════════════════════════
     # PHASE 1: Daily Regime Scoring (foundation)
     # ═══════════════════════════════════════════════════════════
-    score = Decimal("50")
-    rationale: list[str] = []
-    risk_flags: list[str] = []
-
-    # Apply multi-timeframe score adjustment
-    if mtf_score_adjust != 0:
-        score += Decimal(str(mtf_score_adjust))
 
     # 1.1 Daily MA Structure (dominant signal)
     if daily_regime == "bull":
@@ -1335,10 +1342,15 @@ def _recommended_buy_quantity(
 
 
 def _safe_pnl_pct(holding: PortfolioHolding) -> Decimal | None:
-    """Compute pnl_pct safely, returning None if cost_price is zero."""
-    if holding.cost_price is None or holding.cost_price == Decimal("0"):
+    """Compute pnl_pct safely, returning None if missing fields or zero cost."""
+    try:
+        cost = getattr(holding, "cost_price", None)
+        current = getattr(holding, "current_price", None)
+    except Exception:
         return None
-    return (holding.current_price - holding.cost_price) / holding.cost_price * Decimal("100")
+    if cost is None or current is None or cost == Decimal("0"):
+        return None
+    return (current - cost) / cost * Decimal("100")
 
 
 def _recommended_reduce_quantity(

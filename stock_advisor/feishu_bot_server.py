@@ -1,7 +1,7 @@
 # DEPRECATED (2026-05-24): This module is no longer used. Delivery now goes
 # through Hermes Agent DM via bridge_validator cron job. The stock_advisor
 # config has feishu_bot.enabled=false. The serve-feishu-bot CLI entrypoint
-# will refuse to start unless explicitly forced. Scheduled for removal.
+# will refuse to start when feishu_bot.enabled is false. Scheduled for removal.
 from __future__ import annotations
 
 import json

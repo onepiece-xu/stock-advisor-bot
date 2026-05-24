@@ -307,7 +307,7 @@ class AnalysisRegressionTests(unittest.TestCase):
         self.assertEqual(decision.action, "buy")
         self.assertTrue(len(decision.rationale) > 0)
 
-    def test_trend_failure_turns_hold_into_reduce(self) -> None:
+    def test_trend_failure_still_allows_buy_when_pnl_not_deep_loss(self) -> None:
         config = load_config(Path(__file__).resolve().parent.parent / "config.yaml").monitor
         quote = self._quote("30")
         metrics = self._metrics(
@@ -374,7 +374,7 @@ class AnalysisRegressionTests(unittest.TestCase):
         self.assertNotIn("清理", decision.trade_size_hint)
         self.assertNotEqual(decision.action, "avoid")
 
-    def test_deep_losing_position_breaking_structure_turns_hold_into_reduce(self) -> None:
+    def test_deep_losing_with_breaking_structure_still_allows_buy_when_pnl_not_deep_loss(self) -> None:
         config = load_config(Path(__file__).resolve().parent.parent / "config.yaml").monitor
         quote = self._quote("30")
         metrics = self._metrics(

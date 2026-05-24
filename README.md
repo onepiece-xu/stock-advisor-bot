@@ -56,7 +56,7 @@ python3 -m pip install --user -r requirements.txt
 - 当前实际配置：`config.yaml`
 - 长期持仓文档（飞书）：`https://wcntg42cmak8.feishu.cn/docx/DXRDdRGRJohquex19VucUqh0nVd`
 - 本地结构化快照：`portfolio-snapshot.json`
-- 飞书机器人监听配置：`feishu_bot`
+- **~~飞书机器人监听配置（已废弃）~~**：`feishu_bot` — 推送已统一走 Hermes Agent DM 通道
 - 交易计划样例：`trading-plan.example.json`
 - 收盘复盘配置：`review`
 - 用户级 systemd 服务文件：`systemd/user/`
@@ -361,7 +361,13 @@ python3 -m stock_advisor.cli market-scan --config config.yaml --mobile
 - 接口抖动时会自动重试；若实时接口暂不可用，会回退到最近一次成功的市场扫描快照
 - 飞书机器人支持：`market`
 
-## 飞书机器人命令服务
+### ~~飞书 Bot 监听（已废弃）~~
+
+> ⚠️ **已废弃 (2026-05-24)**：推送通道已统一走 Hermes Agent DM。
+> 以下内容仅供历史参考，不建议启用。当前 `config.yaml` 中 `feishu_bot.enabled = false`。
+
+<details>
+<summary>历史用法（点击展开）</summary>
 
 启动服务：
 
@@ -442,7 +448,7 @@ replay action=reduce level=ALERT symbol=601698
 
 - WSL 已启用 `systemd`
 - `config.yaml` 已填写完成
-- 飞书 bot 如果需要启用，`feishu_bot.enabled` 已设为 `true`
+- ~~飞书 bot 如果需要启用，`feishu_bot.enabled` 已设为 `true`~~（已废弃，默认 false）
 
 安装用户级服务：
 
@@ -475,6 +481,8 @@ systemctl --user status stock-advisor-feishu-bot.service
 journalctl --user -u stock-advisor-monitor.service -f
 journalctl --user -u stock-advisor-feishu-bot.service -f
 ```
+
+</details>
 
 ## 历史回放统计
 

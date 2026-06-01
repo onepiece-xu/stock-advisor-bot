@@ -89,7 +89,7 @@ def resolve_instruction(
     if trigger_hit_action:
         instr.action = trigger_hit_action
         validated = validate_lot_size(trigger_hit_quantity)
-        # 验证后为 0（<100 股）时退回原始值，不静默丢弃
+        # 验证为 0（小 < 100 股）时退回原始值，不静默丢弃动作
         instr.quantity = validated if validated > 0 else trigger_hit_quantity
         if trigger_hit_action == "sell":
             instr.reason = "触发卖出区间，按计划执行"

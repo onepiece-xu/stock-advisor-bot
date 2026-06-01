@@ -5,6 +5,19 @@ from decimal import Decimal
 from .models import ActionCandidate, StockQuote
 
 
+# A-share minimum trading unit: 100 shares (1 lot). All quantity recommendations
+# must be multiples of 100, rounded down to the nearest lot.
+A_SHARE_LOT_SIZE = 100
+
+
+def validate_lot_size(quantity: int) -> int:
+    """Ensure quantity is a multiple of A_SHARE_LOT_SIZE (100 shares).
+    Rounds down to nearest lot. Returns 0 if quantity < lot size."""
+    if quantity < A_SHARE_LOT_SIZE:
+        return 0
+    return (quantity // A_SHARE_LOT_SIZE) * A_SHARE_LOT_SIZE
+
+
 STRONG_UP_DAY_PCT = Decimal("2.00")
 WEAK_DOWN_DAY_PCT = Decimal("-2.00")
 HIGH_AMPLITUDE_PCT = Decimal("4.00")

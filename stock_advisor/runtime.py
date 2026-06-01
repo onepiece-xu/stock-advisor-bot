@@ -66,8 +66,7 @@ class MonitorRuntime:
         self._debate_cache: dict[str, tuple] = {}       # code -> (decision, timestamp)
         self._debate_attempts: dict[str, datetime] = {}  # code -> last attempt time
         self._debate_interval = 600  # 10 min between debates per stock
-        self._last_intraday_opportunity_scan: datetime | None = None
-        self._last_intraday_opportunity_digest: str = ""
+        # Intraday opportunity scan removed per push convergence plan (v1.55.22)
 
     def run_once(self) -> None:
         self._prune_notifications()
@@ -260,7 +259,8 @@ class MonitorRuntime:
         try:
             if self._signal_state_path.exists():
                 self._signal_states = json.loads(self._signal_state_path.read_text())
-        except Exception:
+        except Exception as exc:
+            logger.warning("Failed to load signal states: %s", exc)
             self._signal_states = {}
 
     def _save_signal_states(self) -> None:
@@ -268,8 +268,8 @@ class MonitorRuntime:
         try:
             self._signal_state_path.parent.mkdir(parents=True, exist_ok=True)
             self._signal_state_path.write_text(json.dumps(self._signal_states, ensure_ascii=False))
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.warning("Failed to save signal states: %s", exc)
 
     def _check_signal_reversal(self, code: str, action: str) -> bool:
         """Return True if this signal is a reversal and should be suppressed.
@@ -342,8 +342,8 @@ class MonitorRuntime:
                 if trigger_hit:
                     trigger_action = trigger_hit.trigger.action
                     trigger_quantity = trigger_hit.quantity
-            except Exception:
-                pass
+            except Exception as exc:
+                logger.warning("Trigger resolution failed: %s", exc)
 
         # ── Holdings context ──
         holding_quantity = holding.quantity if holding else 0
@@ -601,8 +601,8 @@ class MonitorRuntime:
                     "Cron bridge may be stalled.",
                     len(stale),
                 )
-        except Exception:
-            pass  # Don't let health check crash the daemon
+        except Exception as exc:
+            logger.warning("Health check stale trigger cleanup failed: %s", exc)  # Don't let health check crash the daemon
 
     def _compute_effective_stop(self, quote: StockQuote, holding) -> tuple[Decimal, str, str] | None:
         if holding is None or holding.cost_price <= 0 or holding.quantity <= 0:
@@ -673,6 +673,15 @@ class MonitorRuntime:
                     app_secret=self.config.feishu_bot.app_secret,
                 )
                 mark_close_review_sent(self.config, trade_date)
+                # Outbox backlog alert: warn if items accumulated without being pushed
+                outbox_path = Path("data/outbox.jsonl")
+                if outbox_path.exists() and outbox_path.stat().st_size > 0:
+                    outbox_lines = outbox_path.read_text().strip().split("\n")
+                    if len(outbox_lines) > 3:
+                        logger.warning(
+                            "Outbox backlog detected: %d items accumulated — cron bridge may be stalled",
+                            len(outbox_lines),
+                        )
                 flush_outbox()  # 双保险：不等 cron，立即推送
             except Exception as exc:  # noqa: BLE001
                 logger.exception("Close review delivery failed error=%s", exc)
@@ -720,8 +729,8 @@ class MonitorRuntime:
                             if stock_ref:
                                 q = tencent.fetch_quote(stock_ref)
                                 current_prices[holding.code] = q.current_price
-                        except Exception:
-                            pass
+                        except Exception as exc:
+                            logger.warning("Failed to fetch quote for %s: %s", holding.code, exc)
                 for h in plan["holdings"]:
                     code = h.get("code", "")
                     name = h.get("name", "")
@@ -799,8 +808,8 @@ class MonitorRuntime:
                             f"@ {t.price_min}-{t.price_max}"
                             f"（回落 {t.fallback_price}）"
                         )
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.warning("Trigger plan rendering failed: %s", exc)
 
         # ── 3.5 昨日主力资金 ──
         try:
@@ -817,8 +826,8 @@ class MonitorRuntime:
                             lines.append(
                                 f"  {code} {ff['name']} {d} {abs(ff['main_net_yi']):.2f}亿"
                             )
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.warning("Fund flow display failed: %s", exc)
 
         # ── 4. 板块轮动热力图 ── (REMOVED — office worker doesn't need sector heatmap)
         # ── 5. 近期公告 ──
@@ -857,7 +866,8 @@ class MonitorRuntime:
                         elif bq.change_percent <= -0.5:
                             deploy_blockers.append(f"大盘 {bq.change_percent:+.2f}% 略弱，仓位不宜过重")
                     snapshot_ratio = (snapshot.cash / snapshot.total_assets * 100)
-                except Exception:
+                except Exception as exc:
+                    logger.warning("Market breadth data failed: %s", exc)
                     deploy_blockers.append("大盘数据获取失败")
                     benchmark_ok = False
 
@@ -918,8 +928,8 @@ class MonitorRuntime:
                 if exit_lines:
                     lines.append("\n【持仓卖点计划】")
                     lines.extend(exit_lines)
-            except Exception:
-                pass
+            except Exception as exc:
+                logger.warning("Exit plan generation failed: %s", exc)
 
         # ── 8. LLM 决策解读（AI 浓缩）──
         try:
@@ -953,8 +963,8 @@ class MonitorRuntime:
                 if verdict:
                     lines.append("\n【AI 决策解读】")
                     lines.append(verdict)
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.warning("AI decision generation failed: %s", exc)
 
         # ── 9. 板块强度（当日最强/最弱板块）──
         try:
@@ -968,8 +978,8 @@ class MonitorRuntime:
                 sector_text = format_sector_report(sectors, holdings_list)
                 if sector_text:
                     lines.append(f"\n{sector_text}")
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.warning("Sector text generation failed: %s", exc)
 
         # ── 10. 主动机会扫描（排除当前持仓）──
         try:
@@ -1002,8 +1012,8 @@ class MonitorRuntime:
         # Save briefing data for status command
         try:
             _save_pre_market_state(Path("data"), today, lines, snapshot)
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.warning("Failed to save pre-market state: %s", exc)
 
         lines.append(f"\n下次开盘：{next_session_str()}")
         self._pre_market_sent_dates.add(today)

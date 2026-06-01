@@ -24,7 +24,7 @@ from typing import Literal
 
 import requests
 
-from .llm_analyst import get_deepseek_api_key, get_deepseek_base_url
+from .llm_analyst import get_deepseek_api_key, get_deepseek_base_url, get_deepseek_model
 from .feedback_loop import log_debate_result, get_weighted_confidence
 
 logger = logging.getLogger(__name__)
@@ -167,7 +167,7 @@ def _call_agent(
                 "Content-Type": "application/json",
             },
             json={
-                "model": "deepseek-v4-pro",
+                "model": get_deepseek_model(),
                 "messages": [
                     {"role": "system", "content": role_config["system"]},
                     {"role": "user", "content": user_msg},
@@ -413,7 +413,7 @@ def debate(
                 "Content-Type": "application/json",
             },
             json={
-                "model": "deepseek-v4-pro",
+                "model": get_deepseek_model(),
                 "messages": [
                     {"role": "system", "content": ARBITER_SYSTEM},
                     {"role": "user", "content": arbiter_prompt},

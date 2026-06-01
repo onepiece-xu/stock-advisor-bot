@@ -884,12 +884,14 @@ def _resolve_stock_ref(config, query: str) -> StockRef:
 
 
 def _apply_thresholds_to_config(config_path: str, buy_score: int, hold_score: int, reduce_score: int) -> None:
-    import re
+    import yaml
     text = Path(config_path).read_text(encoding="utf-8")
-    text = re.sub(r"(buy_score:\s*)\d+", f"\\g<1>{buy_score}", text)
-    text = re.sub(r"(hold_score:\s*)\d+", f"\\g<1>{hold_score}", text)
-    text = re.sub(r"(reduce_score:\s*)\d+", f"\\g<1>{reduce_score}", text)
-    Path(config_path).write_text(text, encoding="utf-8")
+    config_data = yaml.safe_load(text)
+    if "decision_thresholds" in config_data:
+        config_data["decision_thresholds"]["buy_score"] = buy_score
+        config_data["decision_thresholds"]["hold_score"] = hold_score
+        config_data["decision_thresholds"]["reduce_score"] = reduce_score
+    Path(config_path).write_text(yaml.dump(config_data, allow_unicode=True, default_flow_style=False), encoding="utf-8")
 
 
 

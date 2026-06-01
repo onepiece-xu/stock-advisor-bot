@@ -1,4 +1,6 @@
 from __future__ import annotations
+import logging
+
 
 import json
 from dataclasses import dataclass
@@ -14,6 +16,8 @@ from .portfolio import load_snapshot as load_portfolio_snapshot
 from .storage import connect_db, fetch_daily_review_snapshot, fetch_latest_trade_date
 from .trading_plan import check_stale_triggers, load_triggers, remove_orphan_triggers, save_triggers
 from .logging_utils import get_logger
+
+logger = logging.getLogger(__name__)
 from .signal_tracker import evaluate_signal_accuracy, format_accuracy_report
 from .feedback_loop import run_daily_feedback
 from .trader_feedback import run_trader_feedback
@@ -221,8 +225,12 @@ def should_send_close_review_now(config: AppConfig, *, now: datetime | None = No
 
 
 def already_sent_close_review(config: AppConfig, trade_date: date) -> bool:
-    state = _load_review_state(config.review.data_dir)
-    return state.get("last_sent_trade_date") == trade_date.isoformat()
+    try:
+        state = _load_review_state(config.review.data_dir)
+        return state.get("last_sent_trade_date") == trade_date.isoformat()
+    except (json.JSONDecodeError, FileNotFoundError, PermissionError) as exc:
+        logger.warning("Close review state file corrupted/missing: %s — treating as unsent", exc)
+        return False
 
 
 def mark_close_review_sent(config: AppConfig, trade_date: date) -> None:

@@ -521,9 +521,13 @@ def fetch_daily_review_snapshot(conn: sqlite3.Connection, trade_date: str) -> li
           WHERE rn_asc = 1
         ),
         latest_signals AS (
-          SELECT s.*, ROW_NUMBER() OVER (PARTITION BY s.symbol ORDER BY s.signal_time DESC, s.id DESC) AS rn_desc
+          SELECT s.*,
+                 ROW_NUMBER() OVER (
+                   PARTITION BY s.symbol
+                   ORDER BY CASE WHEN substr(s.signal_time, 1, 10) = ? THEN 0 ELSE 1 END,
+                            s.signal_time DESC, s.id DESC
+                 ) AS rn_desc
           FROM signals s
-          WHERE substr(s.signal_time, 1, 10) = ?
         )
         SELECT q.symbol, q.code, q.name, q.quote_time, q.current_price, q.open_price, q.previous_close,
                q.high_price, q.low_price, q.change_percent, q.turnover_yuan,

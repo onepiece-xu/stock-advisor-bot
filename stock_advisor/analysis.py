@@ -1,11 +1,14 @@
 from __future__ import annotations
 
+import logging
 from decimal import Decimal, ROUND_HALF_UP
 
 from .advice import build_action_candidates, render_action_candidates
 from .config import MonitorConfig
 from .models import DecisionSignal, ObservationMetrics, ObservationResult, PortfolioHolding, StockQuote, TradingHabitProfile
 from .news import fetch_stock_news, render_news_lines
+
+logger = logging.getLogger(__name__)
 
 
 def analyze_quotes(
@@ -25,6 +28,7 @@ def analyze_quotes(
     daily_closes: list[Decimal] | None = None,
     daily_volumes: list[Decimal] | None = None,
     portfolio_total_assets: Decimal | None = None,
+    peak_price: Decimal | None = None,
 ) -> ObservationResult:
     current = history[-1]
     observations: list[str] = []
@@ -675,7 +679,8 @@ def _build_decision_signal(
             score += Decimal(str(mtf_score_adjust))
         if mtf_desc:
             rationale.append(f"多周期: {mtf_desc}")
-    except Exception:
+    except Exception as exc:
+        logger.warning("多周期过滤器异常，降级为无过滤: %s", exc)
         mtf_block_buy = False
         mtf_block_sell = False
         mtf_score_adjust = 0
@@ -704,15 +709,25 @@ def _build_decision_signal(
         score -= Decimal("30")
         risk_flags.append("日线空头排列：现价<MA20<MA60，大趋势偏弱")
 
-    # 1.2 Daily MA20 Bias (penalized only outside bull regime)
+    # 1.2 Daily MA20 Bias (mean-reversion only valid in bull regime)
     if daily_ma20 is not None and daily_ma20 > 0:
         daily_ma20_bias = _percent_diff(current.current_price, daily_ma20)
         if daily_ma20_bias <= Decimal("-5.00"):
-            score += Decimal("15")
-            rationale.append(f"日线深度低于MA20 {_format_percent(daily_ma20_bias)}，均值回归")
+            if daily_regime == "bull":
+                score += Decimal("15")
+                rationale.append(f"日线深度低于MA20 {_format_percent(daily_ma20_bias)}，牛市回调均值回归")
+            else:
+                # 非牛市：深度低于MA20是趋势性走弱，不加分
+                score -= Decimal("6")
+                risk_flags.append(f"日线深度低于MA20 {_format_percent(daily_ma20_bias)}，趋势偏弱")
         elif daily_ma20_bias <= Decimal("-2.00"):
-            score += Decimal("6")
-            rationale.append(f"日线低于MA20 {_format_percent(daily_ma20_bias)}，修复窗口")
+            if daily_regime == "bull":
+                score += Decimal("6")
+                rationale.append(f"日线低于MA20 {_format_percent(daily_ma20_bias)}，修复窗口")
+            elif daily_regime == "neutral":
+                score += Decimal("3")
+                rationale.append(f"日线略低于MA20 {_format_percent(daily_ma20_bias)}，观察修复")
+            # bear regime: no bonus, price below MA20 is expected
         elif daily_ma20_bias >= Decimal("5.00") and daily_regime != "bull":
             score -= Decimal("18")
             risk_flags.append(f"日线远高于MA20 {_format_percent(daily_ma20_bias)}，追高风险")
@@ -867,15 +882,20 @@ def _build_decision_signal(
                 score += Decimal("5"); rationale.append(f"板块龙头({board['name']})")
                 break
 
-    # 3.4 Mean-reversion: anti-chase / buy-dip
+    # 3.4 Anti-chase / buy-dip (only in bull/neutral — bear market dips aren't dips)
     if current.change_percent >= Decimal("5.00"):
         score -= Decimal("8"); risk_flags.append(f"日涨{_format_percent(current.change_percent)}，不追高")
     elif current.change_percent >= Decimal("3.00"):
         score -= Decimal("4")
     elif current.change_percent <= Decimal("-5.00"):
-        score += Decimal("6"); rationale.append(f"日跌{_format_percent(current.change_percent)}，关注止跌")
+        if daily_regime == "bull":
+            score += Decimal("6"); rationale.append(f"牛市回调{_format_percent(current.change_percent)}，关注止跌")
+        elif daily_regime == "neutral":
+            score += Decimal("3"); rationale.append(f"日跌{_format_percent(current.change_percent)}，观察是否企稳")
+        # bear: 日跌是趋势延续，不加分
     elif current.change_percent <= Decimal("-3.00"):
-        score += Decimal("3")
+        if daily_regime == "bull":
+            score += Decimal("3")
 
     # 3.5 Price vs auction open
     if current.current_price >= current.open_price > 0:
@@ -917,7 +937,7 @@ def _build_decision_signal(
             stop_gap_pct = (((_eff_stop - current.current_price) / _eff_stop * 100) if _eff_stop > 0 else Decimal("0"))
             if stop_gap_pct >= Decimal("15"):
                 score -= Decimal("3")
-                risk_flags.append(f"止损价{_eff_stop}远高于现价，反弹减仓优于割肉")
+                risk_flags.append(f"止损价{_eff_stop}远高于现价，优先按计划卖点降仓")
             else:
                 score -= Decimal("12")
                 risk_flags.append(f"已触及{_label}价{_eff_stop}，建议止损")
@@ -925,8 +945,39 @@ def _build_decision_signal(
             score -= Decimal("6")
             risk_flags.append(f"距{_label}价{_eff_stop}仅{_format_percent(dist_to_stop)}")
 
-    # Take-profit tiers
-    if has_position and holding_return_pct is not None and monitor_config.take_profit_tiers:
+    # Trailing Take-Profit (replaces fixed "一刀切" percentage triggers)
+    # Only triggers when price pulls back from peak by configurable drawdown %.
+    # If trailing is disabled or peak_price unavailable, falls back to fixed tiers.
+    if has_position and holding_return_pct is not None and monitor_config.trailing_take_profit.enabled and peak_price is not None:
+        if portfolio_holding is None:
+            pass  # unreachable, guarded by has_position
+        else:
+            from .stop_loss import compute_take_profit
+            tp_trigger, tp_label, tp_distance = compute_take_profit(
+                cost_price=portfolio_holding.cost_price,
+                current_price=current.current_price,
+                peak_price=peak_price,
+                trailing_drawdowns=monitor_config.trailing_take_profit.drawdown_tiers,
+            )
+            if tp_trigger is not None:
+                # Trailing stop triggered — price pulled back below threshold
+                score -= Decimal("20")
+                risk_flags.append(tp_label)
+                rationale.append("移动止盈触发：趋势转弱")
+                # Use the first sell_ratio tier for quantity
+                if monitor_config.take_profit_tiers:
+                    tier = monitor_config.take_profit_tiers[0]
+                    sell_qty = int(portfolio_holding.quantity * Decimal(str(tier.sell_ratio))) if tier.sell_ratio > 0 else portfolio_holding.quantity
+                    sell_qty = (sell_qty // 100) * 100 if sell_qty >= 100 else max(sell_qty, 100)
+                    risk_flags.append(f"🎯 移动止盈触发：卖出{sell_qty}股（触发价{tp_trigger}）")
+                else:
+                    risk_flags.append(f"🎯 移动止盈触发：卖出全部（触发价{tp_trigger}）")
+            elif tp_label.startswith("📈"):
+                # Not triggered yet — trailing stop is active, price still above
+                pass  # No score penalty, trend is intact
+            # else: no profit yet, nothing to do
+    elif has_position and holding_return_pct is not None and monitor_config.take_profit_tiers:
+        # Fallback: fixed take-profit tiers (when trailing disabled or no peak_price)
         for tier in monitor_config.take_profit_tiers:
             if holding_return_pct >= Decimal(str(tier.profit_pct)):
                 tier_sell_ratio = Decimal(str(tier.sell_ratio))
@@ -938,7 +989,7 @@ def _build_decision_signal(
                     is_full = tier_sell_ratio >= Decimal("1.0") or sell_qty >= portfolio_holding.quantity
                     score -= Decimal("20") if is_full else Decimal("12")
                     risk_flags.append(f"🎯 {tier.label}触发：卖出{sell_qty}股({'清仓' if is_full else '分批'}止盈)")
-                    rationale.append(f"止盈纪律：{tier.label}触发")
+                    rationale.append(f"止盈纪律：{tier.label}触发（固定阈值模式）")
                 break
 
     # ═══════════════════════════════════════════════════════════
@@ -1085,13 +1136,12 @@ def _build_decision_signal(
         pass
 
     # ═══════════════════════════════════════════════════════════
-    # PHASE 7.8: Oversold Bounce Bonus — independent buy signal
-    #            RSI oversold + volume confirmation = accumulation
-    #            NOT blocked by daily regime — buying opportunity
+    # PHASE 7.8: Oversold Bounce Bonus — only in bull/neutral regime
+    #            Bear regime oversold = trend continuation, not buying opportunity
     # ═══════════════════════════════════════════════════════════
     vol_ok = metrics.volume_ratio >= Decimal("0.8")
     rsi_low = metrics.rsi14 <= Decimal("40")
-    if rsi_low and vol_ok:
+    if rsi_low and vol_ok and daily_regime != "bear":
         if metrics.rsi14 <= Decimal("35") and metrics.volume_ratio >= Decimal("1.0"):
             score += Decimal("10")
             rationale.append("超卖+放量：底部吸筹信号，买入窗口")
@@ -1106,7 +1156,8 @@ def _build_decision_signal(
     # PHASE 8: Decision & Hard Guards
     # ═══════════════════════════════════════════════════════════
     score = max(Decimal("0"), min(score, Decimal("100")))
-    action = _decision_action(score, monitor_config, metrics.benchmark_change_pct, metrics.market_advance_ratio)
+    pre_guard_action = _decision_action(score, monitor_config, metrics.benchmark_change_pct, metrics.market_advance_ratio)
+    action = pre_guard_action
 
     action, guard_rationales, guard_risk_flags = _apply_account_risk_guards(
         action, monitor_config, portfolio_holding,
@@ -1144,6 +1195,26 @@ def _build_decision_signal(
         action = "hold"
         rationale.append("多周期护栏: 趋势强劲，暂缓卖出")
 
+    # v1.55.4: Position concentration guard — no single stock > 50% of portfolio
+    if action == "buy" and has_position and portfolio_total_assets and portfolio_total_assets > 0:
+        position_value = Decimal(str(portfolio_holding.quantity)) * current.current_price
+        concentration = float(position_value / portfolio_total_assets)
+        if concentration > 0.50:
+            action = "avoid"
+            risk_flags.append(f"持仓集中度: {concentration*100:.0f}% > 50%上限")
+            rationale.append(f"单票集中度{concentration*100:.0f}%，拒绝加仓")
+
+    # v1.55.5: Hard stop-loss guard — floating loss > 10% → force reduce
+    if has_position and holding_return_pct is not None and holding_return_pct <= Decimal("-10"):
+        if action in ("buy", "hold", "avoid"):
+            action = "reduce"
+            rationale.append(f"硬止损：浮亏{_format_percent(holding_return_pct)}超10%红线，强制减仓")
+            risk_flags.append(f"🚨 浮亏{_format_percent(holding_return_pct)}触发硬止损")
+        elif action == "sell":
+            risk_flags.append(f"🚨 浮亏{_format_percent(holding_return_pct)}超10%，卖出紧迫")
+    elif has_position and holding_return_pct is not None and holding_return_pct <= Decimal("-7"):
+        risk_flags.append(f"⚠️ 浮亏{_format_percent(holding_return_pct)}接近硬止损(10%)，密切关注")
+
     # Ex-dividend guard
     if recent_ex_dividend and action in ("buy", "hold"):
         action = "avoid"
@@ -1154,6 +1225,17 @@ def _build_decision_signal(
     if any("🎯" in flag for flag in risk_flags) and action in ("buy", "hold", "avoid"):
         action = "reduce"
         rationale.append("止盈纪律强制")
+
+    # ── Score-Action Alignment: 若 guard 降级了 action，同步压低 score ──
+    if pre_guard_action != action:
+        buy_threshold = Decimal(str(monitor_config.decision_thresholds.buy_score))
+        hold_threshold = Decimal(str(monitor_config.decision_thresholds.hold_score))
+        if action == "avoid" and score >= buy_threshold:
+            score = buy_threshold - Decimal("1")
+            rationale.append(f"护栏降级：分{score}（原{pre_guard_action}→{action}）")
+        elif action == "reduce" and score >= hold_threshold:
+            score = hold_threshold - Decimal("1")
+            rationale.append(f"护栏降级：分{score}（原{pre_guard_action}→{action}）")
 
     # ═══════════════════════════════════════════════════════════
     # PHASE 9: Trade Plan

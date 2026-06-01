@@ -40,26 +40,57 @@ class WeeklyRegime:
 
 
 def _fetch_weekly_klines(symbol: str, nweeks: int = 30) -> tuple[list[Decimal], list[Decimal], list[Decimal]] | None:
-    """Fetch weekly K-line data from East Money.
+    """Fetch weekly K-line data — Tencent first, East Money as fallback.
     
     Returns (highs, lows, closes) or None on failure.
     """
-    if symbol.startswith("sh"):
-        market = "1"
-    elif symbol.startswith("sz"):
-        market = "0"
-    else:
+    if not (symbol.startswith("sh") or symbol.startswith("sz")):
         return None
     
-    code = symbol[2:]
+    # ── Tier 1: 腾讯 周线 K线 API（WSL兼容） ──
+    try:
+        resp = requests.get(
+            f"https://web.ifzq.gtimg.cn/appstock/app/fqkline/get?param={symbol},week,,,{nweeks + 5},qfq",
+            headers={"User-Agent": "Mozilla/5.0"},
+            timeout=10,
+        )
+        resp.raise_for_status()
+        payload = resp.json()
+        symbol_data = (payload.get("data") or {}).get(symbol, {})
+        qfq_week = symbol_data.get("qfqweek") or []
+        
+        highs: list[Decimal] = []
+        lows: list[Decimal] = []
+        closes: list[Decimal] = []
+        for candle in qfq_week:
+            # Format: [date, open, close, high, low, volume]
+            if len(candle) < 6:
+                continue
+            try:
+                highs.append(Decimal(str(candle[3])))
+                lows.append(Decimal(str(candle[4])))
+                closes.append(Decimal(str(candle[2])))
+            except (ValueError, TypeError, IndexError):
+                continue
+        
+        if len(closes) >= 10:
+            return highs[-nweeks:], lows[-nweeks:], closes[-nweeks:]
+        
+        logger.debug("Tencent weekly data too short for %s: %d candles", symbol, len(closes))
     
+    except Exception as exc:
+        logger.debug("Tencent weekly kline fetch failed for %s: %s", symbol, exc)
+    
+    # ── Tier 2: East Money（WSL SSL 不兼容，留作其他环境备选） ──
+    market = "1" if symbol.startswith("sh") else "0"
+    code = symbol[2:]
     try:
         resp = requests.get(
             "https://push2his.eastmoney.com/api/qt/stock/kline/get",
             params={
                 "secid": f"{market}.{code}",
-                "klt": "102",          # Weekly K-line
-                "fqt": "1",            # Forward-adjusted
+                "klt": "102",
+                "fqt": "1",
                 "lmt": str(nweeks + 5),
                 "beg": (datetime.now() - timedelta(days=nweeks * 10)).strftime("%Y%m%d"),
                 "end": datetime.now().strftime("%Y%m%d"),
@@ -67,7 +98,7 @@ def _fetch_weekly_klines(symbol: str, nweeks: int = 30) -> tuple[list[Decimal], 
                 "fields2": "f51,f52,f53,f54,f55,f56",
             },
             headers={"User-Agent": "Mozilla/5.0"},
-            timeout=10,
+            timeout=5,
         )
         resp.raise_for_status()
         data = (resp.json().get("data") or {})
@@ -83,14 +114,13 @@ def _fetch_weekly_klines(symbol: str, nweeks: int = 30) -> tuple[list[Decimal], 
                 highs.append(Decimal(fields[3]))
                 lows.append(Decimal(fields[4]))
         
-        if len(closes) < 10:
-            return None
-        
-        return highs[-nweeks:], lows[-nweeks:], closes[-nweeks:]
+        if len(closes) >= 10:
+            return highs[-nweeks:], lows[-nweeks:], closes[-nweeks:]
     
     except Exception as exc:
-        logger.debug("Weekly kline fetch failed for %s: %s", symbol, exc)
-        return None
+        logger.debug("East Money weekly kline fetch failed for %s: %s", symbol, exc)
+    
+    return None
 
 
 def _simple_ma(values: list[Decimal], period: int) -> Decimal:
@@ -234,11 +264,32 @@ def multi_timeframe_filter(
         desc = f"周多日空 → 等待日线企稳。{weekly_desc} | {daily_desc}"
         block_buy = False   # Buying the dip in weekly uptrend is OK
         block_sell = False
+    elif weekly_regime == "unknown":
+        # v1.55.4: 周线数据不可用时不应自宫——降级为日线独立判断
+        # 之前未知周线全杀buy信号（block_buy=True），导致score 84 → avoid
+        if daily_regime == "bear":
+            combined = "caution"
+            extra_adjust = -5
+            desc = f"周线缺失 | {daily_desc}"
+            block_buy = True    # 日线空头 → 确实不买
+            block_sell = False
+        elif daily_regime == "bull":
+            combined = "buy"
+            extra_adjust = 2
+            desc = f"周线缺失 | {daily_desc}"
+            block_buy = False
+            block_sell = False
+        else:
+            combined = "neutral"
+            extra_adjust = 0
+            desc = f"周线缺失 | {daily_desc}"
+            block_buy = False   # 日线中性 → 不拦buy，让评分引擎决定
+            block_sell = False
     else:
         combined = "caution"
         extra_adjust = 0
         desc = f"信号混合 → 观望。{weekly_desc} | {daily_desc}"
-        block_buy = False
+        block_buy = True
         block_sell = False
     
     total_adjust = weekly_adjust + daily_adjust + extra_adjust

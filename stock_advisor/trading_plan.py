@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 import logging
 from dataclasses import dataclass, field
-from datetime import date
+from datetime import date, datetime
 from decimal import Decimal, ROUND_HALF_UP
 from pathlib import Path
 from typing import Any
@@ -61,6 +61,11 @@ class TradeTrigger:
     fallback_price: Decimal
     note: str
     disable_buy: bool = False
+    # ── Phase 2: state machine ──
+    state: str = "armed"        # armed | fired | cooldown | expired | cancelled
+    superseded_by: str = ""     # identity of replacement trigger, if any
+    _source: str = ""           # origin: auto_profit_sync | exit_plan_sync | debate_sync | "" (manual)
+    created_at: str = ""        # ISO datetime when trigger was created
 
 
 @dataclass(slots=True)
@@ -123,6 +128,10 @@ def build_default_trigger_payload() -> dict[str, list[dict[str, Any]]]:
                 "fallbackPrice": str(trigger.fallback_price),
                 "note": trigger.note,
                 "disableBuy": trigger.disable_buy,
+                "state": trigger.state,
+                "supersededBy": trigger.superseded_by,
+                "_source": trigger._source,
+                "_created": trigger.created_at,
             }
             for trigger in DEFAULT_TRIGGER_MAP.values()
         ]
@@ -146,9 +155,13 @@ def load_triggers(path: str | Path | None) -> dict[str, TradeTrigger]:
             quantity=int(item["quantity"]),
             price_min=Decimal(str(item["priceMin"])),
             price_max=Decimal(str(item["priceMax"])),
-            fallback_price=Decimal(str(item["fallbackPrice"])),
+            fallback_price=Decimal(str(item.get("fallbackPrice", item.get("priceMin", "0")))),
             note=str(item.get("note", "")),
             disable_buy=bool(item.get("disableBuy", False)),
+            state=str(item.get("state", "armed")),
+            superseded_by=str(item.get("supersededBy", "")),
+            _source=str(item.get("_source", "")),
+            created_at=str(item.get("_created", "")),
         )
         triggers[f"{trigger.code}:{trigger.name}"] = trigger
     return triggers
@@ -418,12 +431,43 @@ def _post_fill_instruction(holding: PortfolioHolding, snapshot: PortfolioSnapsho
     return ("持有观察", "暂时不动，等更清晰信号", "当前不是最急需处理的仓位")
 
 
+def _build_exit_plan(holding: PortfolioHolding) -> tuple[str, int, Decimal, Decimal, str]:
+    cost = holding.cost_price or Decimal("0")
+    current = holding.current_price or Decimal("0")
+    quantity = int(holding.quantity or 0)
+    if cost <= 0 or current <= 0 or quantity <= 0:
+        return ("观察", 0, Decimal("0"), Decimal("0"), "持仓数据不完整")
+
+    pnl_pct = ((current - cost) / cost * Decimal("100")).quantize(Decimal("0.01"))
+    reduce_qty = max(100, (quantity // 4 // 100) * 100) if quantity >= 400 else 100
+    reduce_qty = min(reduce_qty, quantity)
+    target_price = current
+    fallback_price = (current * Decimal("0.97")).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+
+    if pnl_pct >= Decimal("8"):
+        target_price = (current * Decimal("1.02")).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+        return ("止盈计划", reduce_qty, target_price, fallback_price, f"浮盈{pnl_pct}%先兑现一部分，剩余仓位用移动止盈保护利润")
+    if pnl_pct >= Decimal("3"):
+        target_price = (current * Decimal("1.015")).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+        return ("锁盈计划", reduce_qty, target_price, fallback_price, f"已有浮盈{pnl_pct}%，先锁一部分利润")
+    if pnl_pct <= Decimal("-10"):
+        target_price = (current * Decimal("1.02")).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+        fallback_price = (current * Decimal("0.98")).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+        return ("卖点计划", min(max(200, reduce_qty), quantity), target_price, fallback_price, f"浮亏{pnl_pct}%过深，反弹到计划卖点先减仓，跌破防守位执行止损")
+    if pnl_pct < Decimal("0"):
+        target_price = (current * Decimal("1.03")).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+        return ("卖点计划", reduce_qty, target_price, fallback_price, f"浮亏{pnl_pct}%不再拖延，反弹到计划价先降仓位")
+    return ("持有观察", 0, current, fallback_price, f"盈亏{pnl_pct}%不极端，暂不主动卖")
+
+
 def check_stale_triggers(triggers: dict[str, TradeTrigger], snapshot: PortfolioSnapshot) -> list[str]:
     """Return warnings for triggers whose price ranges are too far from current prices.
 
     A trigger is stale if:
-    - Action is sell/hold and current price is >20% above trigger range (you'd be selling too early)
-    - Action is sell/hold and current price is >15% below fallback (trigger is unreachable)
+    - Sell/hold trigger with price_min >15% above current price (unreachable for selling)
+    - Sell/hold trigger with current >20% above trigger range (selling too early)
+    - Buy trigger with price_max <15% below current price (unreachable for buying)
+    - Price below fallback by >15% (stop already breached)
     """
     warnings: list[str] = []
     for _key, trigger in triggers.items():
@@ -431,18 +475,194 @@ def check_stale_triggers(triggers: dict[str, TradeTrigger], snapshot: PortfolioS
         if holding is None or holding.quantity <= 0:
             continue
         current = holding.current_price
-        if trigger.price_max > 0:
-            deviation_above = ((current - trigger.price_max) / trigger.price_max * Decimal("100")).quantize(Decimal("0.1"))
-            if deviation_above > Decimal("20"):
+        # Sell/hold: trigger range unreachably high
+        if trigger.action in ("sell", "hold") and trigger.price_min > 0:
+            gap_pct = ((trigger.price_min - current) / current * Decimal("100")).quantize(Decimal("0.1"))
+            if gap_pct > Decimal("15"):
                 warnings.append(
-                    f"- ⚠️ {trigger.name}({code}) 现价 {current}，远超触发区间上限 {trigger.price_max}（+{deviation_above}%），"
-                    f"触发区间可能过时，建议更新"
+                    f"- ⚠️ {trigger.name}({trigger.code}) 现价 {_fmt(current)}，卖出触发下限 {_fmt(trigger.price_min)}（+{gap_pct}%），短期难触发，建议下调"
+                )
+        # Buy: trigger range unreachably low
+        if trigger.action == "buy" and trigger.price_max > 0:
+            gap_pct = ((current - trigger.price_max) / current * Decimal("100")).quantize(Decimal("0.1"))
+            if gap_pct > Decimal("15"):
+                warnings.append(
+                    f"- ⚠️ {trigger.name}({trigger.code}) 现价 {_fmt(current)}，买入触发上限 {_fmt(trigger.price_max)}（-{gap_pct}%），短期难触发，建议上调"
                 )
         if trigger.fallback_price > 0:
             deviation_below = ((current - trigger.fallback_price) / trigger.fallback_price * Decimal("100")).quantize(Decimal("0.1"))
             if current < trigger.price_min and abs(deviation_below) > Decimal("15"):
                 warnings.append(
-                    f"- ⚠️ {trigger.name}({code}) 现价 {current}，已大幅跌破防守位 {trigger.fallback_price}（{deviation_below}%），"
-                    f"触发单可能已失效"
+                    f"- ⚠️ {trigger.name}({trigger.code}) 现价 {_fmt(current)}，已大幅跌破防守位 {_fmt(trigger.fallback_price)}（{deviation_below}%），触发单可能已失效"
                 )
     return warnings
+
+
+def save_triggers(path: str | Path, triggers: dict[str, TradeTrigger]) -> None:
+    """Write trigger map back to trading-plan.json file."""
+    trigger_path = Path(path)
+    trigger_path.parent.mkdir(parents=True, exist_ok=True)
+    items = []
+    for trigger in triggers.values():
+        items.append({
+            "code": trigger.code,
+            "name": trigger.name,
+            "action": trigger.action,
+            "quantity": trigger.quantity,
+            "priceMin": str(trigger.price_min),
+            "priceMax": str(trigger.price_max),
+            "fallbackPrice": str(trigger.fallback_price),
+            "note": trigger.note,
+            "disableBuy": trigger.disable_buy,
+            "state": trigger.state,
+            "supersededBy": trigger.superseded_by,
+            "_source": trigger._source,
+            "_created": trigger.created_at,
+        })
+    trigger_path.write_text(
+        json.dumps({"triggers": items}, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+
+
+def remove_orphan_triggers(triggers: dict[str, TradeTrigger], active_codes: set[str]) -> tuple[dict[str, TradeTrigger], int]:
+    """Remove triggers for codes that no longer have holdings. Returns (cleaned_triggers, removed_count)."""
+    removed = 0
+    cleaned: dict[str, TradeTrigger] = {}
+    for key, trigger in triggers.items():
+        if trigger.code not in active_codes:
+            removed += 1
+        else:
+            cleaned[key] = trigger
+    return cleaned, removed
+
+
+def sync_profit_triggers(
+    snapshot: PortfolioSnapshot,
+    trigger_path: str | Path,
+    *,
+    drawdown_pct: Decimal = Decimal("5"),
+) -> int:
+    """Auto-create trailing take-profit triggers for positions in profit.
+
+    For each holding with profit >= 5%, create/update a sell trigger with:
+      - priceMin = current_price (卖单底价)
+      - priceMax = current_price * 1.03 (上限留3%空间)
+      - fallbackPrice = current_price * 0.97 (回撤3%触发)
+      - disableBuy = True (浮盈状态不加仓)
+
+    Existing debate-synced stop-loss triggers are preserved. Only the
+    profit-taking triggers for the same code are replaced.
+
+    Returns count of triggers created/updated.
+    """
+    tp = Path(trigger_path)
+    if tp.exists():
+        raw = json.loads(tp.read_text(encoding="utf-8"))
+        existing_triggers = raw.get("triggers", [])
+    else:
+        existing_triggers = []
+
+    kept = [
+        t for t in existing_triggers
+        if not t.get("name", "").endswith("-止盈计划")
+    ]
+
+    created = 0
+    for h in snapshot.holdings:
+        if h.quantity <= 0 or h.cost_price <= 0 or h.current_price <= 0:
+            continue
+        pnl_pct = (h.current_price - h.cost_price) / h.cost_price * 100
+        if pnl_pct < 5:
+            continue
+
+        price = h.current_price
+        sell_qty = max(100, (h.quantity // 2 // 100) * 100)
+
+        kept.append({
+            "code": h.code,
+            "name": f"{h.name}-止盈计划",
+            "action": "sell",
+            "quantity": sell_qty,
+            "priceMin": str(price.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)),
+            "priceMax": str((price * Decimal("1.03")).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)),
+            "fallbackPrice": str((price * (Decimal("1") - drawdown_pct / Decimal("100"))).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)),
+            "note": f"自动止盈计划：浮盈{pnl_pct:.1f}%，卖{sell_qty}股先锁利润，剩余仓位继续移动止盈",
+            "disableBuy": True,
+            "_source": "auto_profit_sync",
+            "_created": datetime.now().isoformat(),
+        })
+        created += 1
+
+    tp.parent.mkdir(parents=True, exist_ok=True)
+    tp.write_text(
+        json.dumps({"triggers": kept}, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+    return created
+
+
+def sync_exit_plan_triggers(
+    snapshot: PortfolioSnapshot,
+    trigger_path: str | Path,
+    *,
+    max_single_position_pct: float = 35.0,
+) -> int:
+    """Sync exit plans for underwater positions into executable sell triggers."""
+    tp = Path(trigger_path)
+    if tp.exists():
+        raw = json.loads(tp.read_text(encoding="utf-8"))
+        existing_triggers = raw.get("triggers", [])
+    else:
+        existing_triggers = []
+
+    debate_codes = {
+        str(t.get("code", ""))
+        for t in existing_triggers
+        if t.get("_source") == "debate_sync" and str(t.get("action", "")) == "sell"
+    }
+
+    kept = [
+        t for t in existing_triggers
+        if t.get("_source") != "exit_plan_sync"
+    ]
+
+    created = 0
+    for h in snapshot.holdings:
+        if h.quantity <= 0 or h.cost_price <= 0 or h.current_price <= 0:
+            continue
+        if h.code in debate_codes:
+            continue
+        pnl_pct = (h.current_price - h.cost_price) / h.cost_price * 100
+        if pnl_pct >= 0:
+            continue
+
+        plan_action, plan_qty, plan_target_price, plan_fallback_price, plan_reason = _build_exit_plan(h)
+        if plan_qty <= 0 or plan_action == "持有观察":
+            continue
+
+        price_min = max(h.current_price, plan_target_price - Decimal("0.10")).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+        price_max = (plan_target_price + Decimal("0.10")).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+        fallback = plan_fallback_price.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+        qty = min(plan_qty, h.quantity)
+        kept.append({
+            "code": h.code,
+            "name": f"{h.name}-卖点计划",
+            "action": "sell",
+            "quantity": qty,
+            "priceMin": str(price_min),
+            "priceMax": str(price_max),
+            "fallbackPrice": str(fallback),
+            "note": f"自动卖点计划：{plan_reason}",
+            "disableBuy": True,
+            "_source": "exit_plan_sync",
+            "_created": datetime.now().isoformat(),
+        })
+        created += 1
+
+    tp.parent.mkdir(parents=True, exist_ok=True)
+    tp.write_text(
+        json.dumps({"triggers": kept}, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+    return created

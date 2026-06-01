@@ -151,7 +151,7 @@ def _call_agent(
     role_name: str,
     role_config: dict,
     stock_context: str,
-    timeout: int = 25,
+    timeout: int = 15,
     focus_hint: str = "",
 ) -> AgentOpinion | None:
     """Call a single agent with role-specific prompt and focus area."""
@@ -267,17 +267,19 @@ def _pre_arbiter_rules(
                 agent_opinions=opinions,
             )
 
-    # Rule 2: ≥3 agents agree → skip arbiter (majority with 5-agent panel)
-    if len(opinions) >= 3:
+    # Rule 2: ≥2 agents agree → skip arbiter (down from 3 to handle API failures)
+    #          When 大胆猎手 times out (WSL SSL), 2-of-4 still produces a valid consensus.
+    #          Single agent alone can't trigger this — minimum 2 agreeing.
+    if len(opinions) >= 2:
         actions = [o.action for o in opinions]
         action_counts = {}
         for a in actions:
             action_counts[a] = action_counts.get(a, 0) + 1
         top_action = max(action_counts, key=action_counts.get)
         top_count = action_counts[top_action]
-        
-        if top_count >= 3:
-            # 3+ agree → strong consensus
+        # With 5 agents: ≥3 is strong, 2 is enough when total < 5 due to failures
+        min_needed = 2 if len(opinions) < 5 else 3
+        if top_count >= min_needed:
             agreeing = [o for o in opinions if o.action == top_action]
             avg_conf = sum(o.confidence for o in agreeing) / len(agreeing)
             if top_action == "buy":
@@ -313,7 +315,7 @@ def debate(
     market_context: str = "",
     technical_data: str = "",
     *,
-    timeout_per_agent: int = 20,
+    timeout_per_agent: int = 15,
 ) -> MultiAgentDecision | None:
     """Run multi-agent debate and return final decision.
 
@@ -424,7 +426,7 @@ def debate(
         if resp.status_code != 200:
             logger.warning("Arbiter API error: %s", resp.status_code)
             # Fallback: majority vote
-            return _majority_vote(opinions, name, symbol)
+            return _majority_vote(opinions, name, symbol, current_price)
 
         content = resp.json()["choices"][0]["message"]["content"].strip()
         decision = _parse_arbiter_response(content, opinions, name, symbol)
@@ -451,7 +453,7 @@ def debate(
 
     except Exception as exc:
         logger.warning("Arbiter failed: %s, falling back to majority vote", exc)
-        return _majority_vote(opinions, name, symbol)
+        return _majority_vote(opinions, name, symbol, current_price)
 
 
 def _parse_arbiter_response(text: str, opinions: list[AgentOpinion], name: str, symbol: str) -> MultiAgentDecision:
@@ -501,7 +503,7 @@ def _parse_arbiter_response(text: str, opinions: list[AgentOpinion], name: str, 
     )
 
 
-def _majority_vote(opinions: list[AgentOpinion], name: str, symbol: str) -> MultiAgentDecision:
+def _majority_vote(opinions: list[AgentOpinion], name: str, symbol: str, current_price: Decimal | None = None) -> MultiAgentDecision:
     """Fallback: simple majority vote when arbiter fails."""
     buy_votes = sum(1 for o in opinions if o.action == "buy")
     sell_votes = sum(1 for o in opinions if o.action == "sell")
@@ -519,7 +521,7 @@ def _majority_vote(opinions: list[AgentOpinion], name: str, symbol: str) -> Mult
     quantities = [o.quantity for o in opinions if o.quantity > 0]
     qty = min(quantities) if quantities else 0  # Use conservative quantity
 
-    return MultiAgentDecision(
+    decision = MultiAgentDecision(
         action=action,
         quantity=qty,
         price_range="",
@@ -529,3 +531,21 @@ def _majority_vote(opinions: list[AgentOpinion], name: str, symbol: str) -> Mult
         risk_warnings=[],
         agent_opinions=opinions,
     )
+
+    # Log for feedback learning
+    if current_price is not None:
+        try:
+            log_debate_result(
+                symbol=symbol,
+                name=name,
+                price=current_price,
+                action=decision.action,
+                confidence=float(decision.confidence),
+                vote_summary=decision.vote_summary,
+                reasoning=decision.reasoning,
+                agent_votes={o.role: o.action for o in opinions},
+            )
+        except Exception:
+            pass
+
+    return decision

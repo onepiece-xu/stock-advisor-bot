@@ -142,3 +142,70 @@ class TradingHabitProfile:
     buy_style: str
     sell_style: str
     summary: str
+
+
+@dataclass(slots=True)
+class EntryPlan:
+    entry_type: str
+    trigger_price: Decimal
+    buy_zone_low: Decimal
+    buy_zone_high: Decimal
+    cancel_below: Decimal
+    chase_above: Decimal
+    note: str
+
+
+@dataclass(slots=True)
+class ExitPlanV2:
+    stop_loss: Decimal
+    first_take_profit: Decimal
+    final_take_profit: Decimal
+    trailing_take_profit_pct: Decimal
+    note: str
+
+
+@dataclass(slots=True)
+class TradeIdea:
+    code: str
+    name: str
+    sector: str
+    score: Decimal
+    current_price: Decimal
+    position_label: str
+    suggested_quantity: int
+    entry_plan: EntryPlan
+    exit_plan: ExitPlanV2
+    thesis: List[str] = field(default_factory=list)
+
+
+def build_position_exit_plan(holding) -> ExitPlanV2:
+    price = getattr(holding, "current_price", Decimal("0")) or Decimal("0")
+    cost = getattr(holding, "cost_price", Decimal("0")) or Decimal("0")
+    pnl_pct = Decimal("0")
+    if cost > 0 and price > 0:
+        pnl_pct = ((price - cost) / cost * Decimal("100")).quantize(Decimal("0.01"))
+
+    stop_loss = (price * Decimal("0.93")).quantize(Decimal("0.01")) if price > 0 else Decimal("0")
+    if pnl_pct >= Decimal("8"):
+        first_take_profit = (price * Decimal("1.03")).quantize(Decimal("0.01"))
+        final_take_profit = (price * Decimal("1.09")).quantize(Decimal("0.01"))
+        trailing_pct = Decimal("4.50")
+        note = "已有明显浮盈，先主动锁一部分利润，强势段交给更宽的移动止盈去吃趋势。"
+    elif pnl_pct >= Decimal("0"):
+        first_take_profit = (price * Decimal("1.05")).quantize(Decimal("0.01"))
+        final_take_profit = (price * Decimal("1.10")).quantize(Decimal("0.01"))
+        trailing_pct = Decimal("4.00")
+        note = "先看冲高主动落袋一部分，剩余仓位不设死目标，优先让趋势继续跑。"
+    else:
+        first_take_profit = (price * Decimal("1.02")).quantize(Decimal("0.01"))
+        final_take_profit = (price * Decimal("1.05")).quantize(Decimal("0.01"))
+        trailing_pct = Decimal("3.50")
+        note = "弱势仓不等回本，先按反弹卖点主动降仓，剩余仓位守纪律。"
+
+    return ExitPlanV2(
+        stop_loss=stop_loss,
+        first_take_profit=first_take_profit,
+        final_take_profit=final_take_profit,
+        trailing_take_profit_pct=trailing_pct,
+        note=note,
+    )

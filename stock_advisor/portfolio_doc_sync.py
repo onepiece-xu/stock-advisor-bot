@@ -95,6 +95,17 @@ def sync_snapshot_from_doc(
     text = markdown_path.read_text(encoding="utf-8")
     snapshot = parse_latest_snapshot(text)
 
+    # ── Phase 5: validate merged snapshot before writing ──
+    try:
+        from .account_reconciliation import validate_merged_snapshot
+        import logging
+        logger = logging.getLogger(__name__)
+        warnings = validate_merged_snapshot(snapshot)
+        for w in warnings:
+            logger.warning("Snapshot validation: %s", w)
+    except Exception:
+        pass  # validation is advisory, never block sync
+
     if snapshot_path.exists():
         current = _load_snapshot_json(snapshot_path)
         if _should_skip_sync(
@@ -124,7 +135,10 @@ def _load_snapshot_json(path: Path) -> dict:
 
 
 def _trade_date(snapshot: dict) -> date:
-    return date.fromisoformat(str(snapshot["tradeDate"]))
+    td = snapshot.get("tradeDate") or snapshot.get("updated", "").split("T")[0]
+    if td:
+        return date.fromisoformat(str(td))
+    return date.today()
 
 
 def _should_skip_sync(

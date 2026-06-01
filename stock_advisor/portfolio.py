@@ -6,7 +6,7 @@ from datetime import date
 from decimal import Decimal, ROUND_HALF_UP
 from pathlib import Path
 
-from .models import ActionCandidate, PortfolioHolding, PortfolioSnapshot
+from .models import ActionCandidate, PortfolioHolding, PortfolioSnapshot, build_position_exit_plan
 
 
 @dataclass(slots=True)
@@ -19,8 +19,11 @@ class AdviceItem:
 
 def load_snapshot(path: str | Path) -> PortfolioSnapshot:
     raw = json.loads(Path(path).read_text(encoding="utf-8"))
+    # tradeDate is optional — fall back to updated field or today
+    trade_date_str = raw.get("tradeDate") or raw.get("updated", "").split("T")[0]
+    trade_date = date.fromisoformat(trade_date_str) if trade_date_str else date.today()
     return PortfolioSnapshot(
-        trade_date=date.fromisoformat(raw["tradeDate"]),
+        trade_date=trade_date,
         total_assets=Decimal(str(raw.get("totalAssets", 0))),
         cash=Decimal(str(raw.get("cash", 0))),
         holdings=[
@@ -37,6 +40,7 @@ def load_snapshot(path: str | Path) -> PortfolioSnapshot:
 
 
 def save_snapshot(snapshot: PortfolioSnapshot, data_dir: Path) -> Path:
+    import hashlib
     data_dir.mkdir(parents=True, exist_ok=True)
     path = data_dir / f"{snapshot.trade_date.isoformat()}.json"
     payload = {
@@ -54,7 +58,13 @@ def save_snapshot(snapshot: PortfolioSnapshot, data_dir: Path) -> Path:
             for h in snapshot.holdings
         ],
     }
-    path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    raw = json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True)
+    checksum = hashlib.sha256(raw.encode()).hexdigest()[:12]
+    payload["_checksum"] = checksum  # Store in payload for load verification
+    path.write_text(
+        json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True),
+        encoding="utf-8",
+    )
     return path
 
 
@@ -178,26 +188,28 @@ def _build_diff_lines(current: PortfolioSnapshot, previous: PortfolioSnapshot) -
 def _advice_for_holding(holding: PortfolioHolding, snapshot: PortfolioSnapshot) -> AdviceItem:
     pnl_pct = _pnl_percent(holding)
     weight_pct = _holding_weight_percent(holding, snapshot)
+    exit_plan = build_position_exit_plan(holding)
     candidates: list[ActionCandidate] = []
 
     if weight_pct >= Decimal("40"):
-        candidates.append(ActionCandidate("reduce", "单票仓位过高，优先释放现金缓冲。", "单票仓位 >= 40%", "high"))
+        candidates.append(ActionCandidate("reduce", "单票仓位过高，优先兑现部分仓位，回收现金。", f"减仓优先区 { _format_money(exit_plan.first_take_profit) } 附近", "high"))
     if pnl_pct <= Decimal("-10"):
-        candidates.append(ActionCandidate("avoid", "亏损较深，不适合边跌边补，先看修复质量。", "浮亏 >= 10%", "high"))
-    elif pnl_pct <= Decimal("-5"):
-        candidates.append(ActionCandidate("hold", "已有一定浮亏，先观察修复持续性。", "浮亏在 5%-10%", "medium"))
+        candidates.append(ActionCandidate("reduce", "弱势仓先按计划卖点减仓。", f"反弹看 { _format_money(exit_plan.first_take_profit) }，止损 { _format_money(exit_plan.stop_loss) }", "high"))
+    elif pnl_pct < Decimal("0"):
+        candidates.append(ActionCandidate("hold", "先等计划卖点，不追求回本，守住止损。", f"反弹看 { _format_money(exit_plan.first_take_profit) }，止损 { _format_money(exit_plan.stop_loss) }", "medium"))
     else:
-        candidates.append(ActionCandidate("hold", "距离成本线相对更近，保留观察灵活性。", "浮亏小于 5%", "low"))
+        candidates.append(ActionCandidate("hold", "已有利润，优先按移动止盈计划处理。", f"先看 { _format_money(exit_plan.first_take_profit) }，移动止盈 {exit_plan.trailing_take_profit_pct}%", "low"))
 
     if holding.current_price >= holding.cost_price and holding.cost_price > 0:
-        candidates.append(ActionCandidate("reduce", "价格接近或站上成本区，可考虑优化仓位。", "现价 >= 成本价", "medium"))
-
-    if not candidates:
-        candidates.append(ActionCandidate("hold", "暂无明确动作条件，继续观察。", "无显著规则触发", "low"))
+        candidates.append(ActionCandidate("reduce", "价格回到成本上方后，先兑现一部分，剩余仓位用移动止盈。", f"强势目标 { _format_money(exit_plan.final_take_profit) }", "medium"))
 
     top_action = candidates[0].action
     title = f"- {holding.name}({holding.code})：执行优先级 {top_action}"
-    detail = f"  浮盈亏 {_format_percent(pnl_pct)}，仓位占比 {_format_percent(weight_pct)}，建议先按最高优先动作执行"
+    detail = (
+        f"  浮盈亏 {_format_percent(pnl_pct)}，仓位占比 {_format_percent(weight_pct)}，"
+        f"止损 {_format_money(exit_plan.stop_loss)}，第一卖点 {_format_money(exit_plan.first_take_profit)}，"
+        f"移动止盈 {exit_plan.trailing_take_profit_pct}%"
+    )
     priority = _priority_for_candidates(candidates)
     return AdviceItem(priority=priority, title=title, detail=detail, candidates=candidates)
 

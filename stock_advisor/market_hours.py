@@ -97,10 +97,19 @@ def next_session_str(now: datetime | None = None) -> str:
     else:
         now = now.astimezone(MARKET_TZ)
 
-    # Find next auction
+    today = now.date()
     today_auction = now.replace(hour=9, minute=25, second=0, microsecond=0)
+
+    # Before morning auction on trading day → today 9:25
     if now < today_auction and now.weekday() < 5:
         return f"今天 {today_auction.strftime('%H:%M')}"
+
+    # Trading day, before afternoon session → today 13:00
+    # Covers: morning session (9:30-11:30) and lunch break (11:30-13:00)
+    if now.weekday() < 5 and now.time() < time(13, 0):
+        return "今天 13:00"
+
+    # Otherwise → next trading day auction
     next_day = now + timedelta(days=1)
     next_auction = next_day.replace(hour=9, minute=25, second=0, microsecond=0)
     while next_auction.weekday() >= 5:

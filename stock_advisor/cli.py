@@ -13,9 +13,11 @@ from .backtest import (
     optimize_decision_thresholds,
     render_minute_backtest,
     render_optimization_report,
+    render_signal_grid_search_report,
     run_daily_backtest,
     run_enhanced_daily_backtest,
     run_minute_backtest,
+    run_signal_grid_search_backtest,
 )
 from .cash_deploy import generate_deploy_signal, render_deploy_signal
 from .data_review import generate_data_review
@@ -24,6 +26,8 @@ from .briefing import format_mobile_digest, format_mobile_replay, format_mobile_
 from .outbox import pull_outbox
 from .feishu_bot_server import serve_feishu_bot
 from .market_overview import build_market_overview, render_market_overview
+from .state_builder import build_trading_state
+from .dashboard import run_dashboard
 from .historical import (
     analyze_historical_point,
     compare_historical_points,
@@ -166,6 +170,9 @@ def main() -> None:
     status_parser = subparsers.add_parser("status", help="输出当前系统状态：交易日历、持仓摘要、触发单")
     status_parser.add_argument("--config", required=True, help="配置文件路径")
 
+    dashboard_parser = subparsers.add_parser("dashboard", help="一键交易仪表盘：持仓+行情+技术指标+触发单+强弱排序+摘要")
+    dashboard_parser.add_argument("--config", required=True, help="配置文件路径")
+
     # ── 现金部署信号 ──
     deploy_parser = subparsers.add_parser("cash-deploy", help="检查现金部署条件，输出可入场标的和买入建议")
     deploy_parser.add_argument("--config", required=True, help="配置文件路径")
@@ -185,6 +192,13 @@ def main() -> None:
     enhanced_bt_parser.add_argument("--stock", required=True, help="股票代码，如 601698")
     enhanced_bt_parser.add_argument("--days", type=int, default=60, help="回测天数（默认60）")
     enhanced_bt_parser.add_argument("--notify", action="store_true", help="把回测结果发送到飞书")
+
+    # ── 信号网格搜索回测 ──
+    grid_bt_parser = subparsers.add_parser("backtest", help="网格搜索 buy/hold/reduce 阈值，基于信号日志模拟交易 PnL")
+    grid_bt_parser.add_argument("--config", required=True, help="配置文件路径")
+    grid_bt_parser.add_argument("--signal-log", help="信号日志路径（默认 data/signals/signal_log.jsonl）")
+    grid_bt_parser.add_argument("--mobile", action="store_true", help="输出手机友好摘要")
+    grid_bt_parser.add_argument("--notify", action="store_true", help="把回测结果发送到飞书")
 
     # ── 交易日志 ──
     journal_stats_parser = subparsers.add_parser("journal-stats", help="查看交易日志统计")
@@ -221,6 +235,37 @@ def main() -> None:
     multi_agent_parser = subparsers.add_parser("multi-agent-debate", help="多Agent（猎手/风控/判官）仲裁辩论")
     multi_agent_parser.add_argument("--config", required=True, help="配置文件路径")
     multi_agent_parser.add_argument("--period", default="morning", choices=["morning", "close"], help="盘前/收盘")
+
+    # ── 机会扫描 ──
+    opp_scan_parser = subparsers.add_parser("opportunity-scan", help="全市场机会扫描，主动找可买标的")
+    opp_scan_parser.add_argument("--config", default="config.yaml", help="配置文件路径")
+    opp_scan_parser.add_argument("--top", type=int, default=10, help="返回 Top N")
+    opp_scan_parser.add_argument("--max-chg", type=float, default=5.0, help="最大涨幅过滤(%)")
+    opp_scan_parser.add_argument("--exclude", nargs="*", default=None, help="排除代码")
+
+    # ── 技术面全貌 ──
+    tech_snap_parser = subparsers.add_parser("tech-snapshot", help="持仓票技术面全貌：MA/RSI/量能/振幅/板块排名")
+    tech_snap_parser.add_argument("--config", default="config.yaml", help="配置文件路径")
+
+    # ── 同框对比 ──
+    compare_parser = subparsers.add_parser("compare", help="三只持仓同框对比：强弱一目了然")
+    compare_parser.add_argument("--config", default="config.yaml", help="配置文件路径")
+
+    # ── 截图对账 ──
+    reconcile_parser = subparsers.add_parser("reconcile", help="券商截图 vs 快照自动对账差异")
+    reconcile_parser.add_argument("--config", default="config.yaml", help="配置文件路径")
+    reconcile_parser.add_argument("--screenshot", help="券商持仓截图文件路径")
+    reconcile_parser.add_argument("--holdings", help="从截图OCR提取的持仓JSON (由vision生成)")
+
+    # ── 资金流向 ──
+    fund_flow_parser = subparsers.add_parser("fund-flow", help="资金面：北向资金+持仓财务指标")
+    fund_flow_parser.add_argument("--config", default="config.yaml", help="配置文件路径")
+    fund_flow_parser.add_argument("--refresh", action="store_true", help="强制刷新缓存")
+    fund_flow_parser.add_argument("--realtime", action="store_true", help="盘中实时分钟级资金流")
+
+    # ── 市场宽度 ──
+    breadth_parser = subparsers.add_parser("market-breadth", help="市场温度：板块强弱+持仓板块+涨跌比")
+    breadth_parser.add_argument("--config", default="config.yaml", help="配置文件路径")
 
     args = parser.parse_args()
 
@@ -262,12 +307,16 @@ def main() -> None:
         run_habit_profile(args.config, args.mobile)
     elif args.command == "status":
         run_status(args.config)
+    elif args.command == "dashboard":
+        run_dashboard(args.config)
     elif args.command == "cash-deploy":
         run_cash_deploy(args.config, args.mobile, args.notify)
     elif args.command == "backtest-daily":
         run_backtest_daily(args.config, args.stock, args.days, args.mobile, args.notify)
     elif args.command == "backtest-enhanced":
         run_enhanced_backtest(args.config, args.stock, args.days, args.notify)
+    elif args.command == "backtest":
+        run_grid_search_backtest(args.config, args.mobile, args.notify, args.signal_log)
     elif args.command == "journal-stats":
         run_journal_stats(args.config, args.notify)
     elif args.command == "journal-verify":
@@ -282,6 +331,121 @@ def main() -> None:
         run_import_snapshot(args.snapshot, args.text, args.date, args.dry_run)
     elif args.command == "prune-data":
         run_prune_data(args.config, args.retention_days)
+    elif args.command == "opportunity-scan":
+        run_opportunity_scan(args.config, args.top, args.max_chg, args.exclude)
+    elif args.command == "tech-snapshot":
+        run_tech_snapshot(args.config)
+    elif args.command == "compare":
+        run_compare(args.config)
+    elif args.command == "reconcile":
+        run_reconcile(args.config, args.screenshot, args.holdings)
+    elif args.command == "fund-flow":
+        run_fund_flow(args.config, args.refresh, args.realtime)
+    elif args.command == "market-breadth":
+        run_market_breadth(args.config)
+
+
+def run_tech_snapshot(config_path: str) -> None:
+    """Print full technical indicator snapshot for all holdings."""
+    from .portfolio import load_snapshot
+    from .tech_snapshot import compute_tech_snapshots, render_tech_snapshot_table
+
+    config = require_valid_config(config_path)
+    snap = load_snapshot(config.snapshot_path)
+    codes = [h.code for h in snap.holdings if h.quantity > 0]
+    names = {h.code: h.name for h in snap.holdings}
+
+    print(render_tech_snapshot_table(compute_tech_snapshots(codes, names)))
+
+
+def run_compare(config_path: str) -> None:
+    """Print side-by-side comparison of all holdings."""
+    from .portfolio import load_snapshot
+    from .tech_snapshot import compute_tech_snapshots, render_compare_table
+
+    config = require_valid_config(config_path)
+    snap = load_snapshot(config.snapshot_path)
+    codes = [h.code for h in snap.holdings if h.quantity > 0]
+    names = {h.code: h.name for h in snap.holdings}
+    holding_info = {
+        h.code: {"quantity": h.quantity, "cost_price": h.cost_price}
+        for h in snap.holdings if h.quantity > 0
+    }
+
+    print(render_compare_table(compute_tech_snapshots(codes, names), holding_info))
+
+
+def run_reconcile(config_path: str, screenshot_path: str | None, holdings_json: str | None = None) -> None:
+    """Compare portfolio-snapshot.json with broker screenshot holdings.
+
+    If holdings_json is provided (from vision OCR), run full automated reconciliation.
+    If only screenshot_path is provided, print snapshot and prompt for vision analysis.
+    """
+    import json as _json
+    from .portfolio import load_snapshot
+    from .tech_snapshot import render_reconciliation
+
+    config = require_valid_config(config_path)
+    snap = load_snapshot(config.snapshot_path)
+
+    # Build snapshot holdings list for comparison
+    snap_holdings = [
+        {"code": h.code, "name": h.name, "quantity": h.quantity, "cost_price": h.cost_price}
+        for h in snap.holdings if h.quantity > 0
+    ]
+
+    # If we have parsed holdings from screenshot, run full reconciliation
+    if holdings_json:
+        try:
+            screenshot_holdings = _json.loads(holdings_json)
+            if not isinstance(screenshot_holdings, list):
+                print("❌ --holdings 必须是 JSON 数组")
+                return
+            # Normalize: convert quantity to int, cost_price to Decimal
+            for h in screenshot_holdings:
+                h["quantity"] = int(h.get("quantity", 0))
+                try:
+                    from decimal import Decimal as D
+                    h["cost_price"] = D(str(h.get("cost_price", 0)))
+                except Exception:
+                    h["cost_price"] = D("0")
+        except _json.JSONDecodeError as e:
+            print(f"❌ --holdings JSON 解析失败: {e}")
+            return
+
+        print(render_reconciliation(
+            snapshot_holdings=snap_holdings,
+            screenshot_holdings=screenshot_holdings,
+            snap_date=str(snap.trade_date) if snap.trade_date else "",
+            snap_assets=snap.total_assets,
+            snap_cash=snap.cash,
+        ))
+        return
+
+    # Otherwise: show snapshot and prompt for screenshot
+    print("## 🔍 快照 vs 截图对账")
+    print()
+    print(f"交易日期: {snap.trade_date}")
+    print(f"总资产: {snap.total_assets:.2f}")
+    print(f"现金: {snap.cash:.2f}")
+    print()
+    print("### 📋 当前快照持仓")
+    print()
+    print("| 代码 | 名称 | 股数 | 成本 |")
+    print("|------|------|------|------|")
+    for h in snap_holdings:
+        print(f"| {h['code']} | {h['name']} | {h['quantity']} | {h['cost_price']:.2f} |")
+    print()
+
+    if screenshot_path:
+        from pathlib import Path
+        if Path(screenshot_path).exists():
+            print(f"📎 截图: MEDIA:{screenshot_path}")
+            print()
+            print("🖼️ 正在用 Vision 提取截图中的持仓数据...")
+            print("（请在对话中发送此截图以自动对账）")
+        else:
+            print(f"❌ 截图文件不存在: {screenshot_path}")
 
 
 def run_monitor_once(config_path: str, force_notify: bool, mobile: bool) -> None:
@@ -709,6 +873,7 @@ def run_import_snapshot(snapshot_path: str, text: str | None, trade_date_str: st
 
 
 def _resolve_stock_ref(config, query: str) -> StockRef:
+    normalized = query.strip()
     for stock in config.monitor.stocks:
         if stock.code == query or stock.symbol == normalized:
             return stock
@@ -794,6 +959,30 @@ def _record_fill_and_render_habit_profile(
         conn.close()
 
 
+def run_fund_flow(config_path: str, force_refresh: bool = False, realtime: bool = False) -> None:
+    """Print fund flow summary: northbound + holdings financials."""
+    from .fund_flow import get_northbound_flow, get_stock_financials, format_fund_flow_md
+    from .portfolio import load_snapshot
+
+    config = require_valid_config(config_path)
+    snap = load_snapshot(config.snapshot_path)
+    codes = [h.code for h in snap.holdings] if snap.holdings else []
+
+    print(format_fund_flow_md(codes if codes else None, realtime=realtime))
+
+
+def run_market_breadth(config_path: str) -> None:
+    """Print market breadth: sector rankings + holding sector context."""
+    from .market_breadth import format_breadth_md
+    from .portfolio import load_snapshot
+
+    config = require_valid_config(config_path)
+    snap = load_snapshot(config.snapshot_path)
+    codes = [h.code for h in snap.holdings] if snap.holdings else []
+
+    print(format_breadth_md(codes if codes else None))
+
+
 def run_status(config_path: str) -> None:
     """Print current system status: trading calendar, holdings, triggers."""
     config = require_valid_config(config_path)
@@ -810,38 +999,31 @@ def run_status(config_path: str) -> None:
     print(f"下次开盘：{next_sess}")
     print()
 
-    # Holdings summary
     snapshot_path = config.snapshot_path
+    briefing_path = Path("data/briefing/latest.json")
     if snapshot_path.exists():
-        snapshot = load_snapshot(snapshot_path)
-        print(f"总资产：{snapshot.total_assets:.0f}  现金：{snapshot.cash:.0f}（{(snapshot.cash/snapshot.total_assets*100):.0f}%）")
+        state = build_trading_state(snapshot_path, config.trading_plan.path, briefing_path)
+        if state.total_assets > 0:
+            cash_pct = (state.cash / state.total_assets * 100)
+            print(f"总资产：{state.total_assets:.0f}  现金：{state.cash:.0f}（{cash_pct:.0f}%）")
+        else:
+            print(f"总资产：{state.total_assets:.0f}  现金：{state.cash:.0f}")
         print()
         print("持仓：")
-        for h in snapshot.holdings:
-            if h.quantity <= 0:
-                continue
-            pnl = ((h.current_price - h.cost_price) / h.cost_price * 100) if h.cost_price > 0 else 0
-            mkt_val = h.current_price * h.quantity
-            print(f"  {h.name}({h.code})：{h.quantity}股 | 成本 {h.cost_price} | 现价 {h.current_price} | 盈亏 {pnl:+.1f}% | 市值 {mkt_val:.0f}")
+        for h in state.holdings:
+            print(f"  {h.name}({h.code})：{h.quantity}股 | 成本 {h.cost_price} | 现价 {h.current_price} | 盈亏 {h.pnl_pct:+.1f}% | 市值 {h.market_value:.0f}")
 
-        # Active triggers
-        triggers = load_triggers(config.trading_plan.path)
-        if triggers:
-            active_codes = {h.code for h in snapshot.holdings if h.quantity > 0}
-            active = [t for t in triggers.values() if t.code in active_codes]
-            orphan = [t for t in triggers.values() if t.code not in active_codes]
-            if active:
-                print(f"\n活跃触发单：")
-                for t in active:
-                    print(f"  {t.code} {t.name}：{t.action} {t.quantity}股 @ {t.price_min}-{t.price_max}（回落 {t.fallback_price}）")
-            if orphan:
-                print(f"\n⚠️ 已清仓触发单：")
-                for t in orphan:
-                    print(f"  {t.code} {t.name}：已清仓但触发单仍存在，建议清理")
+        if state.active_instructions:
+            print(f"\n活跃触发单：")
+            for t in state.active_instructions:
+                print(f"  {t.code} {t.name}：{t.action} {t.quantity}股 @ {t.trigger_low}-{t.trigger_high}（回落 {t.fallback_price}）")
+        if state.orphan_instructions:
+            print(f"\n⚠️ 已清仓触发单：")
+            for t in state.orphan_instructions:
+                print(f"  {t.code} {t.name}：已清仓但触发单仍存在，建议清理")
     else:
         print("⚠️ 持仓快照不存在")
 
-    # Daemon status
     import subprocess
     try:
         result = subprocess.run(["pgrep", "-f", "monitor-daemon"], capture_output=True, text=True)
@@ -852,17 +1034,29 @@ def run_status(config_path: str) -> None:
     except Exception:
         print(f"\n⚠️ 无法检测 daemon 状态")
 
-    # Latest pre-market briefing
-    import json
-    briefing_path = Path("data/briefing/latest.json")
     if briefing_path.exists():
+        import json
         b = json.loads(briefing_path.read_text())
         print(f"\n最近盘前简报：{b['date']}（{b['generated_at'][:16]}）")
-        # Print just the quick verdict lines
-        summary = b.get("summary", "")
-        verdict_start = summary.find("【今日速判】")
-        if verdict_start > 0:
-            print(summary[verdict_start:].split("\n下次开盘")[0])
+        summary = (b.get("summary") or "").strip()
+        if summary:
+            print(summary)
+
+    # ── 资金面 + 市场温度 ──
+    try:
+        from .fund_flow import format_fund_flow_md
+        from .market_breadth import format_breadth_md
+        from .portfolio import load_snapshot as _load_snap
+        snap = _load_snap(config.snapshot_path)
+        codes = [h.code for h in snap.holdings]
+        fund_md = format_fund_flow_md(codes)
+        if fund_md.strip():
+            print(f"\n{fund_md}")
+        breadth_md = format_breadth_md(codes)
+        if breadth_md.strip():
+            print(f"\n{breadth_md}")
+    except Exception:
+        pass
 
 
 def run_prune_data(config_path: str, retention_days: int) -> None:
@@ -951,6 +1145,43 @@ def run_enhanced_backtest(config_path: str, stock_code: str, days: int, notify: 
     print(rendered)
     if notify:
         notify_feishu_if_enabled(config, f"【增强回测】{stock_code}\n{rendered}")
+
+
+def run_grid_search_backtest(
+    config_path: str, mobile: bool = False, notify: bool = False, signal_log: str | None = None
+) -> None:
+    """网格搜索 buy/hold/reduce 阈值，基于信号日志模拟交易并输出最优组合。"""
+    config = require_valid_config(config_path)
+    project_root = Path(config_path).resolve().parent
+    signal_log_path = signal_log or str(project_root / "data" / "signals" / "signal_log.jsonl")
+
+    if not Path(signal_log_path).exists():
+        print(f"❌ 信号日志不存在: {signal_log_path}")
+        return
+
+    # Read current thresholds from config
+    dt = config.monitor.decision_thresholds
+    current_buy = int(dt.buy_score)
+    current_hold = int(dt.hold_score)
+    current_reduce = int(dt.reduce_score)
+
+    report = run_signal_grid_search_backtest(
+        signal_log_path,
+        current_buy=current_buy,
+        current_hold=current_hold,
+        current_reduce=current_reduce,
+    )
+    rendered = render_signal_grid_search_report(report, mobile=mobile)
+    print(rendered)
+
+    if notify and config.monitor.notification.feishu.enabled:
+        deliver_feishu_message(
+            config.monitor.notification.feishu,
+            "📊 信号阈值网格搜索回测",
+            rendered,
+            app_id=config.feishu_bot.app_id,
+            app_secret=config.feishu_bot.app_secret,
+        )
 
 
 def run_journal_stats(config_path: str, notify: bool) -> None:
@@ -1124,6 +1355,22 @@ def run_multi_agent_debate(config_path: str, period: str) -> None:
     from .multi_agent_briefing import run_multi_agent_briefing
     report = run_multi_agent_briefing(config, period=period)
     print(report)
+
+
+def run_opportunity_scan(
+    config_path: str, top_n: int, max_chg: float, exclude_codes: list[str] | None
+) -> None:
+    """Run full-market opportunity scan."""
+    from .opportunity_scanner import build_trade_ideas, render_trade_ideas, scan
+    exclude = set(exclude_codes) if exclude_codes else set()
+    config = require_valid_config(config_path)
+    results = scan(
+        config_path=config_path,
+        top_n=top_n,
+        max_change_pct=max_chg,
+        exclude_codes=exclude,
+    )
+    print(render_trade_ideas(build_trade_ideas(results, config)))
 
 
 if __name__ == "__main__":

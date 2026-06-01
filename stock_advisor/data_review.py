@@ -496,7 +496,22 @@ def generate_data_review(
         elif pnl_pct < -5:
             alerts.append(f"🟡 {name}：浮亏{pnl_pct:.1f}%，止损{today_close*0.93:.2f}")
         elif pnl_pct > 5:
-            alerts.append(f"🟢 {name}：浮盈{pnl_pct:.1f}%，止盈{cost*1.1:.2f}")
+            # 移动止盈：用今日高点做峰值，计算回撤触发价（替代固定 cost*1.1 一刀切）
+            if today_high > cost:
+                peak_profit_pct = (today_high - cost) / cost * 100
+                if peak_profit_pct >= 20:
+                    dd = 0.10
+                elif peak_profit_pct >= 10:
+                    dd = 0.08
+                else:
+                    dd = 0.05
+                tp_trigger = today_high * (1 - dd)
+                if today_close <= tp_trigger:
+                    alerts.append(f"🎯 {name}：移动止盈触发！峰值{today_high:.2f}回撤{dd*100:.0f}%，现价{today_close:.2f}")
+                else:
+                    alerts.append(f"🟢 {name}：浮盈{pnl_pct:.1f}%，移动止盈{tp_trigger:.2f}（峰值回撤{dd*100:.0f}%）")
+            else:
+                alerts.append(f"🟢 {name}：浮盈{pnl_pct:.1f}%，关注移动止盈")
 
     # ── 汇总 ──
     lines.append("### 📋 复盘结论")
@@ -522,14 +537,15 @@ def generate_data_review(
         cost = float(stock.get("cost", 0))
         if cost <= 0:
             continue
-        # Get current price
+        # Get current price and today's high
         row = conn.execute(
-            "SELECT current_price FROM quotes WHERE code=? AND DATE(quote_time)=? ORDER BY quote_time DESC LIMIT 1",
+            "SELECT current_price, high_price FROM quotes WHERE code=? AND DATE(quote_time)=? ORDER BY quote_time DESC LIMIT 1",
             (stock["code"], trade_date),
         ).fetchone()
         if not row:
             continue
         price = float(row["current_price"])
+        today_high2 = float(row["high_price"])
         pnl_pct = (price - cost) / cost * 100
 
         if pnl_pct < -20:
@@ -537,7 +553,22 @@ def generate_data_review(
         elif pnl_pct < -5:
             alerts.append(f"- 🟡 **{stock['name']}**：浮亏{pnl_pct:.1f}%，设止损{price*0.93:.2f}")
         elif pnl_pct > 5:
-            alerts.append(f"- 🟢 **{stock['name']}**：浮盈{pnl_pct:.1f}%，关注止盈位{cost*1.1:.2f}")
+            # 移动止盈替代固定止盈价
+            if today_high2 > cost:
+                peak_p = (today_high2 - cost) / cost * 100
+                if peak_p >= 20:
+                    dd2 = 0.10
+                elif peak_p >= 10:
+                    dd2 = 0.08
+                else:
+                    dd2 = 0.05
+                tp2 = today_high2 * (1 - dd2)
+                if price <= tp2:
+                    alerts.append(f"- 🎯 **{stock['name']}**：移动止盈触发！峰值{today_high2:.2f}回撤{dd2*100:.0f}%")
+                else:
+                    alerts.append(f"- 🟢 **{stock['name']}**：浮盈{pnl_pct:.1f}%，移动止盈{tp2:.2f}（峰值回撤{dd2*100:.0f}%）")
+            else:
+                alerts.append(f"- 🟢 **{stock['name']}**：浮盈{pnl_pct:.1f}%，关注移动止盈")
 
     if alerts:
         lines.append("**明日操作要点：**")

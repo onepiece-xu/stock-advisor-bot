@@ -504,6 +504,312 @@ def _fmt_pct(value: float | None) -> str:
     return "N/A" if value is None else f"{value:.2f}%"
 
 
+# ═══════════════════════════════════════════════════════════════════
+# Signal-log grid search backtest
+# ═══════════════════════════════════════════════════════════════════
+
+@dataclass(slots=True)
+class GridSearchResult:
+    buy_score: int
+    hold_score: int
+    reduce_score: int
+    total_trades: int
+    winning_trades: int
+    losing_trades: int
+    total_pnl_pct: float
+    avg_pnl_pct: float
+    max_drawdown_pct: float
+    buy_signals: int
+    hold_signals: int
+    reduce_signals: int
+    avoid_signals: int
+    final_position: str  # "flat" or "long"
+    entry_price: float | None
+    exit_price: float | None
+
+
+def _load_signals(signal_log_path: str) -> list[dict]:
+    """Load signals from signal_log.jsonl, sorted by timestamp."""
+    import json
+    signals: list[dict] = []
+    with open(signal_log_path) as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            signals.append(json.loads(line))
+    signals.sort(key=lambda s: s["timestamp"])
+    return signals
+
+
+def _map_signal_action(score: float, buy_score: int, hold_score: int, reduce_score: int) -> str:
+    """Map a score to an action based on thresholds."""
+    if score >= buy_score:
+        return "buy"
+    if score >= hold_score:
+        return "hold"
+    if score >= reduce_score:
+        return "reduce"
+    return "avoid"
+
+
+def _simulate_trades(
+    signals: list[dict],
+    buy_score: int,
+    hold_score: int,
+    reduce_score: int,
+) -> GridSearchResult:
+    """Simulate trading through signals chronologically.
+
+    Trading rules:
+    - score >= buy_score  → BUY  (enter if flat at signal price)
+    - score < hold_score  → SELL (exit if long at signal price)
+    - otherwise           → HOLD (do nothing)
+
+    The reduce_score is tracked for signal classification but the core
+    buy/sell logic uses buy_score and hold_score as the two key thresholds.
+    """
+    in_position = False
+    entry_price: float | None = None
+    trades: list[float] = []  # list of pnl_pct per completed trade
+    unrealized_pnl = 0.0
+    peak_pnl = 0.0
+    max_drawdown = 0.0
+    action_counts = {"buy": 0, "hold": 0, "reduce": 0, "avoid": 0}
+
+    for sig in signals:
+        score = sig["score"]
+        price = sig["price"]
+        action = _map_signal_action(score, buy_score, hold_score, reduce_score)
+        action_counts[action] += 1
+
+        should_buy = score >= buy_score
+        should_sell = score < hold_score
+
+        if should_buy and not in_position:
+            # Enter position
+            in_position = True
+            entry_price = price
+            unrealized_pnl = 0.0
+            peak_pnl = 0.0
+
+        elif should_sell and in_position:
+            # Exit position
+            in_position = False
+            if entry_price is not None and entry_price > 0:
+                pnl_pct = (price - entry_price) / entry_price * 100
+                trades.append(pnl_pct)
+            entry_price = None
+            unrealized_pnl = 0.0
+            peak_pnl = 0.0
+
+        # Track running drawdown for open position
+        if in_position and entry_price is not None and entry_price > 0:
+            unrealized_pnl = (price - entry_price) / entry_price * 100
+            if unrealized_pnl > peak_pnl:
+                peak_pnl = unrealized_pnl
+            drawdown = peak_pnl - unrealized_pnl
+            if drawdown > max_drawdown:
+                max_drawdown = drawdown
+
+    total_pnl = sum(trades)
+    total_trades = len(trades)
+    winning = sum(1 for t in trades if t > 0)
+    losing = sum(1 for t in trades if t < 0)
+
+    return GridSearchResult(
+        buy_score=buy_score,
+        hold_score=hold_score,
+        reduce_score=reduce_score,
+        total_trades=total_trades,
+        winning_trades=winning,
+        losing_trades=losing,
+        total_pnl_pct=round(total_pnl, 2),
+        avg_pnl_pct=round(total_pnl / total_trades, 2) if total_trades > 0 else 0.0,
+        max_drawdown_pct=round(max_drawdown, 2),
+        buy_signals=action_counts["buy"],
+        hold_signals=action_counts["hold"],
+        reduce_signals=action_counts["reduce"],
+        avoid_signals=action_counts["avoid"],
+        final_position="long" if in_position else "flat",
+        entry_price=round(entry_price, 2) if entry_price is not None else None,
+        exit_price=None,
+    )
+
+
+def run_signal_grid_search_backtest(
+    signal_log_path: str,
+    *,
+    buy_score_range: tuple[int, int, int] = (68, 88, 2),   # start, stop, step
+    hold_score_range: tuple[int, int, int] = (60, 78, 2),
+    reduce_score_range: tuple[int, int, int] = (35, 61, 5),
+    current_buy: int = 76,
+    current_hold: int = 58,
+    current_reduce: int = 38,
+) -> dict:
+    """Grid-search buy/hold/reduce score thresholds over signal log.
+
+    For each threshold combination, simulates trading through all signals
+    chronologically and computes realized PnL. Compares against the current
+    thresholds.
+    """
+    signals = _load_signals(signal_log_path)
+    if not signals:
+        return {"error": "No signals found", "signal_count": 0}
+
+    results: list[GridSearchResult] = []
+    buy_start, buy_stop, buy_step = buy_score_range
+    hold_start, hold_stop, hold_step = hold_score_range
+    reduce_start, reduce_stop, reduce_step = reduce_score_range
+
+    total_combos = 0
+    for bs in range(buy_start, buy_stop, buy_step):
+        for hs in range(hold_start, hold_stop, hold_step):
+            if hs >= bs:
+                continue
+            for rs in range(reduce_start, reduce_stop, reduce_step):
+                if rs >= hs:
+                    continue
+                total_combos += 1
+                result = _simulate_trades(signals, bs, hs, rs)
+                results.append(result)
+
+    # Simulate current thresholds
+    current_result = _simulate_trades(signals, current_buy, current_hold, current_reduce)
+
+    # Rank by total PnL (descending), then by win rate, then by number of trades
+    ranked = sorted(
+        results,
+        key=lambda r: (
+            r.total_pnl_pct,
+            r.winning_trades / max(r.total_trades, 1) if r.total_trades > 0 else 0,
+            r.total_trades,
+        ),
+        reverse=True,
+    )
+
+    top_n = 10
+    top_results = []
+    for r in ranked[:top_n]:
+        top_results.append({
+            "buy_score": r.buy_score,
+            "hold_score": r.hold_score,
+            "reduce_score": r.reduce_score,
+            "total_trades": r.total_trades,
+            "winning_trades": r.winning_trades,
+            "losing_trades": r.losing_trades,
+            "total_pnl_pct": r.total_pnl_pct,
+            "avg_pnl_pct": r.avg_pnl_pct,
+            "max_drawdown_pct": r.max_drawdown_pct,
+            "win_rate_pct": round(r.winning_trades / max(r.total_trades, 1) * 100, 1),
+            "buy_signals": r.buy_signals,
+            "hold_signals": r.hold_signals,
+            "reduce_signals": r.reduce_signals,
+            "avoid_signals": r.avoid_signals,
+            "final_position": r.final_position,
+            "entry_price": r.entry_price,
+        })
+
+    best = top_results[0] if top_results else None
+    improvement = (
+        round(best["total_pnl_pct"] - current_result.total_pnl_pct, 2)
+        if best and current_result.total_trades > 0
+        else None
+    )
+
+    return {
+        "signal_count": len(signals),
+        "signals_date_range": f"{signals[0]['timestamp'][:10]} ~ {signals[-1]['timestamp'][:10]}",
+        "total_combos_tested": total_combos,
+        "current_thresholds": {
+            "buy_score": current_buy,
+            "hold_score": current_hold,
+            "reduce_score": current_reduce,
+        },
+        "current_result": {
+            "total_trades": current_result.total_trades,
+            "winning_trades": current_result.winning_trades,
+            "losing_trades": current_result.losing_trades,
+            "total_pnl_pct": current_result.total_pnl_pct,
+            "avg_pnl_pct": current_result.avg_pnl_pct,
+            "max_drawdown_pct": current_result.max_drawdown_pct,
+            "win_rate_pct": round(
+                current_result.winning_trades / max(current_result.total_trades, 1) * 100, 1
+            ),
+            "buy_signals": current_result.buy_signals,
+            "hold_signals": current_result.hold_signals,
+            "reduce_signals": current_result.reduce_signals,
+            "avoid_signals": current_result.avoid_signals,
+            "final_position": current_result.final_position,
+            "entry_price": current_result.entry_price,
+        },
+        "best_result": best,
+        "improvement_vs_current": improvement,
+        "top_results": top_results,
+    }
+
+
+def render_signal_grid_search_report(report: dict, *, mobile: bool = False) -> str:
+    """Render the grid search backtest report as readable text."""
+    lines = []
+    lines.append("=" * 64)
+    lines.append("   📊 信号阈值网格搜索回测")
+    lines.append("=" * 64)
+    lines.append(f"信号总数: {report['signal_count']}")
+    lines.append(f"信号日期: {report.get('signals_date_range', 'N/A')}")
+    lines.append(f"测试组合: {report['total_combos_tested']}")
+    lines.append("")
+
+    cur = report["current_thresholds"]
+    cr = report["current_result"]
+    lines.append("── 当前阈值 ──")
+    lines.append(f"  buy>={cur['buy_score']}  hold>={cur['hold_score']}  reduce>={cur['reduce_score']}")
+    lines.append(f"  交易 {cr['total_trades']} 笔 | 胜 {cr['winning_trades']} 败 {cr['losing_trades']} | 胜率 {cr['win_rate_pct']}%")
+    lines.append(f"  总收益: {cr['total_pnl_pct']:+.2f}% | 均收益: {cr['avg_pnl_pct']:+.2f}% | 最大回撤: {cr['max_drawdown_pct']:.2f}%")
+    lines.append(f"  信号分布: buy={cr['buy_signals']} hold={cr['hold_signals']} reduce={cr['reduce_signals']} avoid={cr['avoid_signals']}")
+    if cr['final_position'] == 'long':
+        lines.append(f"  ⚠️ 最终持仓未平仓 (入场价 {cr['entry_price']})")
+    lines.append("")
+
+    best = report.get("best_result")
+    if best:
+        lines.append("── 最优阈值 ──")
+        lines.append(f"  buy>={best['buy_score']}  hold>={best['hold_score']}  reduce>={best['reduce_score']}")
+        lines.append(f"  交易 {best['total_trades']} 笔 | 胜 {best['winning_trades']} 败 {best['losing_trades']} | 胜率 {best['win_rate_pct']}%")
+        lines.append(f"  总收益: {best['total_pnl_pct']:+.2f}% | 均收益: {best['avg_pnl_pct']:+.2f}% | 最大回撤: {best['max_drawdown_pct']:.2f}%")
+        lines.append(f"  信号分布: buy={best['buy_signals']} hold={best['hold_signals']} reduce={best['reduce_signals']} avoid={best['avoid_signals']}")
+        if best['final_position'] == 'long':
+            lines.append(f"  ⚠️ 最终持仓未平仓 (入场价 {best['entry_price']})")
+        lines.append("")
+
+        improvement = report.get("improvement_vs_current")
+        if improvement is not None:
+            delta = "📈" if improvement > 0 else ("📉" if improvement < 0 else "➡️")
+            lines.append(f"  相比当前阈值: {delta} {improvement:+.2f}%")
+
+    lines.append("")
+    top_list = report.get("top_results") or []
+    max_show = 5 if mobile else min(len(top_list), 10)
+    if top_list:
+        lines.append("── Top 阈值组合 ──")
+        lines.append(f"  {'排名':<4} {'buy>=':<6} {'hold>=':<7} {'reduce>=':<9} {'交易':>4} {'胜率':>6} {'总收益':>8} {'回撤':>6}")
+        lines.append("  " + "-" * 54)
+        for i, r in enumerate(top_list[:max_show], 1):
+            marker = "→" if i == 1 else " "
+            lines.append(
+                f"  {marker} {i:<3} "
+                f"{r['buy_score']:<6} {r['hold_score']:<7} {r['reduce_score']:<9} "
+                f"{r['total_trades']:>4} {r['win_rate_pct']:>5.0f}% "
+                f"{r['total_pnl_pct']:>+7.2f}% {r['max_drawdown_pct']:>5.2f}%"
+            )
+
+    lines.append("")
+    lines.append("模拟规则: score>=buy_score → 买入 | score<hold_score → 卖出 | 其余 → 观望")
+    lines.append("每笔交易按信号价格成交，不含手续费")
+    lines.append("仅供参考，不构成投资建议")
+    return "\n".join(lines)
+
+
 # ── Daily-level backtest (item #5: 回测框架) ──
 
 @dataclass(slots=True)

@@ -109,41 +109,92 @@ def _load_current_holdings(config) -> list[dict]:
     """Load current holdings with latest prices for debate."""
     holdings = []
     try:
-        snapshot = _load_snapshot(config)
-        if not snapshot:
+        raw = _load_snapshot_raw(config)
+        if not raw:
             return holdings
 
         from .providers import TencentQuoteProvider
         tencent = TencentQuoteProvider(config.monitor)
 
-        for h in snapshot.holdings:
-            if h.quantity <= 0:
+        # Support both formats: "holdings" (array) and legacy "positions" (dict)
+        holding_list = raw.get("holdings", [])
+        if not holding_list:
+            # Legacy format: positions dict
+            positions = raw.get("positions", {})
+            name_to_code = _build_name_code_map(config.monitor.stocks)
+            for pos_name, pos in positions.items():
+                code = name_to_code.get(pos_name, "")
+                if code:
+                    holding_list.append({
+                        "name": pos_name,
+                        "code": code,
+                        "quantity": int(pos.get("shares", 0)),
+                        "costPrice": float(pos.get("avg_cost", 0)),
+                    })
+
+        for h in holding_list:
+            name = h.get("name", "")
+            code = h.get("code", "")
+            if not code:
+                code = {"中国卫通": "601698", "中兴通讯": "000063", "启明星辰": "002439"}.get(name, "")
+            if not code:
+                logger.warning("No code for holding: %s", name)
                 continue
+
+            stock_ref = next(
+                (s for s in config.monitor.stocks if s.code == code), None
+            )
+            if not stock_ref:
+                continue
+
             try:
-                stock_ref = next(
-                    (s for s in config.monitor.stocks if s.code == h.code), None
-                )
-                if not stock_ref:
-                    continue
                 quote = tencent.fetch_quote(stock_ref)
-                cost = float(h.cost_price) if h.cost_price else float(quote.current_price)
-                pnl = (float(quote.current_price) - cost) / cost * 100 if cost > 0 else 0
-                holdings.append({
-                    "symbol": stock_ref.symbol,
-                    "code": h.code,
-                    "name": h.name,
-                    "quantity": h.quantity,
-                    "cost_price": f"{cost:.2f}",
-                    "current_price": f"{quote.current_price:.2f}",
-                    "pnl_pct": round(pnl, 1),
-                })
             except Exception as exc:
-                logger.warning("Failed to load holding for debate: %s — %s", h.code, exc)
+                logger.warning("Quote fetch failed for %s: %s", code, exc)
+                continue
+
+            shares = int(h.get("quantity", 0))
+            if shares <= 0:
+                continue
+
+            avg_cost = float(h.get("costPrice", 0))
+            if avg_cost <= 0:
+                avg_cost = float(quote.current_price)
+
+            pnl = (float(quote.current_price) - avg_cost) / avg_cost * 100 if avg_cost > 0 else 0
+            holdings.append({
+                "symbol": stock_ref.symbol,
+                "code": code,
+                "name": name,
+                "quantity": shares,
+                "cost_price": f"{avg_cost:.2f}",
+                "current_price": f"{quote.current_price:.2f}",
+                "pnl_pct": round(pnl, 1),
+            })
 
     except Exception as exc:
         logger.warning("Multi-agent briefing failed to load holdings: %s", exc)
 
     return holdings
+
+
+def _build_name_code_map(stocks: list) -> dict[str, str]:
+    """Build name->code mapping from known holdings."""
+    return {
+        "中国卫通": "601698",
+        "中兴通讯": "000063",
+        "启明星辰": "002439",
+    }
+
+
+def _load_snapshot_raw(config) -> dict | None:
+    """Load snapshot JSON as raw dict (handles updated/tradeDate format mismatch)."""
+    import json
+    path = config.snapshot_path
+    if not path.exists():
+        logger.warning("Snapshot not found: %s", path)
+        return None
+    return json.loads(path.read_text(encoding="utf-8"))
 
 
 def _load_snapshot(config):

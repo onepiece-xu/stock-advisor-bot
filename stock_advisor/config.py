@@ -88,6 +88,22 @@ class TakeProfitTier:
 
 
 @dataclass(slots=True)
+class TrailingTakeProfitConfig:
+    """Mobile trailing take-profit — replaces fixed-percentage '一刀切'."""
+    enabled: bool = True
+    # (profit_from_cost_threshold, drawdown_from_peak_pct) — ordered ascending
+    drawdown_tiers: list[tuple[float, float]] = None  # type: ignore[assignment]
+
+    def __post_init__(self):
+        if self.drawdown_tiers is None:
+            self.drawdown_tiers = [
+                (10.0, 5.0),    # profit < 10%: 5% drawdown
+                (20.0, 8.0),    # profit 10-20%: 8% drawdown
+                (float("inf"), 10.0),  # profit >= 20%: 10% drawdown
+            ]
+
+
+@dataclass(slots=True)
 class PositionTierConfig:
     """仓位分级：试探仓/标准仓/确信仓"""
     score_min: float
@@ -110,6 +126,7 @@ class MonitorConfig:
     stop_loss_pct: float
     position_pct_per_trade: float
     take_profit_tiers: list[TakeProfitTier]
+    trailing_take_profit: TrailingTakeProfitConfig
     position_tiers: list[PositionTierConfig]
 
 
@@ -236,6 +253,9 @@ def load_config(path: str | Path) -> AppConfig:
                 )
                 for t in monitor_raw.get("signal", {}).get("take_profit_tiers", [])
             ],
+            trailing_take_profit=_parse_trailing_take_profit(
+                monitor_raw.get("signal", {}).get("trailing_take_profit", {})
+            ),
             position_tiers=_parse_position_tiers(monitor_raw.get("signal", {}).get("position_tiers", {})),
             notification=NotificationConfig(
                 notify_on_neutral=bool(notification_raw.get("notify_on_neutral", False)),
@@ -282,6 +302,21 @@ def load_config(path: str | Path) -> AppConfig:
             model=str(raw.get("deepseek", {}).get("model", "deepseek-v4-pro")),
         ),
     )
+
+
+def _parse_trailing_take_profit(raw: dict) -> TrailingTakeProfitConfig:
+    """Parse trailing_take_profit from config dict."""
+    enabled = bool(raw.get("enabled", True))
+    tiers_raw = raw.get("drawdown_tiers", None)
+    if tiers_raw is None:
+        return TrailingTakeProfitConfig(enabled=enabled)
+    drawdown_tiers = []
+    for t in tiers_raw:
+        if isinstance(t, dict):
+            drawdown_tiers.append((float(t.get("profit_threshold", 10)), float(t.get("drawdown_pct", 5))))
+        elif isinstance(t, list):
+            drawdown_tiers.append((float(t[0]), float(t[1])))
+    return TrailingTakeProfitConfig(enabled=enabled, drawdown_tiers=drawdown_tiers)
 
 
 def _parse_position_tiers(raw: dict) -> list[PositionTierConfig]:

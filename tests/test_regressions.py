@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 import json
+import importlib.util
 import os
 import sqlite3
 import tempfile
 import unittest
 from datetime import date, datetime
+from io import StringIO
 from decimal import Decimal
 from pathlib import Path
 from types import SimpleNamespace
@@ -18,13 +20,53 @@ from stock_advisor.config import FeishuConfig, load_config
 from stock_advisor.notify import deliver_feishu_message
 from stock_advisor.portfolio_doc_sync import parse_latest_snapshot, sync_snapshot_from_doc
 from stock_advisor.market_overview import build_market_overview, render_market_overview
-from stock_advisor.models import StockQuote, StockRef, TradeFillRecord
+from stock_advisor.models import PortfolioHolding, PortfolioSnapshot, StockQuote, StockRef, TradeFillRecord
 from stock_advisor.providers import EastmoneyMarketSnapshotProvider, EastmoneyMinuteHistoryProvider
 from stock_advisor.runtime import MonitorRuntime
 from stock_advisor.storage import connect_db, init_db, insert_trade_fill, load_trade_fills
+from stock_advisor.debate_trigger_sync import sync_debate_to_triggers
+from stock_advisor.trading_plan import sync_exit_plan_triggers
 
 
 class MonitorRuntimeTests(unittest.TestCase):
+    def test_run_once_only_keeps_pre_market_and_close_review_active_pushes(self) -> None:
+        runtime = object.__new__(MonitorRuntime)
+        runtime.config = SimpleNamespace(
+            monitor=SimpleNamespace(
+                schedule=SimpleNamespace(restrict_to_trading_session=True),
+                notification=SimpleNamespace(feishu=SimpleNamespace(enabled=True)),
+            )
+        )
+        runtime._prune_notifications = Mock()
+        runtime._check_bridge_health = Mock()
+        runtime._sync_portfolio_snapshot_if_needed = Mock()
+        runtime._maybe_send_pre_market_briefing = Mock()
+        runtime._maybe_send_close_review = Mock()
+        runtime._maybe_send_breaking_news = Mock()
+        runtime._maybe_send_intraday_opportunities = Mock()
+        runtime._load_portfolio_snapshot = Mock(return_value=None)
+        runtime._detect_and_log_trades = Mock()
+        runtime._adjust_for_drawdown = Mock()
+        runtime._load_benchmark_history = Mock(return_value=[])
+        runtime._load_market_context = Mock(return_value=(0, {}, None))
+        runtime.config.monitor.stocks = []
+        runtime.db = None
+        runtime.tencent_provider = Mock()
+        runtime.price_high_marks = {}
+        runtime._price_high_marks_date = date(2026, 5, 28)
+        runtime._daily_closes = {}
+        runtime._daily_closes_date = date(2026, 5, 28)
+
+        with patch("stock_advisor.runtime.is_a_share_trading_time", return_value=True), \
+             patch("stock_advisor.runtime.compute_cash_ratio", return_value=Decimal("0")), \
+             patch("stock_advisor.runtime.build_trading_habit_profile", return_value=None), \
+             patch("stock_advisor.runtime.is_high_volatility_period", return_value=False):
+            runtime.run_once()
+
+        runtime._maybe_send_pre_market_briefing.assert_called_once()
+        runtime._maybe_send_breaking_news.assert_not_called()
+        runtime._maybe_send_intraday_opportunities.assert_not_called()
+
     def test_run_once_syncs_snapshot_and_pushes_portfolio_advice_outside_trading_hours(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
             root = Path(tmpdir)
@@ -145,6 +187,173 @@ class ConfigRegressionTests(unittest.TestCase):
         self.assertEqual(config.monitor.risk_controls.min_cash_pct, 15.0)
 
 
+class DebateTriggerSyncRegressionTests(unittest.TestCase):
+    def test_debate_sync_creates_partial_reduce_and_preserves_exit_plan(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            data_dir = root / "data"
+            feedback_dir = data_dir / "feedback"
+            feedback_dir.mkdir(parents=True)
+
+            (root / "portfolio-snapshot.json").write_text(
+                json.dumps(
+                    {
+                        "tradeDate": "2026-05-27",
+                        "totalAssets": 43421.82,
+                        "cash": 676.82,
+                        "holdings": [
+                            {
+                                "name": "中国卫通",
+                                "code": "601698",
+                                "quantity": 1100,
+                                "costPrice": 33.944,
+                                "currentPrice": 31.218,
+                            }
+                        ],
+                    },
+                    ensure_ascii=False,
+                    indent=2,
+                ),
+                encoding="utf-8",
+            )
+            (feedback_dir / "debate_log.jsonl").write_text(
+                json.dumps(
+                    {
+                        "timestamp": "2026-05-27T15:03:01.590337",
+                        "symbol": "sh601698",
+                        "name": "中国卫通",
+                        "price": 31.47,
+                        "action": "sell",
+                        "confidence": 0.9,
+                        "vote_summary": "风控否决（跳过仲裁）",
+                        "reasoning": "风控官强制执行卖出：持仓浮亏-7.3%已触发7%铁血止损红线，本金安全优先，纪律卖出不侥幸。",
+                        "agent_votes": {
+                            "铁血风控": "sell",
+                            "大胆猎手": "hold",
+                            "趋势判官": "sell",
+                            "宏观观察": "hold",
+                            "资金猎犬": "sell",
+                        },
+                    },
+                    ensure_ascii=False,
+                ) + "\n",
+                encoding="utf-8",
+            )
+            (data_dir / "trading_plan.json").write_text(
+                json.dumps(
+                    {
+                        "triggers": [
+                            {
+                                "code": "601698",
+                                "name": "中国卫通-辩论止损",
+                                "action": "sell",
+                                "quantity": 1100,
+                                "priceMin": "31.37",
+                                "priceMax": "31.57",
+                                "fallbackPrice": "31.42",
+                                "note": "旧的错误全仓辩论止损",
+                                "disableBuy": True,
+                                "_source": "debate_sync",
+                            },
+                            {
+                                "code": "601698",
+                                "name": "中国卫通-卖点计划",
+                                "action": "sell",
+                                "quantity": 200,
+                                "priceMin": "32.05",
+                                "priceMax": "32.25",
+                                "fallbackPrice": "30.28",
+                                "note": "自动卖点计划",
+                                "disableBuy": True,
+                                "_source": "exit_plan_sync",
+                            },
+                        ]
+                    },
+                    ensure_ascii=False,
+                    indent=2,
+                ),
+                encoding="utf-8",
+            )
+
+            actions = sync_debate_to_triggers(data_dir)
+            self.assertEqual(len(actions), 1)
+            self.assertIn("辩论减仓 300股", actions[0])
+
+            plan = json.loads((data_dir / "trading_plan.json").read_text(encoding="utf-8"))
+            triggers = plan["triggers"]
+            self.assertEqual(len(triggers), 2)
+
+            debate = next(t for t in triggers if t.get("_source") == "debate_sync")
+            exit_plan = next(t for t in triggers if t.get("_source") == "exit_plan_sync")
+
+            self.assertEqual(debate["name"], "中国卫通-辩论减仓")
+            self.assertEqual(debate["quantity"], 300)
+            self.assertIn("不做全仓硬砍", debate["note"])
+            self.assertEqual(exit_plan["name"], "中国卫通-卖点计划")
+            self.assertEqual(exit_plan["quantity"], 200)
+
+    def test_sync_exit_plan_skips_codes_with_debate_sell_trigger(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            trigger_path = Path(tmpdir) / "trading_plan.json"
+            trigger_path.write_text(
+                json.dumps(
+                    {
+                        "triggers": [
+                            {
+                                "code": "601698",
+                                "name": "中国卫通-辩论减仓",
+                                "action": "sell",
+                                "quantity": 300,
+                                "priceMin": "31.37",
+                                "priceMax": "31.57",
+                                "fallbackPrice": "31.42",
+                                "note": "收盘辩论建议先减仓",
+                                "disableBuy": True,
+                                "_source": "debate_sync",
+                                "_created": "2026-05-28T09:00:00",
+                            }
+                        ]
+                    },
+                    ensure_ascii=False,
+                    indent=2,
+                ),
+                encoding="utf-8",
+            )
+
+            snapshot = PortfolioSnapshot(
+                trade_date=date(2026, 5, 28),
+                total_assets=Decimal("43422"),
+                cash=Decimal("677"),
+                holdings=[
+                    PortfolioHolding(
+                        name="中国卫通",
+                        code="601698",
+                        quantity=1100,
+                        cost_price=Decimal("33.944"),
+                        current_price=Decimal("31.218"),
+                    ),
+                    PortfolioHolding(
+                        name="中兴通讯",
+                        code="000063",
+                        quantity=200,
+                        cost_price=Decimal("37.289"),
+                        current_price=Decimal("34.66"),
+                    ),
+                ],
+            )
+
+            created = sync_exit_plan_triggers(snapshot, trigger_path)
+            self.assertEqual(created, 1)
+
+            plan = json.loads(trigger_path.read_text(encoding="utf-8"))
+            triggers = plan["triggers"]
+            self.assertEqual(len(triggers), 2)
+            self.assertEqual(sum(1 for t in triggers if t.get("code") == "601698"), 1)
+            self.assertEqual(sum(1 for t in triggers if t.get("code") == "000063"), 1)
+            self.assertEqual(next(t for t in triggers if t.get("code") == "601698")["_source"], "debate_sync")
+            self.assertEqual(next(t for t in triggers if t.get("code") == "000063")["_source"], "exit_plan_sync")
+
+
 class OutboxTests(unittest.TestCase):
     def test_outbox_delivery_can_be_pulled_and_marked_sent(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -187,6 +396,205 @@ class BriefingRegressionTests(unittest.TestCase):
         self.assertIn("执行数量：先减 300 股，回收现金", rendered)
         self.assertIn("触发条件：反弹靠近 MA60 时挂卖", rendered)
         self.assertIn("风险：单票仓位达到 +41.20%，超过单票上限 +35.00%", rendered)
+
+    def test_run_status_prints_latest_summary_when_briefing_starts_with_quick_verdict(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            (root / "data" / "briefing").mkdir(parents=True)
+            snapshot_path = root / "portfolio-snapshot.json"
+            snapshot_path.write_text(
+                json.dumps(
+                    {
+                        "tradeDate": "2026-05-28",
+                        "totalAssets": 44441.09,
+                        "cash": 4230.09,
+                        "holdings": [
+                            {
+                                "name": "中兴通讯",
+                                "code": "000063",
+                                "quantity": 100,
+                                "costPrice": 35.55,
+                                "currentPrice": 38.30,
+                            }
+                        ],
+                    },
+                    ensure_ascii=False,
+                    indent=2,
+                ),
+                encoding="utf-8",
+            )
+            (root / "data" / "briefing" / "latest.json").write_text(
+                json.dumps(
+                    {
+                        "date": "2026-05-28",
+                        "generated_at": "2026-05-28T14:22:08+08:00",
+                        "summary": "【今日速判】\n- 中兴通讯：🔴 强势持有，已涨停，今日不卖\n\n【持仓卖点计划】\n- 中兴通讯：100股继续持有；涨停封单在，不卖，炸板再评估",
+                    },
+                    ensure_ascii=False,
+                    indent=2,
+                ),
+                encoding="utf-8",
+            )
+            trigger_path = root / "data" / "trading_plan.json"
+            trigger_path.write_text(json.dumps({"triggers": []}, ensure_ascii=False), encoding="utf-8")
+
+            config = SimpleNamespace(snapshot_path=snapshot_path, trading_plan=SimpleNamespace(path=trigger_path))
+            output = StringIO()
+            with patch("stock_advisor.cli.require_valid_config", return_value=config), \
+                 patch("stock_advisor.cli.load_snapshot") as load_snapshot_mock, \
+                 patch("stock_advisor.cli.load_triggers", return_value={}), \
+                 patch("subprocess.run") as subprocess_run_mock, \
+                 patch("sys.stdout", output):
+                load_snapshot_mock.return_value = PortfolioSnapshot(
+                    trade_date=date(2026, 5, 28),
+                    total_assets=Decimal("44441.09"),
+                    cash=Decimal("4230.09"),
+                    holdings=[
+                        PortfolioHolding(
+                            name="中兴通讯",
+                            code="000063",
+                            quantity=100,
+                            cost_price=Decimal("35.55"),
+                            current_price=Decimal("38.30"),
+                        )
+                    ],
+                )
+                subprocess_run_mock.return_value = SimpleNamespace(stdout="123\n")
+                from stock_advisor.cli import run_status
+                run_status("config.yaml")
+
+            rendered = output.getvalue()
+            self.assertIn("最近盘前简报：2026-05-28（2026-05-28T14:22）", rendered)
+            self.assertIn("- 中兴通讯：🔴 强势持有，已涨停，今日不卖", rendered)
+            self.assertIn("- 中兴通讯：100股继续持有；涨停封单在，不卖，炸板再评估", rendered)
+
+
+class BridgeValidatorRegressionTests(unittest.TestCase):
+    def test_new_trigger_does_not_inherit_old_cooldown_count(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo = Path(tmpdir)
+            data_dir = repo / "data"
+            data_dir.mkdir()
+
+            (data_dir / "trading_plan.json").write_text(
+                json.dumps(
+                    {
+                        "triggers": [
+                            {
+                                "code": "601698",
+                                "name": "中国卫通-辩论止损",
+                                "action": "sell",
+                                "quantity": 1100,
+                                "priceMin": "31.37",
+                                "priceMax": "31.57",
+                                "fallbackPrice": "31.42",
+                                "note": "新的辩论止损",
+                                "disableBuy": True,
+                                "_source": "debate_sync",
+                                "_created": "2026-05-27T15:14:13.219857",
+                            }
+                        ]
+                    },
+                    ensure_ascii=False,
+                    indent=2,
+                ),
+                encoding="utf-8",
+            )
+            (data_dir / "bridge_trigger_cooldown.json").write_text(
+                json.dumps(
+                    {
+                        "601698:中国卫通-辩论止损": {
+                            "ts": 0,
+                            "count": 2,
+                        }
+                    },
+                    ensure_ascii=False,
+                ),
+                encoding="utf-8",
+            )
+
+            spec = importlib.util.spec_from_file_location(
+                "bridge_validator_under_test",
+                Path(__file__).resolve().parent.parent / "scripts" / "bridge_validator.py",
+            )
+            self.assertIsNotNone(spec)
+            self.assertIsNotNone(spec.loader)
+            module = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(module)
+
+            with patch.object(module, "REPO", repo), \
+                 patch.object(module, "TRIGGER_COOLDOWN_PATH", data_dir / "bridge_trigger_cooldown.json"), \
+                 patch.object(module, "SNAPSHOT_PATH", data_dir / "missing-snapshot.json"), \
+                 patch.object(module, "_is_trigger_delivery_window", return_value=True), \
+                 patch.object(module, "_fetch_trigger_prices", return_value={"601698": 31.47}):
+                alerts = module._check_triggers()
+
+            self.assertEqual(len(alerts), 1)
+
+            plan = json.loads((data_dir / "trading_plan.json").read_text(encoding="utf-8"))
+            self.assertEqual(len(plan["triggers"]), 1)
+
+            cooldown = json.loads((data_dir / "bridge_trigger_cooldown.json").read_text(encoding="utf-8"))
+            self.assertIn("601698:中国卫通-辩论止损:debate_sync:2026-05-27T15:14:13.219857", cooldown)
+            self.assertEqual(cooldown["601698:中国卫通-辩论止损:debate_sync:2026-05-27T15:14:13.219857"]["count"], 1)
+
+    def test_auto_disable_debate_sell_also_removes_same_code_exit_plan(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            repo = Path(tmpdir)
+            data_dir = repo / "data"
+            data_dir.mkdir()
+            (data_dir / "trading_plan.json").write_text(
+                json.dumps(
+                    {
+                        "triggers": [
+                            {
+                                "code": "601698",
+                                "name": "中国卫通-辩论减仓",
+                                "action": "sell",
+                                "quantity": 300,
+                                "priceMin": "31.37",
+                                "priceMax": "31.57",
+                                "fallbackPrice": "31.42",
+                                "note": "辩论减仓",
+                                "disableBuy": True,
+                                "_source": "debate_sync",
+                                "_created": "2026-05-28T09:00:00",
+                            },
+                            {
+                                "code": "601698",
+                                "name": "中国卫通-卖点计划",
+                                "action": "sell",
+                                "quantity": 200,
+                                "priceMin": "32.05",
+                                "priceMax": "32.25",
+                                "fallbackPrice": "30.28",
+                                "note": "自动卖点计划",
+                                "disableBuy": True,
+                                "_source": "exit_plan_sync",
+                                "_created": "2026-05-28T09:05:00",
+                            },
+                        ]
+                    },
+                    ensure_ascii=False,
+                    indent=2,
+                ),
+                encoding="utf-8",
+            )
+
+            spec = importlib.util.spec_from_file_location(
+                "bridge_validator_under_test",
+                Path(__file__).resolve().parent.parent / "scripts" / "bridge_validator.py",
+            )
+            self.assertIsNotNone(spec)
+            self.assertIsNotNone(spec.loader)
+            module = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(module)
+
+            with patch.object(module, "REPO", repo):
+                module._auto_disable_triggers({"601698:中国卫通-辩论减仓:debate_sync:2026-05-28T09:00:00"})
+
+            plan = json.loads((data_dir / "trading_plan.json").read_text(encoding="utf-8"))
+            self.assertEqual(plan["triggers"], [])
 
 
 class AnalysisRegressionTests(unittest.TestCase):

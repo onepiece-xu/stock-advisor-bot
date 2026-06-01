@@ -15,12 +15,16 @@ from .habit_learning import build_trading_habit_profile
 from .market_hours import MARKET_TZ, is_a_share_trading_time, is_auction_period, is_high_volatility_period, is_opening_grace_period, next_session_str, seconds_until_next_session
 from .models import StockQuote
 from .logging_utils import get_logger
+from .multi_agent import debate  # v1.55.7: intraday debate
+from .instruction_engine import IntradayInstruction, resolve_instruction  # v1.55.21: single decision exit
+from .delivery.intraday import render_intraday_action_card  # Phase 4: pure renderer
 from .news import fetch_announcements_for_code, fetch_stock_news, filter_new_announcements, format_announcement_line, is_important_announcement
 from .notify import deliver_feishu_message
 from .outbox import flush_outbox, check_stale
 from .portfolio import compute_cash_ratio, compute_position_ratio, find_holding, generate_portfolio_report, load_snapshot as load_portfolio_snapshot
 from .portfolio_doc_sync import sync_snapshot_from_doc
 from .providers import EastmoneyMarketSnapshotProvider, EastmoneyMinuteHistoryProvider, SinaMinuteHistoryProvider, TencentQuoteProvider
+from .opportunity_scanner import scan as scan_opportunities, suggest_position, build_exit_plan, can_afford_candidate
 from .review import already_sent_close_review, build_close_review, find_latest_plan_record, mark_close_review_sent, should_send_close_review_now
 from .stop_loss import compute_effective_stop
 from .storage import cache_quotes, connect_db, load_recent_quotes, persist_observation
@@ -58,6 +62,12 @@ class MonitorRuntime:
         self._signal_states: dict[str, str] = {}
         self._signal_state_path = Path(config.portfolio.data_dir) / "signal_history.json"
         self._load_signal_states()
+        # v1.55.7: Intraday multi-agent debate cache
+        self._debate_cache: dict[str, tuple] = {}       # code -> (decision, timestamp)
+        self._debate_attempts: dict[str, datetime] = {}  # code -> last attempt time
+        self._debate_interval = 600  # 10 min between debates per stock
+        self._last_intraday_opportunity_scan: datetime | None = None
+        self._last_intraday_opportunity_digest: str = ""
 
     def run_once(self) -> None:
         self._prune_notifications()
@@ -71,8 +81,6 @@ class MonitorRuntime:
             self._maybe_send_close_review()
             logger.info("skip: outside A-share trading session")
             return
-
-        self._maybe_send_breaking_news()
 
         today = datetime.now(MARKET_TZ).date()
         if self._price_high_marks_date != today:
@@ -130,30 +138,41 @@ class MonitorRuntime:
                 daily_closes=daily_closes,
                 daily_volumes=daily_volumes,
                 portfolio_total_assets=portfolio_snapshot.total_assets if portfolio_snapshot else None,
+                peak_price=self.price_high_marks.get(stock.code),
             )
             persist_observation(self.db, quote, result)
             logger.info("=" * 80)  # type: ignore[arg-type]  # logging format interprets % as placeholder escape
             logger.info(result.title)  # type: ignore[arg-type]
             logger.info(result.message)  # type: ignore[arg-type]
 
-            trigger_message = self._build_trigger_message(quote)
-            if trigger_message:
-                # Secondary confirmation: if scoring engine says "avoid",
-                # suppress trigger notification (e.g. crash day, deep loss, etc.)
-                if result.decision.action == "avoid":
-                    logger.warning(
-                        "Trigger hit suppressed by scoring engine: %s %s (score=%s, action=%s)",
-                        quote.code, quote.name, result.decision.score, result.decision.action,
-                    )
-                else:
-                    pending_notifications.append((stock.symbol + ':trigger', f"{quote.code} {quote.name} 触发交易区间", trigger_message))
-                continue
+            # ── Phase 3: Instruction Engine — single decision per stock ──
+            # Collect scoring + debate + trigger into one instruction resolution
+            instr = self._resolve_instruction(
+                code=stock.code,
+                name=quote.name,
+                current_price=quote.current_price,
+                score_result=result,
+                holding=holding,
+                quote=quote,
+                advance_ratio=advance_ratio,
+            )
 
-            dedup_body = f"{result.decision.action}:{int(result.decision.score) // 10}"
-            if self._is_trade_signal(result, holding, code=quote.code) and self._dedup_ok(stock.symbol, dedup_body, cooldown_minutes=self.config.monitor.notification.dedup.cooldown_minutes):
-                action_label = {"buy": "买入", "reduce": "减仓", "avoid": "清仓"}.get(result.decision.action, result.decision.action)
-                pending_notifications.append((stock.symbol, f"{quote.code} {quote.name} {action_label}", format_mobile_signal(result.title, result.message, include_title=False), dedup_body))
-                self._update_signal_state(quote.code, result.decision.action)
+            # Trigger notifications go through instruction engine now
+            if instr and instr.action in ("buy", "sell"):
+                dedup_body = f"{instr.action}:{instr.priority}"
+                if self._dedup_ok(stock.symbol, dedup_body, cooldown_minutes=self.config.monitor.notification.dedup.cooldown_minutes):
+                    action_label = "买入" if instr.action == "buy" else "卖出"
+                    pending_notifications.append((
+                        stock.symbol,
+                        f"{stock.code} {quote.name} {action_label}",
+                        format_mobile_signal(
+                            f"{quote.name} → {action_label}（{instr.source}）",
+                            instr.reason,
+                            include_title=False,
+                        ),
+                        dedup_body,
+                    ))
+                    self._update_signal_state(stock.code, instr.action)
 
         self._notify_batch(pending_notifications)
 
@@ -177,8 +196,8 @@ class MonitorRuntime:
                         sleep_sec,
                     )
                     time.sleep(sleep_sec)
-            except Exception:
-                pass  # Non-critical — don't crash the daemon for missing config
+            except Exception as exc:
+                logger.warning("休眠计算失败，继续轮询: %s", exc)
 
     def _run_guarded_once(self, phase: str) -> None:
         try:
@@ -275,69 +294,129 @@ class MonitorRuntime:
         self._signal_states[code] = action
         self._save_signal_states()
 
-    def _is_trade_signal(self, result, holding, *, code: str = "") -> bool:
-        if not self.config.monitor.notification.feishu.enabled:
-            return False
-        if self.config.monitor.notification.feishu.delivery_mode == "webhook" and not self.config.monitor.notification.feishu.webhook_url:
-            return False
-        action = result.decision.action
-        # Signal reversal check: don't push contradictory signals
-        if code and self._check_signal_reversal(code, action):
-            return False
-        # Mute low-confidence neutral zone signals: score 45-55 with low confidence
-        # are noise that distracts office workers without actionable value.
-        confidence = result.decision.confidence
-        score = result.decision.score
-        if confidence == "low" and Decimal("45") <= score <= Decimal("55") and action in ("hold", "avoid"):
-            return False
-        if action == "buy":
-            return True
+    def _resolve_instruction(
+        self, *, code: str, name: str, current_price: Decimal,
+        score_result, holding, quote, advance_ratio: Decimal,
+    ) -> IntradayInstruction | None:
+        """Phase 3: Resolve scoring + debate + trigger into ONE instruction per stock."""
+        score_action = score_result.decision.action
+        score_confidence = score_result.decision.confidence
+
+        # ── Filter: low-confidence neutral zone ──
+        score_val = score_result.decision.score
+        if score_confidence == "low" and Decimal("45") <= score_val <= Decimal("55") and score_action in ("hold", "avoid"):
+            return None
+
+        # ── Signal reversal guard ──
+        if code and self._check_signal_reversal(code, score_action):
+            return None
+
+        # ── Opening grace period: mute reduce/avoid ──
         has_position = holding is not None and holding.quantity > 0
-        if action in ("reduce", "avoid") and has_position:
-            # Opening grace period (9:30-9:45): mute all reduce/avoid signals.
-            # Minute-level MA signals are extremely unreliable right after open;
-            # the first 15 minutes are pure noise.  Let the market settle first.
-            if is_opening_grace_period():
-                return False
-            return True
-        return False
+        if score_action in ("reduce", "avoid") and has_position and is_opening_grace_period():
+            return None
 
-    def _maybe_send_breaking_news(self) -> None:
-        """Check for important new announcements during trading hours and push alerts.
+        # ── Debate ──
+        debate_action = None
+        debate_confidence = 0.0
+        if score_action in ("buy", "reduce"):
+            debate_decision = self._intraday_debate(quote, holding, advance_ratio)
+            if debate_decision and debate_decision.action != score_action:
+                logger.info(
+                    "🔄 Debate override: %s scoring=%s→debate=%s (confidence=%.0f%%)",
+                    name, score_action, debate_decision.action,
+                    debate_decision.confidence * 100,
+                )
+                debate_action = debate_decision.action
+                debate_confidence = debate_decision.confidence
 
-        Runs on every daemon cycle during trading hours (9:30-15:00).
-        Cooldown: 1 minute between checks to avoid spamming.
-        Only pushes announcements matching IMPORTANT_ANNOUNCEMENT_KEYWORDS
-        that haven't been seen before (dedup via announcement-seen.json).
-        """
-        now = datetime.now(MARKET_TZ)
-        # Only run during continuous auction (skip pre-market auction 9:25-9:30)
-        if is_auction_period():
-            return
-        # Cooldown: at most once every 1 minute
-        if self._last_news_check is not None:
-            elapsed = (now - self._last_news_check).total_seconds()
-            if elapsed < 60:
-                return
-
-        self._last_news_check = now
-        all_important: list[str] = []
-        for stock in self.config.monitor.stocks:
+        # ── Trigger hit ──
+        trigger_action = None
+        trigger_quantity = 0
+        trigger_message = self._build_trigger_message(quote)
+        if trigger_message and score_action != "avoid":
+            from .trading_plan import detect_trigger_hit, load_snapshot as load_trade_snapshot
             try:
-                items = fetch_announcements_for_code(stock.code, limit=3)
+                snapshot = load_trade_snapshot(self.config.snapshot_path)
+                trigger_hit = detect_trigger_hit(quote, snapshot, self.trade_triggers)
+                if trigger_hit:
+                    trigger_action = trigger_hit.trigger.action
+                    trigger_quantity = trigger_hit.quantity
             except Exception:
-                continue
-            new_items = filter_new_announcements(items)
-            for item in new_items:
-                if is_important_announcement(item.title):
-                    line = format_announcement_line(item)
-                    all_important.append(f"- [{stock.code}] {line}")
+                pass
 
-        if not all_important:
-            return
+        # ── Holdings context ──
+        holding_quantity = holding.quantity if holding else 0
+        holding_pnl_pct = 0.0
+        if holding and holding.cost_price > 0:
+            holding_pnl_pct = float((holding.current_price - holding.cost_price) / holding.cost_price * 100)
 
-        message = "📰 **盘中重要公告**\n" + "\n".join(all_important)
-        deliver_feishu_message(self.config.monitor.notification.feishu, "盘中公告", message)
+        return resolve_instruction(
+            code=code,
+            name=name,
+            current_price=current_price,
+            score_action=score_action,
+            score_confidence=score_confidence,
+            debate_action=debate_action,
+            debate_confidence=debate_confidence,
+            trigger_hit_action=trigger_action,
+            trigger_hit_quantity=trigger_quantity,
+            holding_quantity=holding_quantity,
+            holding_pnl_pct=holding_pnl_pct,
+            max_single_position_pct=self.config.monitor.risk_controls.max_single_position_pct,
+        )
+
+    def _intraday_debate(self, quote, holding, advance_ratio):
+        """Run multi-agent debate intraday for a stock with a trade signal.
+
+        Cached for 10 min per stock to avoid excessive API calls.
+        Returns debate decision or None if debate skipped/failed.
+        """
+        code = quote.code
+        now = datetime.now()
+
+        # Check cache — use recent debate result if available
+        if code in self._debate_cache:
+            decision, cached_at = self._debate_cache[code]
+            if (now - cached_at).total_seconds() < self._debate_interval:
+                return decision
+
+        # Check attempt cooldown — don't spam debate calls
+        last_attempt = self._debate_attempts.get(code)
+        if last_attempt and (now - last_attempt).total_seconds() < self._debate_interval:
+            return None
+
+        self._debate_attempts[code] = now
+
+        # Prepare context
+        holding_info = ""
+        if holding and holding.quantity > 0:
+            pnl = float((quote.current_price - holding.cost_price) / holding.cost_price * 100)
+            holding_info = f"持仓{holding.quantity}股，成本{float(holding.cost_price):.2f}，盈亏{pnl:+.1f}%"
+
+        market_context = f"涨跌比{float(advance_ratio):.2f}" if advance_ratio else ""
+
+        try:
+            decision = debate(
+                symbol=code,
+                name=quote.name,
+                current_price=quote.current_price,
+                holding_info=holding_info,
+                market_context=market_context,
+                timeout_per_agent=15,
+            )
+            if decision:
+                self._debate_cache[code] = (decision, now)
+                logger.info(
+                    "🧠 Debate: %s → %s (vote=%s confidence=%.0f%%)",
+                    quote.name, decision.action, decision.vote_summary,
+                    decision.confidence * 100,
+                )
+                return decision
+        except Exception as exc:
+            logger.warning("Intraday debate failed for %s: %s", quote.name, exc)
+
+        return None
 
     def _notify_batch(self, notifications: list[tuple[str, str, str]]) -> None:
         if not notifications:
@@ -359,7 +438,8 @@ class MonitorRuntime:
             self._notify(symbol, title, message)
             return
 
-        lines = [f"【盘中动作卡】{datetime.now(MARKET_TZ):%H:%M}"]
+        # ── Phase 4: Use delivery renderer for action card ──
+        instructions = []
         dedup_parts: list[str] = []
         for symbol, title, message, dedup_body in batchable:
             body_lines = [line.strip() for line in message.splitlines() if line.strip()]
@@ -371,18 +451,17 @@ class MonitorRuntime:
             size_text = self._strip_label(size_line)
             reasons = self._short_risk_reasons(risk_line)
             card_label = self._action_card_label(title, action_text)
-            lines.append("")
-            lines.append(f"{stock_name}")
-            lines.append(f"- 类型：{card_label}")
-            if action_text:
-                lines.append(f"- 动作：{action_text}")
-            if size_text:
-                lines.append(f"- 执行：{size_text}")
-            if reasons:
-                lines.append(f"- 原因：{reasons}")
+            instructions.append({
+                "name": stock_name,
+                "action_text": action_text,
+                "size_text": size_text,
+                "reasons": reasons,
+                "card_label": card_label,
+            })
             dedup_parts.append(f"{symbol}:{action_text}:{size_text}:{reasons}")
 
-        self._notify("batch", "盘中动作卡", "\n".join(lines))
+        card_text = render_intraday_action_card(instructions, timestamp=datetime.now(MARKET_TZ))
+        self._notify("batch", "盘中动作卡", card_text)
         self.last_notifications["batch"] = ("\n".join(dedup_parts), datetime.now())
         # ── Per-symbol dedup: update individual stock entries so _dedup_ok
         #     can enforce per-stock cooldown in subsequent daemon cycles ──
@@ -723,6 +802,24 @@ class MonitorRuntime:
         except Exception:
             pass
 
+        # ── 3.5 昨日主力资金 ──
+        try:
+            from .chrome_scraper import get_multi_fund_flow
+            if snapshot:
+                codes = [h.code for h in snapshot.holdings if h.quantity > 0]
+                ff_data = get_multi_fund_flow(codes)
+                if ff_data:
+                    lines.append("\n【昨日主力资金】")
+                    for code in codes:
+                        ff = ff_data.get(code)
+                        if ff:
+                            d = "🟢流入" if ff["main_net_yi"] > 0 else ("🔴流出" if ff["main_net_yi"] < 0 else "⚪持平")
+                            lines.append(
+                                f"  {code} {ff['name']} {d} {abs(ff['main_net_yi']):.2f}亿"
+                            )
+        except Exception:
+            pass
+
         # ── 4. 板块轮动热力图 ── (REMOVED — office worker doesn't need sector heatmap)
         # ── 5. 近期公告 ──
         try:
@@ -802,11 +899,25 @@ class MonitorRuntime:
                     elif pnl >= 0:
                         verdict = "🟡 小幅浮盈，持有观望"
                     else:
-                        verdict = "🟡 浮亏中，等反弹减仓"
+                        plan = build_exit_plan(holding, max_single_position_pct=self.config.monitor.risk_controls.max_single_position_pct)
+                        verdict = f"🟡 {plan.action}，目标{plan.target_price}"
                     quick_verdicts.append(f"- {holding.name}：{verdict}")
                 if quick_verdicts:
                     lines.append("\n【今日速判】")
                     lines.extend(quick_verdicts)
+                exit_lines: list[str] = []
+                for holding in snapshot.holdings:
+                    if holding.quantity <= 0:
+                        continue
+                    plan = build_exit_plan(holding, max_single_position_pct=self.config.monitor.risk_controls.max_single_position_pct)
+                    if plan.quantity <= 0:
+                        continue
+                    exit_lines.append(
+                        f"- {holding.name}：先看 {plan.target_price} 附近{plan.action}{plan.quantity}股；若回落到 {plan.fallback_price} 再执行，{plan.reason}"
+                    )
+                if exit_lines:
+                    lines.append("\n【持仓卖点计划】")
+                    lines.extend(exit_lines)
             except Exception:
                 pass
 
@@ -859,6 +970,34 @@ class MonitorRuntime:
                     lines.append(f"\n{sector_text}")
         except Exception:
             pass
+
+        # ── 10. 主动机会扫描（排除当前持仓）──
+        try:
+            exclude_codes = {h.code for h in snapshot.holdings if h.quantity > 0} if snapshot else set()
+            candidates = scan_opportunities(
+                config_path="config.yaml",
+                top_n=3,
+                exclude_codes=exclude_codes,
+                max_change_pct=5.0,
+            )
+            if candidates:
+                candidates = [c for c in candidates if can_afford_candidate(self.config, c.current_price, c.composite_score)]
+            if candidates:
+                lines.append("\n【今日主动机会】")
+                for idx, cand in enumerate(candidates, 1):
+                    stop_price = (cand.current_price * Decimal("0.93")).quantize(Decimal("0.01"))
+                    position = suggest_position(self.config, cand.current_price, cand.composite_score)
+                    position_text = f"{position.label}{position.quantity}股" if position.quantity > 0 else "现金不足，先观察"
+                    reasons = " / ".join(flag.lstrip("🟢🟡🔴🟠📏💪🔔📊📈🔥⚠️ ") for flag in cand.flags[:2])
+                    line = (
+                        f"- #{idx} {cand.name}({cand.code}) {cand.current_price}"
+                        f" | 分{cand.composite_score} | {position_text} | 止损{stop_price}"
+                    )
+                    if reasons:
+                        line += f" | {reasons}"
+                    lines.append(line)
+        except Exception as exc:
+            logger.warning("Pre-market opportunity scan failed error=%s", exc)
 
         # Save briefing data for status command
         try:

@@ -1072,7 +1072,8 @@ def _build_decision_signal(
                 rationale.append(f"UZI增强: {uzi_summary}")
             else:
                 risk_flags.append(f"UZI警告: {uzi_summary}")
-    except Exception:
+    except Exception as exc:
+        logger.warning("stock_advisor/analysis.py:_build_decision_signal failed: %s", exc)
         pass  # UZI scoring is best-effort, never block the pipeline
 
     # ═══════════════════════════════════════════════════════════
@@ -1115,7 +1116,8 @@ def _build_decision_signal(
                 rationale.append(f"威科夫: {wyckoff_summary}")
             else:
                 risk_flags.append(f"威科夫: {wyckoff_summary}")
-    except Exception:
+    except Exception as exc:
+        logger.warning("stock_advisor/analysis.py:_build_decision_signal failed: %s", exc)
         pass  # Wyckoff scoring is best-effort
 
     # ═══════════════════════════════════════════════════════════
@@ -1132,8 +1134,8 @@ def _build_decision_signal(
                 rationale.append(f"板块强度加分: +{sector_boost}")
             else:
                 risk_flags.append(f"板块弱势罚分: {sector_boost}")
-    except Exception:
-        pass
+    except Exception as exc:
+        logger.warning("stock_advisor/analysis.py:_build_decision_signal failed: %s", exc)
 
     # ═══════════════════════════════════════════════════════════
     # PHASE 7.8: Oversold Bounce Bonus — only in bull/neutral regime
@@ -1260,8 +1262,8 @@ def _build_decision_signal(
             regime=regime,
             rationale="; ".join(rationale[:3]),
         )
-    except Exception:
-        pass
+    except Exception as exc:
+        logger.warning("stock_advisor/analysis.py:_build_decision_signal failed: %s", exc)
 
     return DecisionSignal(
         action=action,
@@ -1311,7 +1313,8 @@ def _trade_plan(
                     f"ATR动态止损 {stop_level:.2f}"
                     f"（-{atr_result.dynamic_stop_pct:.1f}%，{atr_result.volatility_level}波动）"
                 )
-        except Exception:
+        except Exception as exc:
+            logger.warning("stock_advisor/analysis.py:_trade_plan failed: %s", exc)
             pass  # ATR是增强特性，失败了用固定止损
         tier_tag = f"[{tier_label}] " if tier_label else ""
         return (
@@ -1428,7 +1431,8 @@ def _safe_pnl_pct(holding: PortfolioHolding) -> Decimal | None:
     try:
         cost = getattr(holding, "cost_price", None)
         current = getattr(holding, "current_price", None)
-    except Exception:
+    except Exception as exc:
+        logger.warning("stock_advisor/analysis.py:_safe_pnl_pct failed: %s", exc)
         return None
     if cost is None or current is None or cost == Decimal("0"):
         return None

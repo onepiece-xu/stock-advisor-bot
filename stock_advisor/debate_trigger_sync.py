@@ -136,8 +136,8 @@ def sync_debate_to_triggers(data_dir: Path, *, dry_run: bool = False) -> list[st
                     if h.get("code", "") == code:
                         qty = int(h.get("quantity", 0))
                         break
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.warning("stock_advisor/debate_trigger_sync.py:sync_debate_to_triggers failed: %s", exc)
 
         if qty <= 0:
             continue
@@ -198,8 +198,8 @@ def sync_debate_to_triggers(data_dir: Path, *, dry_run: bool = False) -> list[st
         try:
             import shutil
             shutil.copy2(plan_path, backup_path)
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.warning("stock_advisor/debate_trigger_sync.py:sync_debate_to_triggers failed: %s", exc)
 
         with open(plan_path, "w") as f:
             json.dump(plan, f, ensure_ascii=False, indent=2)

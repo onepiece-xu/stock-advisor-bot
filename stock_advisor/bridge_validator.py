@@ -414,8 +414,8 @@ def load_state() -> dict:
     if STATE_PATH.exists():
         try:
             return json.loads(STATE_PATH.read_text())
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.warning("stock_advisor/bridge_validator.py:load_state failed: %s", exc)
     return {"validated_hashes": [], "validated_at": None}
 
 
@@ -434,8 +434,8 @@ def _load_block_cooldown() -> dict[str, float]:
     if BLOCK_COOLDOWN_PATH.exists():
         try:
             return json.loads(BLOCK_COOLDOWN_PATH.read_text())
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.warning("stock_advisor/bridge_validator.py:_load_block_cooldown failed: %s", exc)
     return {}
 
 
@@ -497,8 +497,8 @@ def _load_trigger_cooldown() -> dict[str, dict]:
                 elif isinstance(v, dict):
                     normalized[k] = v
             return normalized
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.warning("stock_advisor/bridge_validator.py:_load_trigger_cooldown failed: %s", exc)
     return {}
 
 
@@ -519,7 +519,8 @@ def _format_cash_summary() -> str:
             return ""
         ratio = cash / total * 100
         return f"💰 现金储备：{cash:,.2f} / 总资产{total:,.2f}（{ratio:.0f}%）"
-    except Exception:
+    except Exception as exc:
+        logger.warning("stock_advisor/bridge_validator.py:_format_cash_summary failed: %s", exc)
         return ""
 
 
@@ -540,8 +541,8 @@ def _get_fund_flow_hint(code: str) -> str:
             hint = f"💧 主力{d}{abs(mn):.2f}亿"
             _FUND_FLOW_CACHE[code] = (now, hint)
             return hint
-    except Exception:
-        pass
+    except Exception as exc:
+        logger.warning("stock_advisor/bridge_validator.py:_get_fund_flow_hint failed: %s", exc)
     return ""
 
 
@@ -553,7 +554,8 @@ def _load_holdings_map() -> dict[str, dict]:
     try:
         snap = json.loads(SNAPSHOT_PATH.read_text())
         holdings = snap.get("holdings", []) or snap.get("positions", {}).values()
-    except Exception:
+    except Exception as exc:
+        logger.warning("stock_advisor/bridge_validator.py:_load_holdings_map failed: %s", exc)
         return {}
     result = {}
     for h in holdings:
@@ -611,7 +613,8 @@ def _auto_disable_triggers(keys: set[str]) -> None:
         return
     try:
         plan = json.loads(plan_path.read_text())
-    except Exception:
+    except Exception as exc:
+        logger.warning("stock_advisor/bridge_validator.py:_auto_disable_triggers failed: %s", exc)
         return
 
     triggers = plan.get("triggers", [])
@@ -677,7 +680,8 @@ def _check_triggers() -> list[str]:
 
     try:
         plan = json.loads(plan_path.read_text())
-    except Exception:
+    except Exception as exc:
+        logger.warning("stock_advisor/bridge_validator.py:_check_triggers failed: %s", exc)
         return []
 
     triggers = plan.get("triggers", [])
@@ -957,8 +961,8 @@ def _load_anomaly_cooldown() -> dict[str, float]:
     if ANOMALY_COOLDOWN_PATH.exists():
         try:
             return json.loads(ANOMALY_COOLDOWN_PATH.read_text())
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.warning("stock_advisor/bridge_validator.py:_load_anomaly_cooldown failed: %s", exc)
     return {}
 
 
@@ -996,8 +1000,8 @@ def _fetch_holding_prices_with_chg() -> dict[str, dict]:
                 result[code] = {"price": price, "chg_pct": chg_pct, "name": name}
             except (ValueError, IndexError):
                 continue
-    except Exception:
-        pass
+    except Exception as exc:
+        logger.warning("stock_advisor/bridge_validator.py:_fetch_holding_prices_with_chg failed: %s", exc)
     return result
 
 
@@ -1059,8 +1063,8 @@ def _check_anomalies() -> list[str]:
                         )
                         cooldown[flow_key] = now
                         updated = True
-            except Exception:
-                pass
+            except Exception as exc:
+                logger.warning("stock_advisor/bridge_validator.py:_check_anomalies failed: %s", exc)
 
         if len(alerts) >= MAX_ANOMALIES_PER_RUN:
             break

@@ -357,8 +357,8 @@ def save_trader_feedback(feedbacks: list[TraderFeedbackEntry]) -> None:
                         existing_ids.add(data.get("trade_id", ""))
                     except json.JSONDecodeError:
                         continue
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.warning("stock_advisor/trader_feedback.py:save_trader_feedback failed: %s", exc)
 
     new_count = 0
     try:

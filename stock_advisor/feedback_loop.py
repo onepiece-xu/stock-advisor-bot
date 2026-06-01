@@ -133,7 +133,8 @@ def load_agent_weights() -> dict[str, float]:
         merged = dict(DEFAULT_WEIGHTS)
         merged.update(weights)
         return merged
-    except Exception:
+    except Exception as exc:
+        logger.warning("stock_advisor/feedback_loop.py:load_agent_weights failed: %s", exc)
         return dict(DEFAULT_WEIGHTS)
 
 

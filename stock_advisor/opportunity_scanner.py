@@ -174,7 +174,8 @@ def _fetch_quotes_tencent(codes: list[str]) -> dict[str, dict[str, Any]]:
         except UnicodeDecodeError:
             text = result.stdout.decode("gbk", errors="replace")
         return _parse_tencent_output(text, codes)
-    except Exception:
+    except Exception as exc:
+        logger.warning("stock_advisor/opportunity_scanner.py:_fetch_quotes_tencent failed: %s", exc)
         logger.exception("Tencent quote fetch exception")
         return {}
 
@@ -214,7 +215,8 @@ def _parse_tencent_output(text: str, codes: list[str]) -> dict[str, dict[str, An
                 "turnover_rate": _safe_decimal(parts[38]),
                 "pe": _safe_decimal(parts[39]),
             }
-        except Exception:
+        except Exception as exc:
+            logger.warning("stock_advisor/opportunity_scanner.py:_parse_tencent_output failed: %s", exc)
             continue
     return results
 
@@ -222,7 +224,8 @@ def _parse_tencent_output(text: str, codes: list[str]) -> dict[str, dict[str, An
 def _safe_decimal(s: str) -> Decimal:
     try:
         return Decimal(s.strip() or "0")
-    except Exception:
+    except Exception as exc:
+        logger.warning("stock_advisor/opportunity_scanner.py:_safe_decimal failed: %s", exc)
         return Decimal("0")
 
 
@@ -269,7 +272,8 @@ def _score_recent_news(code: str, name: str, payload: dict[str, Any]) -> tuple[D
     try:
         quote = _build_news_quote(code, name, payload)
         items = fetch_stock_news(quote, limit=3)
-    except Exception:
+    except Exception as exc:
+        logger.warning("stock_advisor/opportunity_scanner.py:_score_recent_news failed: %s", exc)
         logger.exception("News scoring failed for %s", code)
         return Decimal("0"), []
 
@@ -337,7 +341,8 @@ def _fetch_daily_closes(code: str, ndays: int = 60) -> list[Decimal]:
             rows = data.get("data", {}).get(symbol, {}).get("day", [])
         # Each row: [date, open, close, high, low, volume]
         return [_safe_decimal(r[2]) for r in rows if len(r) >= 3]
-    except Exception:
+    except Exception as exc:
+        logger.warning("stock_advisor/opportunity_scanner.py:_fetch_daily_closes failed: %s", exc)
         return []
 
 
@@ -438,8 +443,8 @@ def scan(
     try:
         from .sector_strength import fetch_sector_boards
         sector_boards = fetch_sector_boards(top_n=60)
-    except Exception:
-        pass
+    except Exception as exc:
+        logger.warning("stock_advisor/opportunity_scanner.py:scan failed: %s", exc)
 
     candidates: list[Candidate] = []
 
@@ -512,8 +517,8 @@ def scan(
                     score += Decimal(str(boost))
                     if boost > 0:
                         flags.append(f"📈 板块走强(+{boost})")
-            except Exception:
-                pass
+            except Exception as exc:
+                logger.warning("stock_advisor/opportunity_scanner.py:scan failed: %s", exc)
 
         score = max(Decimal("0"), min(score, Decimal("100")))
         if score < min_candidate_score:
@@ -564,7 +569,8 @@ def suggest_position(config: AppConfig, current_price: Decimal, score: Decimal |
     try:
         if config.snapshot_path.exists():
             snapshot = load_portfolio_snapshot(config.snapshot_path)
-    except Exception:
+    except Exception as exc:
+        logger.warning("stock_advisor/opportunity_scanner.py:suggest_position failed: %s", exc)
         logger.exception("Failed to load portfolio snapshot for position sizing")
 
     total_assets = getattr(snapshot, "total_assets", Decimal("0")) or Decimal("0")

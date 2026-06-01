@@ -81,15 +81,16 @@ def build_close_review(config: AppConfig, *, trade_date: date | None = None) -> 
         breadth = format_breadth_md(codes)
         if breadth.strip():
             body += f"\n\n{breadth}"
-    except Exception:
-        pass
+    except Exception as exc:
+        logger.warning("stock_advisor/review.py:build_close_review failed: %s", exc)
 
     # ── Signal accuracy tracking ──
     try:
         accuracy_stats = evaluate_signal_accuracy(days_lookback=3)
         accuracy_report = format_accuracy_report(accuracy_stats)
         body += f"\n\n{accuracy_report}"
-    except Exception:
+    except Exception as exc:
+        logger.warning("stock_advisor/review.py:build_close_review failed: %s", exc)
         pass  # Non-critical — don't break the review for signal tracking
 
     # ── Feedback loop: evaluate debate accuracy + update agent weights ──
@@ -101,7 +102,8 @@ def build_close_review(config: AppConfig, *, trade_date: date | None = None) -> 
             body += f"\n\n🔄 **Agent反馈回路**: 今日辩论{len(feedbacks)}条，命中{correct}条（{correct/len(feedbacks)*100:.0f}%），权重已自动更新。"
         else:
             body += "\n\n🔄 **Agent反馈回路**: 今日无辩论记录可供验证。"
-    except Exception:
+    except Exception as exc:
+        logger.warning("stock_advisor/review.py:build_close_review failed: %s", exc)
         pass  # Non-critical
 
     # ── Trader feedback: compare user's real trades against system signals ──
@@ -109,7 +111,8 @@ def build_close_review(config: AppConfig, *, trade_date: date | None = None) -> 
         trader_report = run_trader_feedback()
         if trader_report:
             body += f"\n\n{trader_report}"
-    except Exception:
+    except Exception as exc:
+        logger.warning("stock_advisor/review.py:build_close_review failed: %s", exc)
         pass  # Non-critical
 
     # ── Threshold optimization: grid-search against historical signals ──
@@ -128,7 +131,8 @@ def build_close_review(config: AppConfig, *, trade_date: date | None = None) -> 
             applied = auto_apply_if_better("config.yaml", min_gap_pct=5.0)
             if applied:
                 body += f"\n\n⚡ **阈值已自动更新**: buy={applied['old_buy']}→{applied['new_buy']} hold={applied['old_hold']}→{applied['new_hold']}（命中率+{applied['gap_pct']:.1f}%）"
-    except Exception:
+    except Exception as exc:
+        logger.warning("stock_advisor/review.py:build_close_review failed: %s", exc)
         pass  # Non-critical
 
     # ── v1.55.4: Debate→Trigger sync ──
@@ -140,7 +144,8 @@ def build_close_review(config: AppConfig, *, trade_date: date | None = None) -> 
             body += "\n\n🎯 **辩论→触发单同步**:"
             for act in sync_actions:
                 body += f"\n  {act}"
-    except Exception:
+    except Exception as exc:
+        logger.warning("stock_advisor/review.py:build_close_review failed: %s", exc)
         pass  # Non-critical
 
     # ── Auto sell-plan & profit trigger sync through unified state model ──
@@ -160,7 +165,8 @@ def build_close_review(config: AppConfig, *, trade_date: date | None = None) -> 
                 body += f"\n\n💰 **止盈触发同步**: 为{created_profit}只浮盈持仓自动创建止盈触发单"
             if created_exit > 0:
                 body += f"\n\n🎯 **卖点计划同步**: 为{created_exit}只弱势持仓自动创建计划卖点触发单"
-    except Exception:
+    except Exception as exc:
+        logger.warning("stock_advisor/review.py:build_close_review failed: %s", exc)
         pass  # Non-critical
 
     # ── v1.55.9: Attach proactive opportunity scan to close review ──
@@ -196,13 +202,15 @@ def build_close_review(config: AppConfig, *, trade_date: date | None = None) -> 
                 if top_flags:
                     line += f" | {top_flags}"
                 body += line
-    except Exception:
+    except Exception as exc:
+        logger.warning("stock_advisor/review.py:build_close_review failed: %s", exc)
         pass  # Non-critical
 
     # ── v1.55.17: Validate proactive opportunities against next-day/day-3 outcomes ──
     try:
         body += "\n\n" + render_recent_opportunity_validation(conn, config.review.data_dir, as_of_date=trade_date)
-    except Exception:
+    except Exception as exc:
+        logger.warning("stock_advisor/review.py:build_close_review failed: %s", exc)
         pass  # Non-critical
 
     saved_path = _save_review(config.review.data_dir, trade_date, body)
@@ -267,7 +275,8 @@ def _safe_market_context(config: AppConfig) -> dict | None:
             "sector_total": max(snap.get("sector_count", 1), 1),
             "temperature": snap.get("temperature", "无数据"),
         }
-    except Exception:
+    except Exception as exc:
+        logger.warning("stock_advisor/review.py:_safe_market_context failed: %s", exc)
         return None
 
 
@@ -362,8 +371,8 @@ def _render_review_body(config: AppConfig, trade_date: date, items: list[dict], 
             if exit_lines:
                 lines.extend(["", "【卖点计划】"])
                 lines.extend(exit_lines)
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.warning("stock_advisor/review.py:_render_review_body failed: %s", exc)
         # Check for stale trading triggers
         try:
             snapshot = load_portfolio_snapshot(portfolio_path)
@@ -373,7 +382,8 @@ def _render_review_body(config: AppConfig, trade_date: date, items: list[dict], 
                 lines.extend(["", "【⚠️ 过期触发单提醒】"])
                 lines.extend(stale_warnings)
                 lines.append("建议用 /plan 命令或直接编辑 trading-plan.json 更新触发区间。")
-        except Exception:
+        except Exception as exc:
+            logger.warning("stock_advisor/review.py:_render_review_body failed: %s", exc)
             pass  # Non-critical — don't break the review for this
 
     # ── Tomorrow's action plan & orphan trigger check ──
@@ -418,7 +428,8 @@ def _render_review_body(config: AppConfig, trade_date: date, items: list[dict], 
         lines.append("以上为辅助参考，不构成投资建议。请根据明日盘前实际情况做出决策。")
         # Save structured plan record for next-day comparison
         _save_plan_record(config.review.data_dir, trade_date, snapshot, triggers, item_map, config)
-    except Exception:
+    except Exception as exc:
+        logger.warning("stock_advisor/review.py:_render_review_body failed: %s", exc)
         pass  # Non-critical
 
     # ── Friday weekly wrap + cash deployment ──
@@ -437,8 +448,8 @@ def _render_review_body(config: AppConfig, trade_date: date, items: list[dict], 
                         f" | 持仓盈亏 {_signed_decimal(pnl)}%"
                         f" | 距成本 {_fmt_decimal(abs(holding.current_price - holding.cost_price))}"
                     )
-            except Exception:
-                pass
+            except Exception as exc:
+                logger.warning("stock_advisor/review.py:_render_review_body failed: %s", exc)
         lines.append("- 周末关注：周末政策消息、外围市场走势、下周财经日历")
         lines.append("- 周一盘前简报将更新下周关键价位")
 
@@ -457,8 +468,8 @@ def _render_review_body(config: AppConfig, trade_date: date, items: list[dict], 
                     lines.append("  3. 单票仓位不超过 35%")
                     lines.append("  4. 不补仓深套股（-30%+）")
                     lines.append("  审视现有持仓，优先加仓趋势向好、浮盈的标的")
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.warning("stock_advisor/review.py:_render_review_body failed: %s", exc)
 
     lines.extend(["", "【结论】"])
     if avg_score is not None and avg_score >= Decimal("58"):
@@ -512,8 +523,8 @@ def _render_review_body(config: AppConfig, trade_date: date, items: list[dict], 
                 lines.append("【集中度风险应对】")
                 lines.extend(conc_risks)
 
-    except Exception:
-        pass
+    except Exception as exc:
+        logger.warning("stock_advisor/review.py:_render_review_body failed: %s", exc)
 
     lines.append(f"- 下次开盘：{next_session_str()}")
     lines.append("- 仅供参考，不构成投资建议。")

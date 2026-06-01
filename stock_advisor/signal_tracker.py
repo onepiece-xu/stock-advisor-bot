@@ -136,8 +136,8 @@ def _fetch_latest_price(symbol: str) -> Decimal | None:
         price = data.get("f43")
         if price and price != "-":
             return Decimal(str(price))
-    except Exception:
-        pass
+    except Exception as exc:
+        logger.warning("stock_advisor/signal_tracker.py:_fetch_latest_price failed: %s", exc)
     return None
 
 

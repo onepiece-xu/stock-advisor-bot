@@ -36,8 +36,8 @@ def _load_deepseek_config():
             cfg = load_config(str(config_path))
             _DEEPSEEK_CONFIG = cfg.deepseek
             return _DEEPSEEK_CONFIG
-    except Exception:
-        pass
+    except Exception as exc:
+        logger.warning("stock_advisor/llm_analyst.py:_load_deepseek_config failed: %s", exc)
     # Fallback: env vars (for container/CI)
     import os
     api_key = os.environ.get("DEEPSEEK_API_KEY", "")
@@ -93,7 +93,8 @@ def _load_strategies() -> dict[str, str]:
                 data = yaml.safe_load(f.read_text(encoding="utf-8"))
                 if data and "instructions" in data:
                     strategies[data.get("name", f.stem)] = data["instructions"]
-            except Exception:
+            except Exception as exc:
+                logger.warning("stock_advisor/llm_analyst.py:_load_strategies failed: %s", exc)
                 logger.warning("Failed to load strategy: %s", f)
     _cached_strategies = strategies
     return strategies

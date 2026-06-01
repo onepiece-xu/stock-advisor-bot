@@ -383,8 +383,8 @@ def debate(
                 reasoning=pre_ruling.reasoning,
                 agent_votes={o.role: o.action for o in opinions},
             )
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.warning("stock_advisor/multi_agent.py:debate failed: %s", exc)
         elapsed = time.time() - t0
         logger.info(
             "Multi-agent debate short-circuited in %.1fs: action=%s qty=%d confidence=%.2f",
@@ -444,8 +444,8 @@ def debate(
                 reasoning=decision.reasoning,
                 agent_votes={o.role: o.action for o in opinions},
             )
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.warning("stock_advisor/multi_agent.py:debate failed: %s", exc)
 
         elapsed = time.time() - t0
         logger.info("Multi-agent debate complete in %.1fs: action=%s qty=%d confidence=%.2f", elapsed, decision.action, decision.quantity, decision.confidence)
@@ -545,7 +545,7 @@ def _majority_vote(opinions: list[AgentOpinion], name: str, symbol: str, current
                 reasoning=decision.reasoning,
                 agent_votes={o.role: o.action for o in opinions},
             )
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.warning("stock_advisor/multi_agent.py:_majority_vote failed: %s", exc)
 
     return decision

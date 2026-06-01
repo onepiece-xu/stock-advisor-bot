@@ -677,11 +677,21 @@ class MonitorRuntime:
                 outbox_path = Path("data/outbox.jsonl")
                 if outbox_path.exists() and outbox_path.stat().st_size > 0:
                     outbox_lines = outbox_path.read_text().strip().split("\n")
-                    if len(outbox_lines) > 3:
-                        logger.warning(
-                            "Outbox backlog detected: %d items accumulated — cron bridge may be stalled",
-                            len(outbox_lines),
-                        )
+                    stale_count = len(outbox_lines)
+                    if stale_count > 3:
+                        alert = f"⚠️ Outbox 积压 {stale_count} 条，cron bridge 可能卡死，请检查 bridge 进程"
+                        logger.warning(alert)
+                        # 主动推飞书通知，不依赖 cron bridge 自身
+                        try:
+                            deliver_feishu_message(
+                                self.config.monitor.notification.feishu,
+                                "⚠️ Outbox 积压告警",
+                                alert,
+                                app_id=self.config.feishu_bot.app_id,
+                                app_secret=self.config.feishu_bot.app_secret,
+                            )
+                        except Exception:
+                            pass
                 flush_outbox()  # 双保险：不等 cron，立即推送
             except Exception as exc:  # noqa: BLE001
                 logger.exception("Close review delivery failed error=%s", exc)

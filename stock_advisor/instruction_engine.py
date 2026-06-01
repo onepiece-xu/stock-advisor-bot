@@ -13,6 +13,7 @@ Output: a single IntradayInstruction per stock.
 """
 
 from __future__ import annotations
+from .advice import validate_lot_size
 
 from dataclasses import dataclass, field
 from decimal import Decimal
@@ -73,7 +74,7 @@ def resolve_instruction(
         instr.reason = f"风控：浮亏{holding_pnl_pct:.1f}%触发硬止损，优先减仓"
         instr.priority = 100
         instr.source = "risk_guard"
-        instr.quantity = max(100, (holding_quantity // 3 // 100) * 100)
+        instr.quantity = validate_lot_size(holding_quantity // 3)
         return instr
 
     # ── Step 2: Debate override (highest signal priority) ──
@@ -87,7 +88,9 @@ def resolve_instruction(
     # ── Step 3: Trigger hit ──
     if trigger_hit_action:
         instr.action = trigger_hit_action
-        instr.quantity = trigger_hit_quantity
+        validated = validate_lot_size(trigger_hit_quantity)
+        # 验证后为 0（<100 股）时退回原始值，不静默丢弃
+        instr.quantity = validated if validated > 0 else trigger_hit_quantity
         if trigger_hit_action == "sell":
             instr.reason = "触发卖出区间，按计划执行"
             instr.priority = 80

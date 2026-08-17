@@ -8,7 +8,11 @@ from __future__ import annotations
 
 import json
 from dataclasses import dataclass, asdict
-from datetime import datetime, date
+import logging
+from datetime import date
+logger = logging.getLogger(__name__)
+from time import time
+from datetime import date
 from decimal import Decimal
 from pathlib import Path
 from zoneinfo import ZoneInfo
@@ -267,8 +271,8 @@ class TradeJournal:
             try:
                 from datetime import date
                 holding_days = (date.fromisoformat(sell_date) - date.fromisoformat(buy_date)).days
-            except Exception:
-                pass
+            except Exception as exc:
+                logger.warning("Failed to compute holding_days: %s", exc)
 
             # Auto-verdict
             if pnl_pct > 0:

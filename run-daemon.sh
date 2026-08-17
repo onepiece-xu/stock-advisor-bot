@@ -1,6 +1,13 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+# Load API keys from Hermes env
+if [[ -f "/root/.hermes/.env" ]]; then
+  set -a
+  source /root/.hermes/.env
+  set +a
+fi
+
 BASE_DIR="$(cd "$(dirname "$0")" && pwd)"
 LOG_DIR="$BASE_DIR/logs"
 PID_DIR="$BASE_DIR/run"

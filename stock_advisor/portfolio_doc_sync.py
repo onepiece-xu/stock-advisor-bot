@@ -92,6 +92,14 @@ def sync_snapshot_from_doc(
     if not markdown_path.exists():
         return False
 
+    # 快速守卫：快照比文档新 → 无需同步（避免每 tick 解析陈旧文档、刷校验 warning）
+    if not force and snapshot_path.exists():
+        try:
+            if snapshot_path.stat().st_mtime > markdown_path.stat().st_mtime:
+                return False
+        except OSError:
+            pass
+
     text = markdown_path.read_text(encoding="utf-8")
     snapshot = parse_latest_snapshot(text)
 

@@ -161,18 +161,16 @@ def _fetch_quotes_tencent(codes: list[str]) -> dict[str, dict[str, Any]]:
     url = f"http://qt.gtimg.cn/q={','.join(symbols)}"
 
     try:
-        result = subprocess.run(
-            ["curl", "-sL", "--max-time", "10", url],
-            capture_output=True, timeout=12,
-        )
-        if result.returncode != 0:
-            logger.warning("Tencent quote fetch failed: exit=%d", result.returncode)
+        from .platform_compat import http_get_bytes
+        data = http_get_bytes(url, timeout=12)
+        if not data:
+            logger.warning("Tencent quote fetch failed: empty response")
             return {}
         # Tencent API returns GBK-encoded content
         try:
-            text = result.stdout.decode("utf-8")
+            text = data.decode("utf-8")
         except UnicodeDecodeError:
-            text = result.stdout.decode("gbk", errors="replace")
+            text = data.decode("gbk", errors="replace")
         return _parse_tencent_output(text, codes)
     except Exception as exc:
         logger.warning("stock_advisor/opportunity_scanner.py:_fetch_quotes_tencent failed: %s", exc)
@@ -329,13 +327,11 @@ def _fetch_daily_closes(code: str, ndays: int = 60) -> list[Decimal]:
         f"?param={symbol},day,,,{ndays},qfq"
     )
     try:
-        result = subprocess.run(
-            ["curl", "-sL", "--max-time", "8", url],
-            capture_output=True, timeout=10,
-        )
-        if result.returncode != 0 or not result.stdout.strip():
+        from .platform_compat import http_get_text
+        text = http_get_text(url, timeout=10, encoding="utf-8")
+        if not text:
             return []
-        data = json.loads(result.stdout.decode("utf-8", errors="replace"))
+        data = json.loads(text)
         rows = data.get("data", {}).get(symbol, {}).get("qfqday", [])
         if not rows:
             rows = data.get("data", {}).get(symbol, {}).get("day", [])

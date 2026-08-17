@@ -64,15 +64,11 @@ STOCK_SECTORS: dict[str, list[str]] = {
 
 def _fetch_tencent_batch(symbols: list[str]) -> str:
     url = "http://qt.gtimg.cn/q=" + ",".join(symbols)
-    try:
-        result = subprocess.run(
-            f"curl -s '{url}' --max-time 15 | iconv -f GBK -t UTF-8 2>/dev/null || curl -s '{url}' --max-time 15",
-            shell=True, capture_output=True, text=True, timeout=20,
-        )
-        return result.stdout
-    except Exception as e:
-        logger.warning(f"腾讯板块数据获取失败: {e}")
-        return ""
+    from .platform_compat import http_get_text
+    raw = http_get_text(url, timeout=20, encoding="gbk")
+    if not raw:
+        logger.warning("腾讯板块数据获取失败")
+    return raw
 
 
 def _parse_dec(val: str) -> Decimal:
@@ -244,8 +240,8 @@ def format_breadth_md(stock_codes: Optional[list[str]] = None) -> str:
     try:
         from .chrome_scraper import get_market_breadth_cdp
         cdp_breadth = get_market_breadth_cdp()
-    except Exception:
-        pass
+    except Exception as exc:
+        logger.warning("Chrome CDP market breadth fetch failed: %s", exc)
 
     # 2. 板块数据
     sectors = get_sectors()

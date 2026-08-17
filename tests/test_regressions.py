@@ -461,7 +461,13 @@ class BriefingRegressionTests(unittest.TestCase):
                 )
                 subprocess_run_mock.return_value = SimpleNamespace(stdout="123\n")
                 from stock_advisor.cli import run_status
-                run_status("config.yaml")
+                # run_status 用相对 cwd 读 data/briefing/latest.json —— chdir 到临时目录让 fixture 生效
+                old_cwd = os.getcwd()
+                os.chdir(str(root))
+                try:
+                    run_status("config.yaml")
+                finally:
+                    os.chdir(old_cwd)
 
             rendered = output.getvalue()
             self.assertIn("最近盘前简报：2026-05-28（2026-05-28T14:22）", rendered)
@@ -515,7 +521,7 @@ class BridgeValidatorRegressionTests(unittest.TestCase):
 
             spec = importlib.util.spec_from_file_location(
                 "bridge_validator_under_test",
-                Path(__file__).resolve().parent.parent / "scripts" / "bridge_validator.py",
+                Path(__file__).resolve().parent.parent / "stock_advisor" / "bridge_validator.py",
             )
             self.assertIsNotNone(spec)
             self.assertIsNotNone(spec.loader)
@@ -583,7 +589,7 @@ class BridgeValidatorRegressionTests(unittest.TestCase):
 
             spec = importlib.util.spec_from_file_location(
                 "bridge_validator_under_test",
-                Path(__file__).resolve().parent.parent / "scripts" / "bridge_validator.py",
+                Path(__file__).resolve().parent.parent / "stock_advisor" / "bridge_validator.py",
             )
             self.assertIsNotNone(spec)
             self.assertIsNotNone(spec.loader)
@@ -782,7 +788,9 @@ class AnalysisRegressionTests(unittest.TestCase):
         self.assertNotIn("清理", decision.trade_size_hint)
         self.assertNotEqual(decision.action, "avoid")
 
-    def test_deep_losing_with_breaking_structure_still_allows_buy_when_pnl_not_deep_loss(self) -> None:
+    def test_deep_losing_with_breaking_structure_reduces_when_pnl_not_deep_loss(self) -> None:
+        # 2026-05 保守策略后：浮亏-14.29% 且现价已跌破固定止损价（成本-7%=32.55），
+        # 止损线以下禁止加仓 —— 行为从 buy 变更为 reduce（止损价下还买入是灾难）
         config = load_config(Path(__file__).resolve().parent.parent / "config.yaml").monitor
         quote = self._quote("30")
         metrics = self._metrics(
@@ -808,8 +816,106 @@ class AnalysisRegressionTests(unittest.TestCase):
             portfolio_total_assets=Decimal("50000"),
         )
 
-        self.assertEqual(decision.action, "buy")
+        self.assertEqual(decision.action, "reduce")
         self.assertTrue(len(decision.risk_flags) > 0)
+        self.assertIn("硬止损", decision.risk_flags[-1])
+
+    def test_bounce_hold_guard_suppresses_reduce_when_structure_intact(self) -> None:
+        # v1.56.0：深套但反弹结构完好（价≥MA20 + RSI修复 + 未破前低）→ 硬止损 reduce 被抑制为 hold
+        # 回测实证：反弹初期减仓 3日方向正确率 0%（卖飞），支撑未破时让反弹走完
+        config = load_config(Path(__file__).resolve().parent.parent / "config.yaml").monitor
+        quote = self._quote("26.49")
+        metrics = self._metrics(
+            rsi14=Decimal("58"),
+            breakdown_below_prev30_low_pct=Decimal("0.05"),  # 未深破前低
+            volume_ratio=Decimal("0.90"),
+        )
+        holding = SimpleNamespace(quantity=1300, cost_price=Decimal("31.867"), current_price=Decimal("26.49"))
+
+        decision = _build_decision_signal(
+            quote,
+            metrics,
+            240,
+            holding,
+            config,
+            None,
+            is_volatile_period=False,
+            portfolio_cash_ratio=Decimal("0.07"),
+            sector_boards=None,
+            portfolio_position_ratio=Decimal("0.89"),
+            daily_ma20=Decimal("25.85"),  # 现价 ≥ MA20
+            daily_ma60=Decimal("27.5"),
+            daily_rsi14=Decimal("58.8"),  # 修复区
+            portfolio_total_assets=Decimal("38598"),
+        )
+
+        self.assertEqual(decision.action, "hold")
+        self.assertTrue(any("反弹抑制" in flag for flag in decision.risk_flags), decision.risk_flags)
+
+    def test_bounce_hold_guard_does_not_suppress_when_breakdown(self) -> None:
+        # v1.56.0：结构破位（深破前30日低点）不算反弹 → 维持 reduce（硬止损优先）
+        config = load_config(Path(__file__).resolve().parent.parent / "config.yaml").monitor
+        quote = self._quote("26.49")
+        metrics = self._metrics(
+            breakdown_below_prev30_low_pct=Decimal("0.35"),  # 深破前低
+            volume_ratio=Decimal("1.50"),
+        )
+        holding = SimpleNamespace(quantity=1300, cost_price=Decimal("31.867"), current_price=Decimal("26.49"))
+
+        decision = _build_decision_signal(
+            quote,
+            metrics,
+            240,
+            holding,
+            config,
+            None,
+            is_volatile_period=False,
+            portfolio_cash_ratio=Decimal("0.07"),
+            sector_boards=None,
+            portfolio_position_ratio=Decimal("0.89"),
+            daily_ma20=Decimal("25.85"),
+            daily_ma60=Decimal("27.5"),
+            daily_rsi14=Decimal("45"),
+            portfolio_total_assets=Decimal("38598"),
+        )
+
+        self.assertEqual(decision.action, "reduce")
+        self.assertTrue(any("硬止损" in flag for flag in decision.risk_flags), decision.risk_flags)
+
+    def test_volume_attack_boost_only_when_above_ma20_with_volume(self) -> None:
+        # v1.56.1：放量上攻加分（价>MA20 + 量比≥1.2 + 收阳 + 非bear）——回测实证唯一正期望买点
+        config = load_config(Path(__file__).resolve().parent.parent / "config.yaml").monitor
+        quote = self._quote("30")  # change_percent +1.69% 收阳
+        # 压分到中等区间（76/90）：放量上攻 +14 成为 push 过 80 阈值（buy 区）的决定性因素
+        metrics = self._metrics(
+            volume_ratio=Decimal("0.90"), bias_to_ma15=Decimal("0.0"),
+            breakout_above_prev30_high_pct=Decimal("0.0"),
+            relative_strength_pct=Decimal("-1.0"),
+        )
+        holding = SimpleNamespace(quantity=100, cost_price=Decimal("28"), current_price=Decimal("30"))
+
+        d_attack = _build_decision_signal(
+            quote, metrics, 240, holding, config, None,
+            is_volatile_period=False, portfolio_cash_ratio=Decimal("0.50"),
+            sector_boards=None, portfolio_position_ratio=Decimal("0.30"),
+            daily_ma20=Decimal("29.5"), daily_ma60=Decimal("31"),  # neutral regime, 价>MA20
+            daily_vol_ratio=Decimal("1.50"),
+            portfolio_total_assets=Decimal("50000"),
+        )
+        d_quiet = _build_decision_signal(
+            quote, metrics, 240, holding, config, None,
+            is_volatile_period=False, portfolio_cash_ratio=Decimal("0.50"),
+            sector_boards=None, portfolio_position_ratio=Decimal("0.30"),
+            daily_ma20=Decimal("29.5"), daily_ma60=Decimal("31"),
+            daily_vol_ratio=Decimal("1.00"),  # 量比不足, 不加分
+            portfolio_total_assets=Decimal("50000"),
+        )
+        # 放量上攻触发: 加分把分数推入 buy 区（原buy）；量比不足: 保持 hold 区
+        self.assertTrue(any("放量上攻" in r for r in d_attack.rationale), d_attack.rationale)
+        self.assertFalse(any("放量上攻" in r for r in d_quiet.rationale), d_quiet.rationale)
+        self.assertTrue(any("原buy" in r for r in d_attack.rationale), d_attack.rationale)
+        self.assertFalse(any("原buy" in r for r in d_quiet.rationale), d_quiet.rationale)
+        self.assertGreater(d_attack.score, d_quiet.score)
 
     @staticmethod
     def _quote(price: str) -> StockQuote:

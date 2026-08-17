@@ -1,2 +1,7 @@
+# 运行时依赖
 PyYAML==6.0.2
 requests==2.32.3
+websocket-client>=1.6.0   # chrome_scraper 需要
+
+# 测试依赖
+pytest>=8.0

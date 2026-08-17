@@ -18,3 +18,16 @@ data/codex_outbox.jsonl
 data/market_overview_cache.json
 data/portfolio_doc_latest.md
 *.bak
+*.bak*
+*.optbak
+
+# 运行时产物
+data/backups/
+data/cron_runs/
+data/feedback/
+data/bridge_*_cooldown.json
+data/feishu_push_map*.md
+data/signal_quality.json
+close_*.xml
+portfolio_*.md
+portfolio_*.xml

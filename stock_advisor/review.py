@@ -32,6 +32,23 @@ from .opportunity_journal import record_daily_opportunities, render_recent_oppor
 
 logger = get_logger(__name__)
 
+_QUALITY_CACHE: dict | None = None
+
+
+def _load_signal_quality() -> dict:
+    """每票历史信号质量 {code6: {buy: {n, ret5, win5}, ...}}，供【明日机会】标注。
+    数据由 scripts/backtest_daily_tencent.py --quality-json 生成。"""
+    global _QUALITY_CACHE
+    if _QUALITY_CACHE is not None:
+        return _QUALITY_CACHE
+    try:
+        p = Path(__file__).resolve().parent.parent / "data" / "signal_quality.json"
+        data = json.loads(p.read_text(encoding="utf-8"))
+        _QUALITY_CACHE = {k[-6:]: v for k, v in data.items()}
+    except Exception:  # noqa: BLE001 —— 无质量数据时标注降级为空
+        _QUALITY_CACHE = {}
+    return _QUALITY_CACHE
+
 
 @dataclass(slots=True)
 class ReviewArtifact:
@@ -401,6 +418,44 @@ def _render_review_body(config: AppConfig, trade_date: date, items: list[dict], 
                 lines.extend(["", "【🧹 已自动清理过期触发单】"])
                 for t in orphan_triggers:
                     lines.append(f"- ✅ 已移除 {t.code} {t.name}（已清仓，触发单 {t.action} {t.quantity}股 @ {t.price_min}-{t.price_max}）")
+        # ── v1.57.0: 明日机会 (非持仓 buy/高分票) — 上班族不盯盘, 收盘统一给入场价 ──
+        try:
+            opp_candidates = [
+                it for it in items
+                if it["code"] not in active_codes
+                and it.get("score") is not None and float(it["score"]) >= 80
+            ]
+            if opp_candidates:
+                lines.extend(["", "【明日机会】"])
+                qmap = _load_signal_quality()
+                for it in opp_candidates[:5]:
+                    price = Decimal(str(it.get("current_price") or 0))
+                    if price <= 0:
+                        continue
+                    entry_lo = (price * Decimal("0.985")).quantize(Decimal("0.01"))
+                    entry_hi = (price * Decimal("0.995")).quantize(Decimal("0.01"))
+                    abort = (price * Decimal("0.97")).quantize(Decimal("0.01"))
+                    sc = float(it["score"])
+                    tier = "确信仓" if sc >= 92 else ("标准仓" if sc >= 86 else "试探仓")
+                    reason = (it.get("rationale") or [""])[0]
+                    if len(reason) > 40:
+                        reason = reason[:37] + "..."
+                    lines.append(
+                        f"- 🟢 {it['name']}({it['code']}) 今日{_signed(it['change_percent'])}% 分{sc:.0f} {tier}"
+                    )
+                    lines.append(
+                        f"  入场: 回踩 {entry_lo}-{entry_hi} 挂单 | 放弃: 高开>3% 或 破 {abort} | {reason}"
+                    )
+                    # v1.57.1: 历史信号质量标注 (backtest 回放 120 日)
+                    bq = qmap.get(it["code"], {}).get("buy")
+                    if bq and bq.get("n", 0) > 0:
+                        tag = f"📊 历史buy信号{bq['n']}次 5日{bq['ret5']:+.2f}% 胜率{bq['win5']}%"
+                        if bq["ret5"] <= 0:
+                            tag = f"⚠️ {tag}（该票buy信号历史负期望，谨慎）"
+                        lines.append(f"  {tag}")
+        except Exception as exc:
+            logger.warning("review.py 明日机会 section failed: %s", exc)
+
         # Tomorrow's key levels
         lines.extend(["", "【明日操作计划】"])
         for holding in snapshot.holdings:

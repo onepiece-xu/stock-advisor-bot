@@ -187,14 +187,10 @@ def get_stock_financials(codes: list[str]) -> dict[str, dict]:
     symbols = ",".join(codes)
     url = TENCENT_QUOTE_URL.format(symbols=symbols)
 
-    try:
-        result = subprocess.run(
-            f"curl -s '{url}' | iconv -f GBK -t UTF-8 2>/dev/null || curl -s '{url}'",
-            shell=True, capture_output=True, text=True, timeout=15,
-        )
-        raw = result.stdout
-    except Exception as e:
-        logger.warning(f"腾讯行情获取失败: {e}")
+    from .platform_compat import http_get_text
+    raw = http_get_text(url, timeout=15, encoding="gbk")
+    if not raw:
+        logger.warning("腾讯行情获取失败")
         return {}
 
     out = {}

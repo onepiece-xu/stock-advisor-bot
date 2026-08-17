@@ -1,37 +1,49 @@
 {
-    "tradeDate": "2026-05-21",
-    "totalAssets": 45730.07,
-    "cash": 16945.07,
-    "totalPnl": -1365.79,
-    "holdings": [
-        {
-            "name": "中国卫通", "code": "601698",
-            "quantity": 500, "costPrice": 35.12, "currentPrice": 33.29
-        },
-        {
-            "name": "中兴通讯", "code": "000063",
-            "quantity": 200, "costPrice": 37.29, "currentPrice": 35.51
-        },
-        {
-            "name": "启明星辰", "code": "002439",
-            "quantity": 100, "costPrice": 16.00, "currentPrice": 15.29
-        }
-    ],
-    "accounts": {
-        "兴业2455": {
-            "totalAssets": 10209.00, "cash": 0.00, "pnl": -1050.06,
-            "holdings": {
-                "601698": { "quantity": 200, "costPrice": 36.783 },
-                "000063": { "quantity": 100, "costPrice": 39.029 }
-            }
-        },
-        "东吴": {
-            "totalAssets": 35521.07, "cash": 16945.07, "pnl": -315.73,
-            "holdings": {
-                "601698": { "quantity": 300, "costPrice": 34.017 },
-                "000063": { "quantity": 100, "costPrice": 35.55 },
-                "002439": { "quantity": 100, "costPrice": 16.00 }
-            }
-        }
-    }
+ "tradeDate": "2026-08-14",
+ "updated": "2026-08-16T09:30:00+08:00",
+ "source": "东吴证券APP 8/14收盘截图对账（用户8/16发图）；卫通期间补仓200股@~29.52，1100→1300股，成本32.293→31.867",
+ "totalAssets": 38598.33,
+ "cash": 2769.33,
+ "withdrawable": 2769.33,
+ "totalMarketValue": 35829.0,
+ "totalPnl": -7226.84,
+ "dailyPnl": 270.0,
+ "dailyPnlPct": 0.007,
+ "positionRatio": 0.928,
+ "holdings": [
+  {
+   "name": "中国卫通",
+   "code": "601698",
+   "quantity": 1300,
+   "available": 1300,
+   "costPrice": 31.867,
+   "currentPrice": 26.49,
+   "marketValue": 34437.0,
+   "pnl": -7013.14,
+   "pnlPct": -0.16929
+  },
+  {
+   "name": "启明星辰",
+   "code": "002439",
+   "quantity": 100,
+   "available": 100,
+   "costPrice": 16.0,
+   "currentPrice": 13.92,
+   "marketValue": 1392.0,
+   "pnl": -213.7,
+   "pnlPct": -0.13356
+  }
+ ],
+ "quotes": {
+  "601698": {
+   "close": 26.49,
+   "prevClose": 26.27,
+   "chgPct": 0.0084
+  },
+  "002439": {
+   "close": 13.92,
+   "prevClose": 14.08,
+   "chgPct": -0.0114
+  }
+ }
 }

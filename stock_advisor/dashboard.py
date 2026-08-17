@@ -29,24 +29,15 @@ logger = logging.getLogger(__name__)
 
 def _tencent_quote_raw(codes: list[str]) -> dict[str, dict]:
     """Fetch raw Tencent quotes and return parsed fields."""
-    key = ",".join(codes)
+    from .platform_compat import http_get_text
+    # 纯代码 → 带 sh/sz 前缀的腾讯 symbol（6/9 开头是沪市，其余是深市）
+    def _to_symbol(c: str) -> str:
+        return f"sh{c}" if c.startswith(("6", "9")) else f"sz{c}"
+
+    key = ",".join(_to_symbol(c) for c in codes)
     url = f"https://qt.gtimg.cn/q={key}"
-    try:
-        result = subprocess.run(
-            ["curl", "-s", url],
-            capture_output=True, text=True, timeout=15,
-        )
-        raw = result.stdout
-        # Handle GBK — qt.gtimg.cn returns GBK, sometimes with latin1 pass-through
-        for enc in ("utf-8", "gbk", "gb2312", "latin1"):
-            try:
-                trial = raw.encode("latin1").decode(enc)
-                if "~" in trial and len(trial) > 50:
-                    raw = trial
-                    break
-            except Exception:
-                continue
-    except Exception:
+    raw = http_get_text(url, timeout=15, encoding="gbk")
+    if not raw:
         return {}
 
     out = {}

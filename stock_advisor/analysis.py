@@ -242,6 +242,7 @@ def analyze_quotes(
         daily_vol_ratio=daily_vol_ratio,
         recent_ex_dividend=recent_ex_div,
         portfolio_total_assets=portfolio_total_assets,
+        peak_price=peak_price,
     )
     sparkline = _render_sparkline(history)
     title = f"{current.code} {current.name} 行情观察"
@@ -624,6 +625,7 @@ def _build_decision_signal(
     daily_vol_ratio: Decimal | None = None,
     recent_ex_dividend: bool = False,
     portfolio_total_assets: Decimal | None = None,
+    peak_price: Decimal | None = None,
 ) -> DecisionSignal:
     """Two-tier scoring: daily regime → position context → minute fine-tuning.
 
@@ -764,6 +766,16 @@ def _build_decision_signal(
         elif daily_vol_ratio <= Decimal("0.50") and current.change_percent < 0:
             score += Decimal("6")
             rationale.append(f"日线缩量下跌（量比 {_format_ratio(daily_vol_ratio)}），抛压减轻")
+        # v1.56.1: 放量上攻 —— 回测实证（11票×120日, 2026-08-16）唯一稳定正期望买点:
+        #   价>MA20 + 量比≥1.2 + 当日收阳 → 10日 +1.25% 胜率59%
+        #   （量比≥2 走上面 +18 分支, 避免叠加）
+        elif (daily_vol_ratio >= Decimal("1.20")
+              and daily_ma20 is not None and daily_ma20 > 0
+              and current.current_price > daily_ma20
+              and current.change_percent > 0
+              and daily_regime != "bear"):
+            score += Decimal("14")
+            rationale.append(f"放量上攻: 站上MA20+量比{_format_ratio(daily_vol_ratio)}+收阳，趋势启动")
 
     # ═══════════════════════════════════════════════════════════
     # PHASE 2: Minute Signals (neutral regime only)
@@ -1216,6 +1228,29 @@ def _build_decision_signal(
             risk_flags.append(f"🚨 浮亏{_format_percent(holding_return_pct)}超10%，卖出紧迫")
     elif has_position and holding_return_pct is not None and holding_return_pct <= Decimal("-7"):
         risk_flags.append(f"⚠️ 浮亏{_format_percent(holding_return_pct)}接近硬止损(10%)，密切关注")
+
+    # ── v1.56.0 Bounce-Hold Guard: 超跌反弹结构完好时抑制 reduce（防卖飞）──
+    # 回测实证（2026-08-16）：超跌反弹中 reduce 信号 3日方向正确率 0%（卫通 +1.69%），
+    # 反弹初期减仓 = 卖在坑里。以下条件全部满足时把 reduce 降为 hold：
+    #   · 日线非单边熊（bull/neutral）
+    #   · 现价 ≥ MA20（中期支撑上方）
+    #   · RSI 未深弱（≥35，修复中）
+    #   · 未深破前30日低点（结构破位不算反弹，维持 reduce）
+    #   · 无止盈强制（🎯 止盈纪律优先，不受抑制）
+    bounce_hold = False
+    if action == "reduce" and has_position and daily_regime != "bear":
+        _ma20_ok = daily_ma20 is not None and daily_ma20 > 0 and current.current_price >= daily_ma20
+        _rsi_ok = daily_rsi14 is None or daily_rsi14 >= Decimal("35")
+        _structure_ok = metrics.breakdown_below_prev30_low_pct < Decimal("0.15")
+        _no_take_profit = not any("🎯" in flag for flag in risk_flags)
+        if _ma20_ok and _rsi_ok and _structure_ok and _no_take_profit:
+            bounce_hold = True
+    if bounce_hold:
+        action = "hold"
+        rationale.append(
+            f"反弹抑制: 价{current.current_price:.2f}≥MA20({daily_ma20:.2f})且RSI修复，暂缓减仓让反弹走完"
+        )
+        risk_flags.append("⏸️ 反弹抑制: 支撑未破，减仓延后（破MA20/RSI<35/结构破位/止盈信号时恢复）")
 
     # Ex-dividend guard
     if recent_ex_dividend and action in ("buy", "hold"):

@@ -98,8 +98,16 @@ def generate_and_sync_triggers(
 
     kept = [t for t in existing_triggers if t.get("_source") not in _AUTO_SOURCES]
 
+    manual_sell_codes = {
+        str(t.get("code", ""))
+        for t in existing_triggers
+        if t.get("_source") == "hermes_manual" and str(t.get("action", "")) == "sell"
+    }
+
     # ── Generate profit instructions ──
     for h in snapshot.holdings:
+        if h.code in manual_sell_codes:
+            continue
         if h.quantity <= 0 or h.cost_price <= 0 or h.current_price <= 0:
             continue
         pnl_pct = (h.current_price - h.cost_price) / h.cost_price * 100
@@ -132,6 +140,8 @@ def generate_and_sync_triggers(
     }
 
     for h in snapshot.holdings:
+        if h.code in manual_sell_codes:
+            continue
         if h.quantity <= 0 or h.cost_price <= 0 or h.current_price <= 0:
             continue
         if h.code in debate_codes:

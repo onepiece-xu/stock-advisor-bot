@@ -43,17 +43,12 @@ class DataSourceStatus:
 
 
 def _curl_get(url: str, timeout: int = 5) -> tuple[bool, str]:
-    """Quick curl-based HTTP check (bypasses Python SSL issues with East Money)."""
-    try:
-        result = subprocess.run(
-            ["curl", "-sL", "--connect-timeout", str(timeout), "--max-time", str(timeout + 2), url],
-            capture_output=True, text=True, timeout=timeout + 3,
-        )
-        if result.returncode == 0 and len(result.stdout.strip()) > 10:
-            return True, result.stdout[:200]
-        return False, f"exit={result.returncode}"
-    except Exception as e:
-        return False, str(e)[:100]
+    """HTTP check via requests (cross-platform; replaces curl)."""
+    from .platform_compat import http_get_text
+    text = http_get_text(url, timeout=timeout + 2)
+    if len(text.strip()) > 10:
+        return True, text[:200]
+    return False, "empty response"
 
 
 def _python_get(url: str, timeout: int = 5) -> tuple[bool, str]:
@@ -107,14 +102,11 @@ def check_eastmoney_northbound() -> tuple[bool, str]:
 
 def check_chrome_cdp() -> tuple[bool, str]:
     try:
-        result = subprocess.run(
-            ["curl", "-s", "--connect-timeout", "3", "--max-time", "5",
-             "http://172.27.144.1:9222/json/version"],
-            capture_output=True, text=True, timeout=8,
-        )
-        if result.returncode == 0 and "Browser" in result.stdout:
+        from .platform_compat import http_get_text
+        text = http_get_text("http://172.27.144.1:9222/json/version", timeout=5)
+        if "Browser" in text:
             return True, "OK"
-        return False, f"exit={result.returncode}"
+        return False, "no Browser in response"
     except Exception as e:
         return False, str(e)[:100]
 

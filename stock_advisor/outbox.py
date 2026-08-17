@@ -1,12 +1,13 @@
 from __future__ import annotations
 
-import fcntl
 import json
 import logging
 import os
 import re
 from datetime import datetime
 from pathlib import Path
+
+from .platform_compat import lock_file, unlock_file
 
 logger = logging.getLogger(__name__)
 
@@ -41,14 +42,14 @@ def _acquire_outbox_lock() -> int:
     """Acquire an exclusive lock on the outbox file. Returns the fd."""
     OUTBOX_PATH.parent.mkdir(parents=True, exist_ok=True)
     fd = os.open(str(OUTBOX_PATH), os.O_RDWR | os.O_CREAT, 0o644)
-    fcntl.flock(fd, fcntl.LOCK_EX)
+    lock_file(fd)
     return fd
 
 
 def _release_outbox_lock(fd: int) -> None:
     """Release the lock and close the fd."""
     try:
-        fcntl.flock(fd, fcntl.LOCK_UN)
+        unlock_file(fd)
     finally:
         os.close(fd)
 

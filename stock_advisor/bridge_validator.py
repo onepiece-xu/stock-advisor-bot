@@ -74,6 +74,8 @@ def _item_hash(item: dict) -> str:
 ANOMALY_COOLDOWN_SECONDS = 600      # 10 min between same anomaly type+code
 FUND_OUTFLOW_THRESHOLD_YI = -0.3    # 主力净流出 > 3000万 → 警报
 SUDDEN_DROP_THRESHOLD_PCT = -2.0    # 日内跌超 2% → 警报
+SECTOR_SURGE_THRESHOLD = 3.0        # 板块涨超 3% → 检测背离
+SECTOR_LAG_GAP = 5.0                # 个股跑输板块 > 5个百分点 → 警报
 MAX_ANOMALIES_PER_RUN = 1           # Max anomaly alerts per bridge tick
 
 _KLINE_CACHE: dict[str, list[dict]] = {}
@@ -414,8 +416,8 @@ def load_state() -> dict:
     if STATE_PATH.exists():
         try:
             return json.loads(STATE_PATH.read_text())
-        except Exception as exc:
-            logger.warning("stock_advisor/bridge_validator.py:load_state failed: %s", exc)
+        except Exception:
+            pass
     return {"validated_hashes": [], "validated_at": None}
 
 
@@ -434,8 +436,8 @@ def _load_block_cooldown() -> dict[str, float]:
     if BLOCK_COOLDOWN_PATH.exists():
         try:
             return json.loads(BLOCK_COOLDOWN_PATH.read_text())
-        except Exception as exc:
-            logger.warning("stock_advisor/bridge_validator.py:_load_block_cooldown failed: %s", exc)
+        except Exception:
+            pass
     return {}
 
 
@@ -497,8 +499,8 @@ def _load_trigger_cooldown() -> dict[str, dict]:
                 elif isinstance(v, dict):
                     normalized[k] = v
             return normalized
-        except Exception as exc:
-            logger.warning("stock_advisor/bridge_validator.py:_load_trigger_cooldown failed: %s", exc)
+        except Exception:
+            pass
     return {}
 
 
@@ -519,8 +521,7 @@ def _format_cash_summary() -> str:
             return ""
         ratio = cash / total * 100
         return f"💰 现金储备：{cash:,.2f} / 总资产{total:,.2f}（{ratio:.0f}%）"
-    except Exception as exc:
-        logger.warning("stock_advisor/bridge_validator.py:_format_cash_summary failed: %s", exc)
+    except Exception:
         return ""
 
 
@@ -541,8 +542,8 @@ def _get_fund_flow_hint(code: str) -> str:
             hint = f"💧 主力{d}{abs(mn):.2f}亿"
             _FUND_FLOW_CACHE[code] = (now, hint)
             return hint
-    except Exception as exc:
-        logger.warning("stock_advisor/bridge_validator.py:_get_fund_flow_hint failed: %s", exc)
+    except Exception:
+        pass
     return ""
 
 
@@ -554,8 +555,7 @@ def _load_holdings_map() -> dict[str, dict]:
     try:
         snap = json.loads(SNAPSHOT_PATH.read_text())
         holdings = snap.get("holdings", []) or snap.get("positions", {}).values()
-    except Exception as exc:
-        logger.warning("stock_advisor/bridge_validator.py:_load_holdings_map failed: %s", exc)
+    except Exception:
         return {}
     result = {}
     for h in holdings:
@@ -613,8 +613,7 @@ def _auto_disable_triggers(keys: set[str]) -> None:
         return
     try:
         plan = json.loads(plan_path.read_text())
-    except Exception as exc:
-        logger.warning("stock_advisor/bridge_validator.py:_auto_disable_triggers failed: %s", exc)
+    except Exception:
         return
 
     triggers = plan.get("triggers", [])
@@ -680,8 +679,7 @@ def _check_triggers() -> list[str]:
 
     try:
         plan = json.loads(plan_path.read_text())
-    except Exception as exc:
-        logger.warning("stock_advisor/bridge_validator.py:_check_triggers failed: %s", exc)
+    except Exception:
         return []
 
     triggers = plan.get("triggers", [])
@@ -961,8 +959,8 @@ def _load_anomaly_cooldown() -> dict[str, float]:
     if ANOMALY_COOLDOWN_PATH.exists():
         try:
             return json.loads(ANOMALY_COOLDOWN_PATH.read_text())
-        except Exception as exc:
-            logger.warning("stock_advisor/bridge_validator.py:_load_anomaly_cooldown failed: %s", exc)
+        except Exception:
+            pass
     return {}
 
 
@@ -1000,8 +998,8 @@ def _fetch_holding_prices_with_chg() -> dict[str, dict]:
                 result[code] = {"price": price, "chg_pct": chg_pct, "name": name}
             except (ValueError, IndexError):
                 continue
-    except Exception as exc:
-        logger.warning("stock_advisor/bridge_validator.py:_fetch_holding_prices_with_chg failed: %s", exc)
+    except Exception:
+        pass
     return result
 
 
@@ -1063,8 +1061,36 @@ def _check_anomalies() -> list[str]:
                         )
                         cooldown[flow_key] = now
                         updated = True
-            except Exception as exc:
-                logger.warning("stock_advisor/bridge_validator.py:_check_anomalies failed: %s", exc)
+            except Exception:
+                pass
+
+        # ── 3. 板块大涨个股不跟（sector surge but stock lags）──
+        lag_key = f"LAG:{code}"
+        last = cooldown.get(lag_key, 0)
+        if (now - last) >= ANOMALY_COOLDOWN_SECONDS:
+            try:
+                from stock_advisor.market_breadth import get_sectors, STOCK_SECTORS
+                stock_secs = STOCK_SECTORS.get(code, [])
+                sectors_data = get_sectors()
+                sec_map = {s["code"]: s for s in sectors_data}
+                for sc in stock_secs:
+                    # STOCK_SECTORS uses "pt01801102" but get_sectors returns "01801102"
+                    clean_sc = sc[2:] if sc.startswith("pt") else sc
+                    sec = sec_map.get(clean_sc) or sec_map.get(sc)
+                    if not sec:
+                        continue
+                    sec_chg = float(sec["chg_pct"])
+                    if sec_chg >= SECTOR_SURGE_THRESHOLD and (sec_chg - pct) >= SECTOR_LAG_GAP:
+                        alerts.append(
+                            f"🔴 **板块背离：{name}** `{datetime.now(MARKET_TZ).strftime('%H:%M')}`\n"
+                            f"{sec['name']}板块 {sec_chg:+.1f}%，{name}仅 {pct:+.1f}%（跑输 {sec_chg - pct:.1f}个百分点）\n"
+                            f"📊 板块大涨个股不跟，极度弱势⚠️"
+                        )
+                        cooldown[lag_key] = now
+                        updated = True
+                        break  # One alert per stock
+            except Exception:
+                pass
 
         if len(alerts) >= MAX_ANOMALIES_PER_RUN:
             break
@@ -1179,9 +1205,9 @@ def _mark_sent(validated_hashes: set[str] | None = None, limit: int = 10) -> int
     if not OUTBOX_PATH.exists():
         return 0
 
-    import fcntl
+    from .platform_compat import lock_file, unlock_file
     fd = os.open(str(OUTBOX_PATH), os.O_RDWR)
-    fcntl.flock(fd, fcntl.LOCK_EX)
+    lock_file(fd)
     try:
         os.lseek(fd, 0, os.SEEK_SET)
         data = os.read(fd, 10 * 1024 * 1024)
@@ -1212,7 +1238,7 @@ def _mark_sent(validated_hashes: set[str] | None = None, limit: int = 10) -> int
             os.truncate(fd, 0)
             os.write(fd, content.encode("utf-8"))
     finally:
-        fcntl.flock(fd, fcntl.LOCK_UN)
+        unlock_file(fd)
         os.close(fd)
 
     return marked

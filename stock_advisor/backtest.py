@@ -8,7 +8,7 @@ from statistics import median
 from .analysis import analyze_quotes
 from .config import AppConfig, DecisionThresholds
 from .models import StockQuote, StockRef
-from .providers import EastmoneyMinuteHistoryProvider
+from .providers import SinaMinuteHistoryProvider
 
 
 DEFAULT_HORIZONS = (5, 15, 30)
@@ -223,7 +223,7 @@ def _collect_backtest_samples(
     horizons: tuple[int, ...] = DEFAULT_HORIZONS,
 ) -> list[BacktestSample]:
     selected = symbols or config.monitor.stocks
-    provider = EastmoneyMinuteHistoryProvider(config.monitor)
+    provider = SinaMinuteHistoryProvider(config.monitor)
     benchmark = config.monitor.benchmark
     benchmark_quotes = provider.fetch_recent_days_exact(benchmark, ndays=ndays) if benchmark is not None else []
     benchmark_map = {quote.quote_time: index for index, quote in enumerate(benchmark_quotes)}
@@ -842,7 +842,7 @@ def run_daily_backtest(
 
     from .models import PortfolioHolding
 
-    provider = EastmoneyMinuteHistoryProvider(config.monitor)
+    provider = SinaMinuteHistoryProvider(config.monitor)
     end_date = date.today()
     start_date = end_date - timedelta(days=days * 2)
 
@@ -1082,7 +1082,7 @@ def run_enhanced_daily_backtest(
 
     from .models import PortfolioHolding
 
-    provider = EastmoneyMinuteHistoryProvider(config.monitor)
+    provider = SinaMinuteHistoryProvider(config.monitor)
     end_date = date.today()
     start_date = end_date - timedelta(days=days * 2)
 

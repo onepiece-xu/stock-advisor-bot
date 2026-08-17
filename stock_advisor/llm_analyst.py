@@ -34,8 +34,9 @@ def _load_deepseek_config():
         config_path = Path(__file__).parent.parent / "config.yaml"
         if config_path.exists():
             cfg = load_config(str(config_path))
-            _DEEPSEEK_CONFIG = cfg.deepseek
-            return _DEEPSEEK_CONFIG
+            if cfg.deepseek and cfg.deepseek.api_key:
+                _DEEPSEEK_CONFIG = cfg.deepseek
+                return _DEEPSEEK_CONFIG
     except Exception as exc:
         logger.warning("stock_advisor/llm_analyst.py:_load_deepseek_config failed: %s", exc)
     # Fallback: env vars (for container/CI)

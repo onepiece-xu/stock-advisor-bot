@@ -256,14 +256,20 @@ class EastmoneyMinuteHistoryProvider:
     ) -> list[StockQuote]:
         if count <= 0:
             return []
-        if end_time is None:
-            end_date = datetime.now().date()
-        else:
-            end_date = end_time.date()
-        quotes = self._fetch_recent_multiday_quotes(stock, end_date)
-        if end_time is not None:
-            quotes = [quote for quote in quotes if quote.quote_time <= end_time]
-        return quotes[-count:]
+        try:
+            if end_time is None:
+                end_date = datetime.now().date()
+            else:
+                end_date = end_time.date()
+            quotes = self._fetch_recent_multiday_quotes(stock, end_date)
+            if end_time is not None:
+                quotes = [quote for quote in quotes if quote.quote_time <= end_time]
+            return quotes[-count:]
+        except Exception as exc:
+            # 东方财富 API 与 Python SSL 栈不兼容时 RemoteDisconnected，
+            # 必须返回空列表让上层 fallback 到 Sina/Tencent，而不是抛异常中断监控。
+            logger.warning("Eastmoney fetch_recent_window failed for %s: %s", stock.symbol, exc)
+            return []
 
     def fetch_recent_window_exact(
         self,
@@ -300,34 +306,65 @@ class EastmoneyMinuteHistoryProvider:
         return closes
 
     def fetch_daily_klines(self, stock: StockRef, ndays: int = 60) -> tuple[list[Decimal], list[Decimal]]:
-        """Fetch daily K-line data. Returns (closes, volumes) for the last ndays."""
-        today = datetime.now().date()
-        lookback = today - timedelta(days=ndays * 2)
-        response = requests.get(
-            "https://push2his.eastmoney.com/api/qt/stock/kline/get",
-            params={
-                "secid": self._secid(stock),
-                "klt": "101",
-                "fqt": "1",
-                "lmt": str(ndays + 10),
-                "beg": lookback.strftime("%Y%m%d"),
-                "end": today.strftime("%Y%m%d"),
-                "fields1": "f1,f2,f3,f4,f5,f6",
-                "fields2": "f51,f52,f53,f54,f55,f56",
-            },
-            headers={"User-Agent": "Mozilla/5.0"},
-            timeout=self.monitor_config.provider_settings.request_timeout_ms / 1000,
-        )
-        response.raise_for_status()
-        data = (response.json().get("data") or {})
-        closes: list[Decimal] = []
-        volumes: list[Decimal] = []
-        for line in data.get("klines") or []:
-            fields = str(line).split(",")
-            if len(fields) >= 6:
-                closes.append(Decimal(fields[2]))
-                volumes.append(Decimal(fields[5]))
-        return closes[-ndays:], volumes[-ndays:]
+        """Fetch daily K-line data. Returns (closes, volumes) for the last ndays.
+
+        Primary: eastmoney push2his (Python direct connection is flaky — SSL/connection
+        gets reset). Fallback: Tencent fqkline (web.ifzq.gtimg.cn) which is verified
+        working from Python (curl AND requests). v1.57.0: fallback added because
+        daily_ma20/daily_vol_ratio were silently None in production → 放量上攻 never fired.
+        """
+        try:
+            today = datetime.now().date()
+            lookback = today - timedelta(days=ndays * 2)
+            response = requests.get(
+                "https://push2his.eastmoney.com/api/qt/stock/kline/get",
+                params={
+                    "secid": self._secid(stock),
+                    "klt": "101",
+                    "fqt": "1",
+                    "lmt": str(ndays + 10),
+                    "beg": lookback.strftime("%Y%m%d"),
+                    "end": today.strftime("%Y%m%d"),
+                    "fields1": "f1,f2,f3,f4,f5,f6",
+                    "fields2": "f51,f52,f53,f54,f55,f56",
+                },
+                headers={"User-Agent": "Mozilla/5.0"},
+                timeout=self.monitor_config.provider_settings.request_timeout_ms / 1000,
+            )
+            response.raise_for_status()
+            data = (response.json().get("data") or {})
+            closes: list[Decimal] = []
+            volumes: list[Decimal] = []
+            for line in data.get("klines") or []:
+                fields = str(line).split(",")
+                if len(fields) >= 6:
+                    closes.append(Decimal(fields[2]))
+                    volumes.append(Decimal(fields[5]))
+            if closes:
+                return closes[-ndays:], volumes[-ndays:]
+            logger.warning("Eastmoney daily klines empty for %s, falling back to Tencent", stock.symbol)
+        except Exception as exc:
+            logger.warning("Eastmoney fetch_daily_klines failed for %s: %s — falling back to Tencent", stock.symbol, exc)
+        # ── Tencent fallback (v1.57.0) ──
+        try:
+            symbol = f"{stock.exchange}{stock.code}"
+            response = requests.get(
+                "https://web.ifzq.gtimg.cn/appstock/app/fqkline/get",
+                params={"param": f"{symbol},day,,,{ndays},qfq"},
+                headers={"User-Agent": "Mozilla/5.0"},
+                timeout=self.monitor_config.provider_settings.request_timeout_ms / 1000,
+            )
+            response.raise_for_status()
+            data = (response.json().get("data") or {}).get(symbol) or {}
+            klines = data.get("qfqday") or data.get("day") or []
+            closes = [Decimal(f[2]) for f in klines if len(f) >= 6]
+            volumes = [Decimal(f[5]) for f in klines if len(f) >= 6]
+            if closes:
+                return closes[-ndays:], volumes[-ndays:]
+            logger.warning("Tencent daily klines empty for %s", stock.symbol)
+        except Exception as exc:
+            logger.warning("Tencent daily klines fallback failed for %s: %s", stock.symbol, exc)
+        return [], []
 
     def _secid(self, stock: StockRef) -> str:
         exchange = stock.exchange.lower()
@@ -465,6 +502,19 @@ class SinaMinuteHistoryProvider:
         if end_time is not None:
             quotes = [q for q in quotes if q.quote_time <= end_time]
         return quotes[-count:]
+
+    def fetch_recent_days_exact(
+        self,
+        stock: StockRef,
+        ndays: int,
+        *,
+        end_date: date | None = None,
+    ) -> list[StockQuote]:
+        """Fetch the most recent `ndays` trade days of minute bars (sina max window ~1970 bars)."""
+        if ndays <= 0:
+            return []
+        quotes = self.fetch_recent_window(stock, 1970, end_time=datetime.combine(end_date or date.today(), datetime.max.time()) if end_date else None)
+        return _tail_trade_days(quotes, ndays)
 
     def fetch_quotes(
         self, stock: StockRef, start_date: date, end_date: date

@@ -156,11 +156,19 @@ class MonitorRuntime:
                 advance_ratio=advance_ratio,
             )
 
-            # Trigger notifications go through instruction engine now
+            # Trigger notifications go through instruction engine now.
+            # v1.57.0 上班族模式: buy 信号盘中不即时推送（用户上班无法操作, 收盘复盘统一给
+            # 明日入场价+触发单）; sell 保留即时推（止损/止盈纪律, 越早通知越好）。
             if instr and instr.action in ("buy", "sell"):
                 dedup_body = f"{instr.action}:{instr.priority}"
-                if self._dedup_ok(stock.symbol, dedup_body, cooldown_minutes=self.config.monitor.notification.dedup.cooldown_minutes):
-                    action_label = "买入" if instr.action == "buy" else "卖出"
+                if instr.action == "buy":
+                    logger.info(
+                        "[v1.57.0] %s %s buy 信号（分%s）— 盘中不推, 收盘复盘给明日入场计划",
+                        stock.code, quote.name, getattr(instr, "score", "?"),
+                    )
+                    self._update_signal_state(stock.code, instr.action)
+                elif self._dedup_ok(stock.symbol, dedup_body, cooldown_minutes=self.config.monitor.notification.dedup.cooldown_minutes):
+                    action_label = "卖出"
                     pending_notifications.append((
                         stock.symbol,
                         f"{stock.code} {quote.name} {action_label}",
@@ -560,7 +568,16 @@ class MonitorRuntime:
         if benchmark is None:
             return None
         if self.config.monitor.provider == "eastmoney_minute":
-            return self.provider.fetch_recent_window(benchmark, self.config.monitor.history_size)
+            history = self.provider.fetch_recent_window(benchmark, self.config.monitor.history_size)
+            if history:
+                return history
+            # eastmoney blocked — fall back to Sina, then Tencent
+            try:
+                history = self.sina_provider.fetch_recent_window(benchmark, self.config.monitor.history_size)
+                if history:
+                    return history
+            except Exception as exc:
+                logger.warning("Benchmark Sina fallback failed symbol=%s error=%s", benchmark.symbol, exc)
         try:
             return [TencentQuoteProvider(self.config.monitor).fetch_quote(benchmark)]
         except Exception as exc:  # noqa: BLE001

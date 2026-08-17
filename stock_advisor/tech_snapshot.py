@@ -79,14 +79,11 @@ def _fetch_realtime_quotes(codes: list[str]) -> dict[str, dict]:
     symbols = ",".join(_tencent_symbol(c) for c in codes)
     url = f"https://qt.gtimg.cn/q={symbols}"
     try:
-        result = subprocess.run(
-            ["curl", "-sL", "--max-time", "8", url],
-            capture_output=True, timeout=10,
-        )
-        if result.returncode != 0 or not result.stdout.strip():
+        from .platform_compat import http_get_bytes
+        raw = http_get_bytes(url, timeout=10)
+        if not raw:
             return {}
         # Tencent returns GBK, handle encoding
-        raw = result.stdout
         try:
             text = raw.decode("utf-8")
         except UnicodeDecodeError:
@@ -134,13 +131,11 @@ def _fetch_daily_klines(codes: list[str], ndays: int = 60) -> dict[str, dict]:
             f"?param={symbol},day,,,{ndays},qfq"
         )
         try:
-            result = subprocess.run(
-                ["curl", "-sL", "--max-time", "8", url],
-                capture_output=True, timeout=10,
-            )
-            if result.returncode != 0 or not result.stdout.strip():
+            from .platform_compat import http_get_text
+            text = http_get_text(url, timeout=10, encoding="utf-8")
+            if not text:
                 continue
-            data = json.loads(result.stdout.decode("utf-8", errors="replace"))
+            data = json.loads(text)
             rows = data.get("data", {}).get(symbol, {}).get("qfqday", [])
             if not rows:
                 rows = data.get("data", {}).get(symbol, {}).get("day", [])

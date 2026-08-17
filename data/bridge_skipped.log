@@ -47,3 +47,51 @@
 
 [2026-05-24T09:07:15.005238] Validated 4 pending, passed 3, skipped 1:
   SKIP 000063: 【止损】中兴通讯 (小亏-4.8%仅连跌0天，拦截卖出)
+
+[2026-06-02T09:38:07.691136] Auto-disabled triggers: ['601698:中国卫通-抄底']
+
+[2026-06-03T11:12:48.392297] Auto-disabled triggers: ['601698:中国卫通-降仓1:hermes_manual']
+
+[2026-06-05T10:05:38.565275] Auto-disabled triggers: ['601698:中国卫通-卖点计划:exit_plan_sync:2026-06-03T22:30:48.866202']
+
+[2026-06-05T10:22:03.987532] Auto-disabled triggers: ['601698:中国卫通-降仓2:hermes_manual']
+
+[2026-06-22T14:07:11.808645] Auto-disabled triggers: ['002439:启明星辰-减亏卖出:hermes_manual']
+
+[2026-06-24T09:38:28.395609] Auto-disabled triggers: ['002439:启明星辰-卖点计划:exit_plan_sync:2026-06-22T15:10:37.077223']
+
+[2026-06-25T09:06:16.505748] Auto-disabled triggers: ['002439:启明星辰-卖点计划:exit_plan_sync:2026-06-24T15:02:15.402823']
+
+[2026-07-01T10:12:08.616661] Auto-disabled triggers: ['002439:启明星辰-卖点计划:exit_plan_sync:2026-06-30T15:10:14.273534']
+
+[2026-07-02T09:43:55.235215] Auto-disabled triggers: ['002439:启明星辰-卖点计划:exit_plan_sync:2026-07-01T15:10:28.463436']
+
+[2026-07-03T14:46:04.503635] Auto-disabled triggers: ['601698:中国卫通-减亏卖点1:hermes_manual']
+
+[2026-07-13T11:23:36.442453] Auto-disabled triggers: ['601698:中国卫通-回落防守减仓:hermes_manual']
+
+[2026-07-13T11:31:38.213538] Auto-disabled triggers: ['601698:中国卫通-反弹第一档锁盈:hermes_manual']
+
+[2026-07-13T13:27:58.818953] Auto-disabled triggers: ['601698:中国卫通-盈利保护防回吐:hermes_manual']
+
+[2026-07-20T09:50:23.348492] Auto-disabled triggers: ['601698:中国卫通-破25防守止血:hermes_manual']
+
+[2026-07-20T15:02:15.924559] Auto-disabled triggers: ['002439:启明星辰-反弹清理:hermes_manual']
+
+[2026-07-21T09:34:40.244935] Auto-disabled triggers: ['002439:启明星辰-卖点计划:exit_plan_sync:2026-07-20T15:12:39.271377']
+
+[2026-07-22T09:48:16.372683] Auto-disabled triggers: ['002439:启明星辰-卖点计划:exit_plan_sync:2026-07-21T15:12:45.539626']
+
+[2026-07-23T09:48:56.308729] Auto-disabled triggers: ['002439:启明星辰-卖点计划:exit_plan_sync:2026-07-22T15:12:38.677109']
+
+[2026-07-24T09:48:59.381276] Auto-disabled triggers: ['002439:启明星辰-卖点计划:exit_plan_sync:2026-07-23T15:12:41.792347']
+
+[2026-08-04T13:07:56.283148] Auto-disabled triggers: ['002439:启明星辰-卖点计划:exit_plan_sync:2026-07-24T15:12:46.700443']
+
+[2026-08-04T13:53:59.297189] Auto-disabled triggers: ['601698:中国卫通-反抽止血一档:hermes_manual']
+
+[2026-08-05T09:38:36.222937] Auto-disabled triggers: ['002439:启明星辰-卖点计划:exit_plan_sync:2026-08-04T15:10:34.094060']
+
+[2026-08-06T09:38:29.966053] Auto-disabled triggers: ['002439:启明星辰-卖点计划:exit_plan_sync:2026-08-05T15:10:28.079718']
+
+[2026-08-17T09:13:18.945372] Auto-disabled triggers: ['002439:启明星辰-卖点计划:exit_plan_sync:2026-08-06T15:10:10.317247']

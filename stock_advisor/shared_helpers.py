@@ -32,7 +32,31 @@ def load_stock_history(config, conn, provider, stock) -> list[StockQuote]:
         history = provider.fetch_recent_window(stock, config.monitor.history_size)
         if history:
             cache_quotes(conn, history)
-        return history
+            return history
+        # eastmoney blocked — try Sina minute API (跨平台 fallback)
+        try:
+            from .providers import SinaMinuteHistoryProvider
+            history = SinaMinuteHistoryProvider(config.monitor).fetch_recent_window(
+                stock, config.monitor.history_size
+            )
+            if history:
+                cache_quotes(conn, history)
+                return history
+        except Exception as exc:
+            logger.warning("Sina fallback failed for %s: %s", stock.symbol, exc)
+        # Both blocked — fall back to DB history + Tencent real-time
+        try:
+            from .providers import TencentQuoteProvider
+            quote = TencentQuoteProvider(config.monitor).fetch_quote(stock)
+            if quote:
+                cache_quotes(conn, [quote])
+            db_history = load_recent_quotes(conn, stock.symbol, config.monitor.history_size)
+            if quote and (not db_history or db_history[-1].quote_time < quote.quote_time):
+                db_history.append(quote)
+            return db_history
+        except Exception as exc:
+            logger.warning("Tencent fallback failed for %s: %s", stock.symbol, exc)
+        return []
     history = load_recent_quotes(conn, stock.symbol, config.monitor.history_size - 1)
     history.append(provider.fetch_quote(stock))
     return history

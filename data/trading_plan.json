@@ -1,70 +1,18 @@
 {
-  "triggers": [
-    {
-      "code": "601698",
-      "name": "中国卫通-减亏",
-      "action": "sell",
-      "quantity": 200,
-      "priceMin": "34.50",
-      "priceMax": "35.50",
-      "fallbackPrice": "34.00",
-      "note": "现价33.29，成本35.12(-5.2%)。反弹到34.5-35.5先卖200股减仓",
-      "disableBuy": false
-    },
-    {
-      "code": "601698",
-      "name": "中国卫通-清仓",
-      "action": "sell",
-      "quantity": 300,
-      "priceMin": "36.50",
-      "priceMax": "37.50",
-      "fallbackPrice": "35.50",
-      "note": "成本线上方全清剩余300股",
-      "disableBuy": false
-    },
-    {
-      "code": "000063",
-      "name": "中兴通讯-减亏",
-      "action": "sell",
-      "quantity": 100,
-      "priceMin": "36.50",
-      "priceMax": "37.50",
-      "fallbackPrice": "35.50",
-      "note": "加权成本37.29(-4.8%)，反弹先减100股",
-      "disableBuy": false
-    },
-    {
-      "code": "000063",
-      "name": "中兴通讯-回本出",
-      "action": "sell",
-      "quantity": 100,
-      "priceMin": "38.00",
-      "priceMax": "39.00",
-      "fallbackPrice": "37.00",
-      "note": "成本线上方清仓剩余100股",
-      "disableBuy": false
-    },
-    {
-      "code": "002439",
-      "name": "启明星辰-减亏",
-      "action": "sell",
-      "quantity": 100,
-      "priceMin": "15.80",
-      "priceMax": "16.20",
-      "fallbackPrice": "15.00",
-      "note": "成本16.00(-4.4%)，反弹到16附近走人",
-      "disableBuy": true
-    },
-    {
-      "code": "601698",
-      "name": "中国卫通-抄底",
-      "action": "buy",
-      "quantity": 100,
-      "priceMin": "31.50",
-      "priceMax": "32.50",
-      "fallbackPrice": "30.50",
-      "note": "深跌到31.5-32.5加100股摊薄",
-      "disableBuy": false
-    }
-  ]
+    "triggers": [
+        {
+            "code": "601698",
+            "name": "中国卫通-反抽止血二档",
+            "action": "sell",
+            "quantity": 300,
+            "priceMin": 28.0,
+            "priceMax": 29.0,
+            "fallbackPrice": 25.6,
+            "note": "反抽到28-29再卖300股降风险，保留剩余仓等更高反弹；跌破前低25.59止损（fallback 26.5→25.6，原值卡现价会误触发）",
+            "disableBuy": true,
+            "state": "armed",
+            "_source": "hermes_manual",
+            "created_at": "2026-07-18T22:45:00+08:00"
+        }
+    ]
 }

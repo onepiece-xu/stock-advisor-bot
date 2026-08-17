@@ -240,7 +240,7 @@ def main() -> None:
     opp_scan_parser = subparsers.add_parser("opportunity-scan", help="全市场机会扫描，主动找可买标的")
     opp_scan_parser.add_argument("--config", default="config.yaml", help="配置文件路径")
     opp_scan_parser.add_argument("--top", type=int, default=10, help="返回 Top N")
-    opp_scan_parser.add_argument("--max-chg", type=float, default=5.0, help="最大涨幅过滤(%)")
+    opp_scan_parser.add_argument("--max-chg", type=float, default=5.0, help="最大涨幅过滤(%%)")
     opp_scan_parser.add_argument("--exclude", nargs="*", default=None, help="排除代码")
 
     # ── 技术面全貌 ──
@@ -698,8 +698,8 @@ def run_close_review(config_path: str, notify: bool) -> None:
         stats = evaluate_signal_accuracy(days_lookback=7)
         if stats.get("total_signals", 0) > 0:
             print(f"\n{format_accuracy_report(stats)}")
-    except Exception:
-        pass
+    except Exception as exc:
+        logger.warning("Signal accuracy eval failed: %s", exc)
     
     # Run sector strength report
     try:
@@ -711,8 +711,8 @@ def run_close_review(config_path: str, notify: bool) -> None:
         ]
         if sectors:
             print(f"\n{format_sector_report(sectors, holdings_list)}")
-    except Exception:
-        pass
+    except Exception as exc:
+        logger.warning("Sector strength report failed: %s", exc)
     
     if notify and config.monitor.notification.feishu.enabled:
         deliver_feishu_message(
@@ -908,9 +908,21 @@ def _load_benchmark_history(config):
         return None
     provider = build_provider(config)
     if config.monitor.provider == "eastmoney_minute":
-        return provider.fetch_recent_window(benchmark, config.monitor.history_size)
+        history = provider.fetch_recent_window(benchmark, config.monitor.history_size)
+        if history:
+            return history
+        # eastmoney blocked — fall back to Sina, then Tencent
+        try:
+            from .providers import SinaMinuteHistoryProvider
+            history = SinaMinuteHistoryProvider(config.monitor).fetch_recent_window(
+                benchmark, config.monitor.history_size
+            )
+            if history:
+                return history
+        except Exception as exc:
+            logger.warning("Benchmark Sina fallback failed error=%s", exc)
     try:
-        return [provider.fetch_quote(benchmark)]
+        return [TencentQuoteProvider(config.monitor).fetch_quote(benchmark)]
     except Exception as exc:
         logger.warning("Benchmark fetch failed error=%s", exc)
         return None
@@ -1027,12 +1039,39 @@ def run_status(config_path: str) -> None:
         print("⚠️ 持仓快照不存在")
 
     import subprocess
+    from .platform_compat import IS_WINDOWS
     try:
-        result = subprocess.run(["pgrep", "-f", "monitor-daemon"], capture_output=True, text=True)
-        if result.stdout.strip():
-            print(f"\n✅ daemon 运行中")
+        if IS_WINDOWS:
+            # Windows: 用 pid 文件检测 daemon 是否存活
+            pid_file = Path("run") / "stock-advisor.pid"
+            daemon_running = False
+            if pid_file.exists():
+                try:
+                    pid = int(pid_file.read_text().strip())
+                    if IS_WINDOWS:
+                        # Windows: OpenProcess 检测进程存活（os.kill 在 Windows 上报 WinError 87 不可靠）
+                        import ctypes
+                        PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+                        h = ctypes.windll.kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
+                        daemon_running = bool(h)
+                        if h:
+                            ctypes.windll.kernel32.CloseHandle(h)
+                    else:
+                        import os as _os
+                        _os.kill(pid, 0)
+                        daemon_running = True
+                except Exception:
+                    daemon_running = False
+            if daemon_running:
+                print(f"\n✅ daemon 运行中")
+            else:
+                print(f"\n❌ daemon 未运行")
         else:
-            print(f"\n❌ daemon 未运行")
+            result = subprocess.run(["pgrep", "-f", "monitor-daemon"], capture_output=True, text=True)
+            if result.stdout.strip():
+                print(f"\n✅ daemon 运行中")
+            else:
+                print(f"\n❌ daemon 未运行")
     except Exception:
         print(f"\n⚠️ 无法检测 daemon 状态")
 
@@ -1057,8 +1096,8 @@ def run_status(config_path: str) -> None:
         breadth_md = format_breadth_md(codes)
         if breadth_md.strip():
             print(f"\n{breadth_md}")
-    except Exception:
-        pass
+    except Exception as exc:
+        logger.warning("Fund flow / market breadth display failed: %s", exc)
 
 
 def run_prune_data(config_path: str, retention_days: int) -> None:
@@ -1341,7 +1380,7 @@ def _save_review_to_feishu_doc(content: str, trade_date: str) -> None:
         result = subprocess.run(
             ["lark-cli", "docs", "+update", "--doc", REVIEW_DOC_TOKEN,
              "--mode", "overwrite", "--markdown", f"@./{out_path}"],
-            capture_output=True, text=True, timeout=60, cwd="/root/projects/stock-advisor-bot",
+            capture_output=True, text=True, timeout=60, cwd=str(Path(__file__).resolve().parent.parent),
         )
         if result.returncode == 0:
             print("✅ 已写入飞书复盘文档")
